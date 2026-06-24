@@ -1,0 +1,164 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #0f172a;
+  background: #f6f6f0;
+  font-family: "Manrope", "Segoe UI", sans-serif;
+  --ui-border-soft: #d2dae2;
+  --ui-border: #c2ccd6;
+  --ui-border-strong: #b1becb;
+  --ui-divider: #ccd6df;
+  --ui-muted-text: #73839a;
+  --ui-placeholder: #7c8898;
+  --ui-shadow-sm: 0 8px 20px rgba(15, 23, 42, 0.06);
+  --ui-shadow-card: 0 18px 48px rgba(15, 23, 42, 0.1), 0 1px 0 rgba(255, 255, 255, 0.52) inset;
+  --ui-focus-ring: 0 0 0 4px rgba(15, 118, 110, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.88)),
+    radial-gradient(circle at top, rgba(15, 118, 110, 0.08), transparent 35%),
+    radial-gradient(circle at bottom right, rgba(249, 115, 22, 0.08), transparent 25%),
+    #f6f6f0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input:not([type="checkbox"]),
+select,
+textarea {
+  font: inherit;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border-radius: 18px;
+  border: 1px solid var(--ui-border);
+  background: rgba(255, 255, 255, 0.96);
+  padding: 0.9rem 1rem;
+  color: #0f172a;
+  outline: none;
+  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+}
+
+input:not([type="checkbox"]):hover,
+select:hover,
+textarea:hover {
+  border-color: var(--ui-border-strong);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--ui-placeholder);
+  opacity: 1;
+}
+
+input:not([type="checkbox"]):focus,
+select:focus,
+textarea:focus {
+  border-color: rgb(15 118 110);
+  box-shadow: var(--ui-focus-ring);
+}
+
+button {
+  cursor: pointer;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:not([type="checkbox"]):focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  box-shadow: var(--ui-focus-ring);
+}
+
+button[class*="border-slate-200"]:not(:disabled):hover,
+button[class*="border-slate-300"]:not(:disabled):hover,
+a[class*="border-slate-200"]:hover,
+a[class*="border-slate-300"]:hover {
+  box-shadow: var(--ui-shadow-sm);
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  padding: 0;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+}
+
+.border-slate-100 {
+  border-color: var(--ui-border-soft);
+}
+
+.border-slate-200 {
+  border-color: var(--ui-border);
+}
+
+.border-slate-300 {
+  border-color: var(--ui-border-strong);
+}
+
+.border-white\/70 {
+  border-color: rgba(201, 210, 220, 0.92);
+}
+
+.border-accent\/20 {
+  border-color: rgba(15, 118, 110, 0.32);
+}
+
+.border-accent\/30 {
+  border-color: rgba(15, 118, 110, 0.42);
+}
+
+.border-accent\/35 {
+  border-color: rgba(15, 118, 110, 0.48);
+}
+
+.border-accent\/40 {
+  border-color: rgba(15, 118, 110, 0.56);
+}
+
+.divide-slate-100 > :not([hidden]) ~ :not([hidden]),
+.divide-slate-200 > :not([hidden]) ~ :not([hidden]),
+.divide-slate-300 > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--ui-divider);
+}
+
+.text-slate-400 {
+  color: var(--ui-muted-text);
+}
+
+.shadow-sm {
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.shadow-card {
+  box-shadow: var(--ui-shadow-card);
+}
