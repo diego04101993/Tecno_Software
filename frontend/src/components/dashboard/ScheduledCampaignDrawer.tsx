@@ -1,5 +1,5 @@
 import { ArrowRightLeft, CalendarClock, Layers3, RadioTower, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiRequest } from "../../lib/api";
 import type { Campaign, CampaignAssignmentResult } from "../../types/domain";
@@ -60,6 +60,9 @@ function deriveRecurrence({
   endsOn: string;
   weekdays: number[];
 }) {
+  if (weekdays.length === WEEKDAY_OPTIONS.length) {
+    return "daily";
+  }
   if (weekdays.length > 0) {
     return "weekly";
   }
@@ -137,6 +140,7 @@ export function ScheduledCampaignDrawer({
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<CampaignPublishSummary | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const wasOpenRef = useRef(false);
 
   const allTargets = useMemo(
     () => (selectionMode === "fixed" ? fixedTargets : targetGroups.flatMap((branchGroup) => branchGroup.targets)),
@@ -149,7 +153,10 @@ export function ScheduledCampaignDrawer({
   );
 
   useEffect(() => {
-    if (!open) {
+    const isOpening = open && !wasOpenRef.current;
+    wasOpenRef.current = open;
+
+    if (!isOpening) {
       return;
     }
 
@@ -172,11 +179,15 @@ export function ScheduledCampaignDrawer({
   }, [campaigns, currentCampaignId, fixedTargets, open, selectionMode]);
 
   useEffect(() => {
-    if (!open || selectedCampaignId || campaigns.length === 0) {
+    if (!open || campaigns.length === 0) {
       return;
     }
-    setSelectedCampaignId(campaigns[0].id);
-  }, [campaigns, open, selectedCampaignId]);
+    const selectedCampaignStillExists = campaigns.some((campaign) => campaign.id === selectedCampaignId);
+    if (selectedCampaignStillExists) {
+      return;
+    }
+    setSelectedCampaignId(currentCampaignId ?? campaigns[0].id);
+  }, [campaigns, currentCampaignId, open, selectedCampaignId]);
 
   useEffect(() => {
     if (!open) {
@@ -194,6 +205,7 @@ export function ScheduledCampaignDrawer({
     () => campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null,
     [campaigns, selectedCampaignId],
   );
+  const allWeekdaysSelected = weekdays.length === WEEKDAY_OPTIONS.length;
 
   const visibleBranchGroups = useMemo(() => {
     if (selectionMode === "fixed") {
@@ -562,7 +574,16 @@ export function ScheduledCampaignDrawer({
                 </div>
 
                 <div className="mt-4">
-                  <p className="text-sm font-semibold text-slate-700">Dias de la semana</p>
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-semibold text-slate-700">Dias de la semana</p>
+                    <button
+                      className={chipClassName(allWeekdaysSelected)}
+                      type="button"
+                      onClick={() => setWeekdays(allWeekdaysSelected ? [] : WEEKDAY_OPTIONS.map((day) => day.value))}
+                    >
+                      Todos los dias
+                    </button>
+                  </div>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {WEEKDAY_OPTIONS.map((day) => (
                       <button

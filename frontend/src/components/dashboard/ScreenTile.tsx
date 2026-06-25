@@ -1,8 +1,7 @@
-import { ArrowRightLeft, Cpu, PencilLine, PlayCircle, Trash2 } from "lucide-react";
+import { ArrowRightLeft, CalendarClock, Cpu, PencilLine, PlayCircle, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 
-import { formatHeartbeatAge } from "../../lib/labels";
-import { formatChannelMode } from "../../lib/labels";
+import { formatChannelMode, formatHeartbeatAge } from "../../lib/labels";
 import type { ChannelStatus } from "../../types/domain";
 import { StatusBadge } from "../StatusBadge";
 
@@ -44,7 +43,10 @@ export function ScreenTile({
   lastHeartbeatAt,
   eyebrow,
   hasAssignedCampaign,
+  scheduleCount,
+  scheduleSummary,
   onPublishCampaign,
+  onManageSchedules,
   onEdit,
   onDelete,
 }: {
@@ -60,7 +62,10 @@ export function ScreenTile({
   lastHeartbeatAt?: string | null;
   eyebrow?: string;
   hasAssignedCampaign?: boolean;
+  scheduleCount?: number;
+  scheduleSummary?: string;
   onPublishCampaign?: () => void;
+  onManageSchedules?: () => void;
   onEdit?: () => void;
   onDelete?: () => void;
 }) {
@@ -86,12 +91,18 @@ export function ScreenTile({
         <StatusBadge status={status} />
       </div>
 
-      {onPublishCampaign || onEdit || onDelete ? (
+      {onPublishCampaign || onManageSchedules || onEdit || onDelete ? (
         <div className="mt-4 flex flex-wrap gap-2">
           {onPublishCampaign ? (
             <ScreenActionButton onClick={onPublishCampaign}>
               <ArrowRightLeft className="h-3.5 w-3.5" />
               {hasAssignedCampaign ? "Cambiar campaña" : "Publicar campaña"}
+            </ScreenActionButton>
+          ) : null}
+          {onManageSchedules ? (
+            <ScreenActionButton onClick={onManageSchedules}>
+              <CalendarClock className="h-3.5 w-3.5" />
+              Programaciones
             </ScreenActionButton>
           ) : null}
           {onEdit ? (
@@ -136,6 +147,22 @@ export function ScreenTile({
           </div>
           <p className="mt-2 line-clamp-2 break-all text-sm text-slate-700">{hardwareLabel ?? "Pendiente"}</p>
         </div>
+      </div>
+
+      <div className="mt-3 rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3">
+        <div className="flex items-center justify-between gap-2 text-slate-500">
+          <div className="flex items-center gap-2">
+            <CalendarClock className="h-4 w-4" />
+            <span className="text-[11px] uppercase tracking-[0.2em]">Programaciones</span>
+          </div>
+          <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-700">
+            {scheduleCount ?? 0}
+          </span>
+        </div>
+        <p className="mt-2 text-sm font-semibold text-ink">{scheduleSummary ?? "Sin programaciones"}</p>
+        <p className="mt-1 text-xs text-slate-500">
+          {(scheduleCount ?? 0) > 0 ? "Puedes editar, desactivar o eliminar reglas desde este dashboard." : "La pantalla depende solo de la campaña visible actual."}
+        </p>
       </div>
 
       <div className="mt-3 rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3">

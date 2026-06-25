@@ -5,6 +5,7 @@ import { useParams } from "react-router-dom";
 import { SectionCard } from "../../components/SectionCard";
 import { BranchFormDrawer } from "../../components/dashboard/BranchFormDrawer";
 import { BranchInfrastructureCard } from "../../components/dashboard/BranchInfrastructureCard";
+import { ChannelSchedulesDrawer } from "../../components/dashboard/ChannelSchedulesDrawer";
 import type { CampaignPublishSummary } from "../../components/dashboard/CampaignPublishResultSummary";
 import type { PublishTargetBranchGroup, PublishableChannelTarget } from "../../components/dashboard/CampaignPublishTargetTree";
 import { DashboardExecutiveBar } from "../../components/dashboard/DashboardExecutiveBar";
@@ -38,6 +39,8 @@ type ScreenTileView = {
   hardwareLabel: string | null;
   lastHeartbeatAt: string | null;
   heartbeatAgeSeconds: number | null;
+  scheduleCount: number;
+  scheduleSummary: string;
   eyebrow?: string;
   channel: Channel | null;
   node: VideowallNode | null;
@@ -153,6 +156,11 @@ type PublishDrawerState =
     }
   | null;
 
+type ScheduleDrawerState = {
+  branch: Branch;
+  channel: Channel;
+} | null;
+
 type VideowallEditTarget = {
   branch: Branch;
   videowall: Videowall;
@@ -236,6 +244,36 @@ function getChannelSchedules(channel: Channel, schedules: ScheduleItem[]) {
   return schedules.filter((item) => item.channel_id === channel.id || (!item.channel_id && item.branch_id === channel.branch_id));
 }
 
+function compareSchedulePriority(left: ScheduleItem, right: ScheduleItem) {
+  return right.priority - left.priority || (left.starts_on ?? "9999-12-31").localeCompare(right.starts_on ?? "9999-12-31");
+}
+
+function buildScheduleSnapshot(channel: Channel, schedules: ScheduleItem[], campaignsById: Map<string, Campaign>) {
+  const channelSchedules = getChannelSchedules(channel, schedules);
+  if (channelSchedules.length === 0) {
+    return {
+      scheduleCount: 0,
+      scheduleSummary: "Sin programaciones",
+    };
+  }
+
+  const activeSchedule = channelSchedules.filter((schedule) => isScheduleActiveNow(schedule)).sort(compareSchedulePriority)[0] ?? null;
+  if (activeSchedule) {
+    const activeCampaignName = campaignsById.get(activeSchedule.campaign_id)?.name ?? "Campaña";
+    return {
+      scheduleCount: channelSchedules.length,
+      scheduleSummary: `Activa: ${activeCampaignName}`,
+    };
+  }
+
+  const nextSchedule = channelSchedules.slice().sort(compareSchedulePriority)[0];
+  const nextCampaignName = campaignsById.get(nextSchedule.campaign_id)?.name ?? "Campaña";
+  return {
+    scheduleCount: channelSchedules.length,
+    scheduleSummary: `Programada: ${nextCampaignName}`,
+  };
+}
+
 function getPhysicalScreenCount(channel: Channel) {
   return channel.mode === "expanded" ? Math.max(2, channel.screen_count) : 1;
 }
@@ -284,6 +322,7 @@ export function ClientOverviewPage() {
   const [videowallMonitorState, setVideowallMonitorState] = useState<VideowallMonitorState>(null);
   const [selectedVideowallCell, setSelectedVideowallCell] = useState<{ videowallId: string; position: number } | null>(null);
   const [publishDrawerState, setPublishDrawerState] = useState<PublishDrawerState>(null);
+  const [scheduleDrawerState, setScheduleDrawerState] = useState<ScheduleDrawerState>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -436,6 +475,7 @@ export function ClientOverviewPage() {
 
       const standaloneTiles = standaloneChannels.map<ScreenTileView>((channel) => {
         const context = channelContextById.get(channel.id);
+        const scheduleSnapshot = buildScheduleSnapshot(channel, schedules, campaignsById);
 
         return {
           id: channel.id,
@@ -452,6 +492,8 @@ export function ClientOverviewPage() {
           hardwareLabel: channel.hardware_identifier,
           lastHeartbeatAt: channel.last_heartbeat_at ?? channel.last_ping_at,
           heartbeatAgeSeconds: channel.heartbeat_age_seconds,
+          scheduleCount: scheduleSnapshot.scheduleCount,
+          scheduleSummary: scheduleSnapshot.scheduleSummary,
           eyebrow: "Pantalla",
           channel,
           node: null,
@@ -461,6 +503,7 @@ export function ClientOverviewPage() {
 
       const expandedGroups = expandedChannels.map<ExpandedGroupView>((channel) => {
         const context = channelContextById.get(channel.id);
+        const scheduleSnapshot = buildScheduleSnapshot(channel, schedules, campaignsById);
         const outputs = Array.from({ length: Math.max(2, channel.screen_count) }, (_, index) => ({
           id: `${channel.id}-output-${index + 1}`,
           title: `Salida ${index + 1}`,
@@ -476,6 +519,8 @@ export function ClientOverviewPage() {
           hardwareLabel: channel.hardware_identifier,
           lastHeartbeatAt: channel.last_heartbeat_at ?? channel.last_ping_at,
           heartbeatAgeSeconds: channel.heartbeat_age_seconds,
+          scheduleCount: scheduleSnapshot.scheduleCount,
+          scheduleSummary: scheduleSnapshot.scheduleSummary,
           eyebrow: channel.name,
           channel,
           node: null,
@@ -510,6 +555,7 @@ export function ClientOverviewPage() {
         const nodeTiles = nodes.map<ScreenTileView>((node) => {
           const channel = nodeChannelById.get(node.channel_id) ?? null;
           const context = channel ? channelContextById.get(channel.id) : null;
+          const scheduleSnapshot = channel ? buildScheduleSnapshot(channel, schedules, campaignsById) : { scheduleCount: 0, scheduleSummary: "Sin programaciones" };
 
           return {
             id: node.id,
@@ -526,6 +572,8 @@ export function ClientOverviewPage() {
             hardwareLabel: channel?.hardware_identifier ?? null,
             lastHeartbeatAt: channel?.last_heartbeat_at ?? channel?.last_ping_at ?? null,
             heartbeatAgeSeconds: channel?.heartbeat_age_seconds ?? null,
+            scheduleCount: scheduleSnapshot.scheduleCount,
+            scheduleSummary: scheduleSnapshot.scheduleSummary,
             eyebrow: videowall.name,
             channel,
             node,
@@ -572,7 +620,7 @@ export function ClientOverviewPage() {
         videowallGroups,
       };
     });
-  }, [branches, channelContextById, channels, nodesByVideowallId, schedules, videowallNodeByChannelId, videowalls]);
+  }, [branches, campaignsById, channelContextById, channels, nodesByVideowallId, schedules, videowallNodeByChannelId, videowalls]);
 
   const publishTargetGroups = useMemo<PublishTargetBranchGroup[]>(() => {
     return branchInfrastructure.map((branchCard) => {
@@ -916,6 +964,14 @@ export function ClientOverviewPage() {
     });
   }
 
+  async function handleSchedulesSaved(message: string) {
+    await loadDashboard();
+    setFeedback({
+      tone: "success",
+      text: message,
+    });
+  }
+
   async function handleDeleteConfirm() {
     if (!token || !deleteTarget) {
       return;
@@ -1084,6 +1140,8 @@ export function ClientOverviewPage() {
                             hardwareLabel={tile.hardwareLabel}
                             lastHeartbeatAt={tile.lastHeartbeatAt}
                             heartbeatAgeSeconds={tile.heartbeatAgeSeconds}
+                            scheduleCount={tile.scheduleCount}
+                            scheduleSummary={tile.scheduleSummary}
                             eyebrow={tile.eyebrow}
                             onPublishCampaign={
                               canManageInfrastructure && tile.channel
@@ -1094,6 +1152,11 @@ export function ClientOverviewPage() {
                                       tile.currentCampaignId,
                                       tile.campaignLabel,
                                     )
+                                : undefined
+                            }
+                            onManageSchedules={
+                              canManageInfrastructure && tile.channel
+                                ? () => setScheduleDrawerState({ branch: branchCard.branch, channel: tile.channel as Channel })
                                 : undefined
                             }
                             onEdit={
@@ -1153,6 +1216,8 @@ export function ClientOverviewPage() {
                               hardwareLabel={tile.hardwareLabel}
                               lastHeartbeatAt={tile.lastHeartbeatAt}
                               heartbeatAgeSeconds={tile.heartbeatAgeSeconds}
+                              scheduleCount={tile.scheduleCount}
+                              scheduleSummary={tile.scheduleSummary}
                               eyebrow={tile.eyebrow}
                               onPublishCampaign={
                                 canManageInfrastructure && tile.channel
@@ -1163,6 +1228,11 @@ export function ClientOverviewPage() {
                                         tile.currentCampaignId,
                                         tile.campaignLabel,
                                       )
+                                  : undefined
+                              }
+                              onManageSchedules={
+                                canManageInfrastructure && tile.channel
+                                  ? () => setScheduleDrawerState({ branch: branchCard.branch, channel: tile.channel as Channel })
                                   : undefined
                               }
                             />
@@ -1268,6 +1338,8 @@ export function ClientOverviewPage() {
                                 hardwareLabel={tile.hardwareLabel}
                                 lastHeartbeatAt={tile.lastHeartbeatAt}
                                 heartbeatAgeSeconds={tile.heartbeatAgeSeconds}
+                                scheduleCount={tile.scheduleCount}
+                                scheduleSummary={tile.scheduleSummary}
                                 eyebrow={tile.eyebrow}
                                 onPublishCampaign={
                                   canManageInfrastructure && tile.channel
@@ -1278,6 +1350,11 @@ export function ClientOverviewPage() {
                                           tile.currentCampaignId,
                                           tile.campaignLabel,
                                         )
+                                    : undefined
+                                }
+                                onManageSchedules={
+                                  canManageInfrastructure && tile.channel
+                                    ? () => setScheduleDrawerState({ branch: branchCard.branch, channel: tile.channel as Channel })
                                     : undefined
                                 }
                                 onEdit={
@@ -1431,6 +1508,17 @@ export function ClientOverviewPage() {
         resolutionHint={publishDrawerState?.scope === "videowall" ? publishDrawerState.resolutionHint : null}
         onClose={() => setPublishDrawerState(null)}
         onCompleted={handlePublishCompleted}
+      />
+
+      <ChannelSchedulesDrawer
+        open={Boolean(scheduleDrawerState)}
+        token={token}
+        branch={scheduleDrawerState?.branch ?? null}
+        channel={scheduleDrawerState?.channel ?? null}
+        schedules={scheduleDrawerState ? getChannelSchedules(scheduleDrawerState.channel, schedules) : []}
+        campaigns={campaigns}
+        onClose={() => setScheduleDrawerState(null)}
+        onSaved={handleSchedulesSaved}
       />
 
       <DeleteConfirmDialog

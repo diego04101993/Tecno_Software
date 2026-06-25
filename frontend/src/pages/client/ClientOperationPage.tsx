@@ -464,7 +464,8 @@ export function ClientOperationPage() {
     setPlaybackOrder(buildPlaybackOrder(editableTimelineEntries.length, playbackMode));
     setPlaybackCursor(0);
     setElapsedMs(0);
-    setIsPlaying(false);
+    setSelectedSequenceItemId(editableTimelineEntries[0]?.id ?? null);
+    setIsPlaying(editableTimelineEntries.length > 0);
   }, [editableTimelineEntries.length, playbackMode, playbackSignature, selectedCampaignId]);
 
   useEffect(() => {
@@ -486,9 +487,18 @@ export function ClientOperationPage() {
         setPlaybackCursor((cursor) => {
           const nextCursor = cursor + 1;
           if (nextCursor < playbackOrder.length) {
+            const nextEntry = editableTimelineEntries[playbackOrder[nextCursor] ?? 0];
+            if (nextEntry) {
+              setSelectedSequenceItemId(nextEntry.id);
+            }
             return nextCursor;
           }
-          setPlaybackOrder(buildPlaybackOrder(editableTimelineEntries.length, playbackMode));
+          const nextOrder = buildPlaybackOrder(editableTimelineEntries.length, playbackMode);
+          setPlaybackOrder(nextOrder);
+          const wrappedEntry = editableTimelineEntries[nextOrder[0] ?? 0];
+          if (wrappedEntry) {
+            setSelectedSequenceItemId(wrappedEntry.id);
+          }
           return 0;
         });
         return 0;

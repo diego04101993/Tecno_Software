@@ -611,6 +611,22 @@ class ScheduleCreate(BaseModel):
     priority: int = 100
 
 
+class ScheduleUpdate(BaseModel):
+    campaign_id: str | None = None
+    layout_id: str | None = None
+    title: str | None = None
+    recurrence: ScheduleRecurrence | None = None
+    days_of_week: list[int] | None = None
+    starts_on: date | None = None
+    ends_on: date | None = None
+    start_time: time | None = None
+    end_time: time | None = None
+    is_active: bool | None = None
+    is_looping: bool | None = None
+    timezone: str | None = None
+    priority: int | None = None
+
+
 class ScheduleRead(TimestampedModel):
     client_id: str
     campaign_id: str
