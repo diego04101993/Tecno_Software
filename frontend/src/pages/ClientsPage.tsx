@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+﻿import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { SectionCard } from "../components/SectionCard";
@@ -257,7 +257,7 @@ export function ClientsPage() {
           }
         >
           {error ? <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
-          <div className="grid gap-4 xl:grid-cols-2">
+          <div className="space-y-4">
             {clientCards.map(({ client, branchCount, channelCount, onlineChannels }) => {
               const statusTone =
                 client.status === "active"
@@ -266,73 +266,99 @@ export function ClientsPage() {
 
               return (
                 <article key={client.id} className="rounded-[28px] border border-slate-300 bg-white p-5 shadow-sm">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <p className="truncate font-display text-2xl text-ink" title={client.name}>
-                        {client.name}
-                      </p>
-                      <p className="mt-2 truncate text-sm text-slate-500" title={client.slug}>
-                        {client.slug}
-                      </p>
-                    </div>
-                    <span className={`rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-wide ${statusTone}`}>
-                      {formatClientStatus(client.status)}
-                    </span>
-                  </div>
+                  <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+                    <div className="min-w-0 flex-1 space-y-5">
+                      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                        <div className="min-w-0">
+                          <p className="truncate font-display text-[1.9rem] leading-tight text-ink" title={client.name}>
+                            {client.name}
+                          </p>
+                          <p className="mt-2 text-sm text-slate-500">
+                            Cliente SaaS listo para administrar sucursales, pantallas y operación diaria.
+                          </p>
+                        </div>
+                        <span className={`self-start rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-wide ${statusTone}`}>
+                          {formatClientStatus(client.status)}
+                        </span>
+                      </div>
 
-                  <div className="mt-5 grid gap-3 md:grid-cols-3">
-                    <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Sucursales</p>
-                      <p className="mt-2 font-semibold text-ink">{branchCount}</p>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Cliente</p>
+                          <p className="mt-2 truncate font-semibold text-ink" title={client.name}>
+                            {client.name}
+                          </p>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Marca</p>
+                          <p className="mt-2 truncate font-semibold text-ink" title={client.brand_name ?? "Sin marca definida"}>
+                            {client.brand_name ?? "Sin marca definida"}
+                          </p>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Slug</p>
+                          <p className="mt-2 truncate font-semibold text-ink" title={client.slug}>
+                            {client.slug}
+                          </p>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Sucursales</p>
+                          <p className="mt-2 font-semibold text-ink">{branchCount}</p>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Pantallas</p>
+                          <p className="mt-2 font-semibold text-ink">{channelCount}</p>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Online</p>
+                          <p className="mt-2 font-semibold text-ink">{onlineChannels}</p>
+                        </div>
+                        <div className="col-span-full min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Contacto</p>
+                          <p className="mt-2 truncate font-semibold text-ink" title={client.contact_email ?? "Sin correo definido"}>
+                            {client.contact_email ?? "Sin correo definido"}
+                          </p>
+                        </div>
+                      </div>
                     </div>
-                    <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Pantallas</p>
-                      <p className="mt-2 font-semibold text-ink">
-                        {channelCount} totales · {onlineChannels} online
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                      <p className="text-xs uppercase tracking-wide text-slate-500">Contacto</p>
-                      <p className="mt-2 truncate font-semibold text-ink" title={client.contact_email ?? "Sin correo definido"}>
-                        {client.contact_email ?? "Sin correo definido"}
-                      </p>
-                    </div>
-                  </div>
 
-                  <div className="mt-5 flex flex-wrap gap-2">
-                    <Link
-                      className="inline-flex rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-accent hover:text-ink"
-                      to={buildClientOverviewPath(client.id)}
-                    >
-                      Abrir workspace
-                    </Link>
-                    {canManageDirectory ? (
-                      <>
-                        <button
-                          className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-ink"
-                          type="button"
-                          onClick={() => openClientDrawer(client, "general")}
+                    <div className="w-full xl:w-[220px] xl:shrink-0">
+                      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+                        <Link
+                          className="inline-flex justify-center rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-accent hover:text-ink"
+                          to={buildClientOverviewPath(client.id)}
                         >
-                          Editar
-                        </button>
-                        <button
-                          className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-ink"
-                          type="button"
-                          onClick={() => setStatusTarget(client)}
-                        >
-                          {client.status === "active" ? "Suspender" : "Reactivar"}
-                        </button>
-                      </>
-                    ) : null}
-                    {canDeleteClients ? (
-                      <button
-                        className="rounded-full border border-rose-300 px-4 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50"
-                        type="button"
-                        onClick={() => setDeleteTarget(client)}
-                      >
-                        Eliminar
-                      </button>
-                    ) : null}
+                          Abrir workspace
+                        </Link>
+                        {canManageDirectory ? (
+                          <>
+                            <button
+                              className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-ink"
+                              type="button"
+                              onClick={() => openClientDrawer(client, "general")}
+                            >
+                              Editar
+                            </button>
+                            <button
+                              className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-400 hover:text-ink"
+                              type="button"
+                              onClick={() => setStatusTarget(client)}
+                            >
+                              {client.status === "active" ? "Suspender" : "Reactivar"}
+                            </button>
+                          </>
+                        ) : null}
+                        {canDeleteClients ? (
+                          <button
+                            className="rounded-full border border-rose-300 px-4 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50"
+                            type="button"
+                            onClick={() => setDeleteTarget(client)}
+                          >
+                            Eliminar
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 </article>
               );
@@ -510,3 +536,4 @@ export function ClientsPage() {
     </>
   );
 }
+
