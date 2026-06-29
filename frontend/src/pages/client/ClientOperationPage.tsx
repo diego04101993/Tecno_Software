@@ -465,7 +465,7 @@ export function ClientOperationPage() {
     setPlaybackCursor(0);
     setElapsedMs(0);
     setSelectedSequenceItemId(editableTimelineEntries[0]?.id ?? null);
-    setIsPlaying(editableTimelineEntries.length > 0);
+    setIsPlaying(false);
   }, [editableTimelineEntries.length, playbackMode, playbackSignature, selectedCampaignId]);
 
   useEffect(() => {
@@ -659,6 +659,50 @@ export function ClientOperationPage() {
     }
   }
 
+  async function handleCreateUrlContent(payload: { name: string; url: string; durationSeconds: number | null }) {
+    if (!token || !clientId || !selectedCampaignId) {
+      return;
+    }
+
+    const campaignId = selectedCampaignId;
+    const trimmedName = payload.name.trim();
+    const trimmedUrl = payload.url.trim();
+    if (!trimmedName) {
+      setError("Escribe un nombre para la URL.");
+      return;
+    }
+    if (!trimmedUrl) {
+      setError("Pega una URL válida para continuar.");
+      return;
+    }
+    if (!/^[a-z]+:\/\//i.test(trimmedUrl)) {
+      setError("La URL debe incluir protocolo, por ejemplo https://, http://, rtmp:// o rtsp://.");
+      return;
+    }
+
+    try {
+      const created = await apiRequest<ContentItem>("/contents", {
+        method: "POST",
+        token,
+        body: {
+          client_id: clientId,
+          folder_id: selectedFolderScope !== "all" && selectedFolderScope !== "uncategorized" ? selectedFolderScope : null,
+          name: trimmedName,
+          type: "url",
+          source_url: trimmedUrl,
+          ...(payload.durationSeconds ? { duration_seconds: Math.max(1, Math.round(payload.durationSeconds)) } : {}),
+        },
+      });
+
+      setContents((current) => [created, ...current]);
+      setError(null);
+      await handleAddToSequence(created.id, created, campaignId);
+    } catch (nextError) {
+      setError(resolveApiErrorMessage(nextError, "No se pudo guardar la URL en la biblioteca"));
+      throw nextError;
+    }
+  }
+
   async function handleCreateCampaign(name: string) {
     if (!token || !clientId) {
       return;
@@ -729,15 +773,15 @@ export function ClientOperationPage() {
     await Promise.all([loadSequence(campaignId), loadSequencePreview(campaignId)]);
   }
 
-  async function handleAddToSequence(contentId: string) {
-    if (!token || !selectedCampaignId) {
+  async function handleAddToSequence(contentId: string, contentOverride?: ContentItem | null, campaignIdOverride?: string) {
+    const campaignId = campaignIdOverride ?? selectedCampaignId;
+    if (!token || !campaignId) {
       return;
     }
 
     pausePreviewPlayback();
-    const campaignId = selectedCampaignId;
     setAddingContentIds((current) => (current.includes(contentId) ? current : [...current, contentId]));
-    const content = contents.find((item) => item.id === contentId);
+    const content = contentOverride ?? contents.find((item) => item.id === contentId) ?? null;
     const requestTask = async () => {
       try {
         const created = await apiRequest<CampaignSequenceItem>(`/campaigns/${campaignId}/sequence`, {
@@ -1210,6 +1254,7 @@ export function ClientOperationPage() {
                 onAddToPlaylist={handleAddToSequence}
                 onDeleteContent={(content) => setDeleteTarget({ kind: "content", entity: content })}
                 onUpload={handleQuickUpload}
+                onCreateUrlContent={handleCreateUrlContent}
                 addingContentIds={addingContentIds}
                 canEdit={canEditOperation}
                 selectedCampaignName={selectedCampaign?.name ?? null}

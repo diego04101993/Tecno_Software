@@ -1,6 +1,40 @@
 import { FileCode2, Globe, ImageIcon, LayoutTemplate, Type, Video } from "lucide-react";
 
-import { resolvePreviewMediaUrl, type PreviewRenderableEntry } from "../lib/preview";
+import { isStreamLikeContent, resolvePreviewMediaUrl, type PreviewRenderableEntry } from "../lib/preview";
+
+function resolveUrlPreviewFrame(url: string | null) {
+  if (!url) {
+    return null;
+  }
+
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    const hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+
+    if (hostname === "youtube.com" || hostname === "m.youtube.com") {
+      const videoId = parsed.searchParams.get("v");
+      if (videoId) {
+        return `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
+      }
+    }
+
+    if (hostname === "youtu.be") {
+      const videoId = parsed.pathname.replace(/\//g, "");
+      if (videoId) {
+        return `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
+      }
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
 
 function getOverlayLabel(entry: PreviewRenderableEntry | null) {
   if (!entry?.content) {
@@ -155,28 +189,58 @@ export function PreviewContentSurface({
   }
 
   if (content?.type === "url") {
+    const sourceUrl = content.source_url ?? "";
+    const streamLike = isStreamLikeContent(content);
+    const frameUrl = streamLike ? null : resolveUrlPreviewFrame(sourceUrl);
+
     return (
       <div className={`h-full overflow-hidden border border-slate-200 bg-white shadow-sm ${baseChrome}`}>
         <div className="flex items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
           <span className="h-2.5 w-2.5 rounded-full bg-rose-300" />
           <span className="h-2.5 w-2.5 rounded-full bg-amber-300" />
           <span className="h-2.5 w-2.5 rounded-full bg-emerald-300" />
-          <div className="ml-2 truncate rounded-full bg-white px-3 py-1 text-xs text-slate-500" title={content.source_url ?? ""}>
-            {content.source_url ?? "URL externa"}
+          <div className="ml-2 truncate rounded-full bg-white px-3 py-1 text-xs text-slate-500" title={sourceUrl}>
+            {sourceUrl || "URL externa"}
           </div>
         </div>
-        <div className="flex h-[calc(100%-57px)] flex-col justify-between bg-gradient-to-br from-slate-100 via-white to-cyan-50 px-5 py-5">
-          <div>
-            <p className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-cyan-700">
-              <Globe className="h-3.5 w-3.5" />
-              Vista web simulada
-            </p>
-            <p className="mt-3 text-lg font-semibold text-ink">{title ?? content.name}</p>
-            <p className="mt-2 text-sm text-slate-600">La pantalla mostrara este sitio dentro del player usando la resolucion configurada.</p>
-          </div>
-          <div className="rounded-[18px] border border-slate-200 bg-white/90 px-4 py-4 text-sm text-slate-700">
-            <p className="font-semibold text-ink">{content.source_url ?? "URL pendiente"}</p>
-          </div>
+        <div className="flex h-[calc(100%-57px)] flex-col bg-gradient-to-br from-slate-100 via-white to-cyan-50">
+          {frameUrl ? (
+            <div className="relative min-h-0 flex-1 overflow-hidden">
+              <iframe
+                className="h-full w-full bg-white"
+                referrerPolicy="strict-origin-when-cross-origin"
+                sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-presentation"
+                src={frameUrl}
+                title={title ?? content.name}
+              />
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent px-5 py-4 text-white">
+                <p className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.2em] text-cyan-200">
+                  <Globe className="h-3.5 w-3.5" />
+                  Vista embebida
+                </p>
+                <p className="mt-2 truncate text-lg font-semibold">{title ?? content.name}</p>
+                <p className="mt-1 truncate text-xs text-slate-200">{sourceUrl}</p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex h-full flex-col justify-between px-5 py-5">
+              <div>
+                <p className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-cyan-700">
+                  <Globe className="h-3.5 w-3.5" />
+                  {streamLike ? "Stream o fuente externa" : "Vista web simulada"}
+                </p>
+                <p className="mt-3 text-lg font-semibold text-ink">{title ?? content.name}</p>
+                <p className="mt-2 text-sm text-slate-600">
+                  {streamLike
+                    ? "El SaaS guarda este enlace para runtime. La reproducción real del stream dependerá del Player."
+                    : "Si el sitio no permite iframe, aquí verás una tarjeta representativa con la URL."}
+                </p>
+              </div>
+              <div className="rounded-[18px] border border-slate-200 bg-white/90 px-4 py-4 text-sm text-slate-700">
+                <p className="font-semibold text-ink">{sourceUrl || "URL pendiente"}</p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );

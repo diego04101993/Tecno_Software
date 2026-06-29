@@ -43,6 +43,7 @@ type OperationLibraryPanelProps = {
   onAddToPlaylist: (contentId: string) => void;
   onDeleteContent: (content: ContentItem) => void;
   onUpload: (payload: { file: File; name: string; durationSeconds: number }) => Promise<void>;
+  onCreateUrlContent: (payload: { name: string; url: string; durationSeconds: number | null }) => Promise<void>;
   addingContentIds: string[];
   canEdit: boolean;
   selectedCampaignName: string | null;
@@ -133,6 +134,7 @@ export function OperationLibraryPanel({
   onAddToPlaylist,
   onDeleteContent,
   onUpload,
+  onCreateUrlContent,
   addingContentIds,
   canEdit,
   selectedCampaignName,
@@ -142,6 +144,10 @@ export function OperationLibraryPanel({
   const [uploadName, setUploadName] = useState("");
   const [uploadDurationSeconds, setUploadDurationSeconds] = useState(15);
   const [uploading, setUploading] = useState(false);
+  const [urlName, setUrlName] = useState("");
+  const [urlValue, setUrlValue] = useState("");
+  const [urlDurationSeconds, setUrlDurationSeconds] = useState("15");
+  const [creatingUrlContent, setCreatingUrlContent] = useState(false);
   const [draggingContentId, setDraggingContentId] = useState<string | null>(null);
   const [dropFolderId, setDropFolderId] = useState<string | null>(null);
   const orderedFolders = useMemo(() => sortFolders(folders), [folders]);
@@ -230,7 +236,34 @@ export function OperationLibraryPanel({
     }
   }
 
+  async function handleCreateUrlSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (creatingUrlContent) {
+      return;
+    }
+
+    setCreatingUrlContent(true);
+    try {
+      await onCreateUrlContent({
+        name: urlName.trim(),
+        url: urlValue.trim(),
+        durationSeconds: urlDurationSeconds.trim() ? Number(urlDurationSeconds) || 1 : null,
+      });
+      setUrlName("");
+      setUrlValue("");
+      setUrlDurationSeconds("15");
+    } finally {
+      setCreatingUrlContent(false);
+    }
+  }
+
   const explorerItemCount = currentFolderChildren.length + visibleFiles.length;
+  const urlSubmitDisabled =
+    !canEdit ||
+    !selectedCampaignName ||
+    !urlName.trim() ||
+    !urlValue.trim() ||
+    creatingUrlContent;
 
   return (
     <div id="operation-library-panel" className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden px-4 py-4">
@@ -367,6 +400,77 @@ export function OperationLibraryPanel({
             </button>
           ))}
         </div>
+
+        {selectedFilter === "url" ? (
+          <form className="rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3" onSubmit={handleCreateUrlSubmit}>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Agregar URL / Streaming</p>
+                <p className="mt-1 text-sm text-slate-600">Pega una página web, un stream o un enlace embebible para guardarlo y sumarlo a la campaña activa.</p>
+              </div>
+              <span className="rounded-full bg-white px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500 shadow-sm">URL</span>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <label className="block">
+                <span className="mb-2 block text-sm font-semibold text-slate-700">Nombre del contenido</span>
+                <input
+                  value={urlName}
+                  onChange={(event) => setUrlName(event.target.value)}
+                  disabled={creatingUrlContent}
+                  placeholder="Ej. Canal en vivo / YouTube demo"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-2 block text-sm font-semibold text-slate-700">URL</span>
+                <input
+                  value={urlValue}
+                  onChange={(event) => setUrlValue(event.target.value)}
+                  disabled={creatingUrlContent}
+                  placeholder="https://..."
+                  type="text"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-2 block text-sm font-semibold text-slate-700">Duración en segundos</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={urlDurationSeconds}
+                  onChange={(event) => setUrlDurationSeconds(event.target.value)}
+                  disabled={creatingUrlContent}
+                  placeholder="15"
+                />
+              </label>
+
+              <button
+                className="w-full rounded-[16px] bg-ink px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={urlSubmitDisabled}
+                type="submit"
+              >
+                {creatingUrlContent ? "Guardando..." : "Guardar y agregar a campaña"}
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
+              <p>
+                <span className="font-semibold text-slate-700">Carpeta actual:</span> {currentFolder?.name ?? "General"}
+              </p>
+              <p>
+                <span className="font-semibold text-slate-700">Campaña activa:</span> {selectedCampaignName ?? "Selecciona una campaña"}
+              </p>
+              <p>
+                <span className="font-semibold text-slate-700">Duración:</span> {urlDurationSeconds.trim() || "15"}s
+              </p>
+            </div>
+
+            {!selectedCampaignName ? (
+              <p className="mt-3 text-xs text-amber-700">Selecciona una campaña en el panel izquierdo para guardar la URL y agregarla al timeline.</p>
+            ) : null}
+          </form>
+        ) : null}
       </div>
 
       <div className="mt-3 min-h-0 flex-1 overflow-hidden rounded-[20px] border border-slate-200 bg-white">
