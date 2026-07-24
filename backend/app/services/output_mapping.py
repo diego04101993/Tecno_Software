@@ -179,21 +179,20 @@ def _build_auto_slices(
 
 
 def _build_custom_default_slice(*, output_width: int, output_height: int, canvas_width: int, canvas_height: int) -> dict[str, object]:
-    scale = min(output_width / max(1, canvas_width), output_height / max(1, canvas_height))
-    scaled_width = max(1, round(canvas_width * scale))
-    scaled_height = max(1, round(canvas_height * scale))
+    viewport_width = max(1, min(output_width, canvas_width))
+    viewport_height = max(1, min(output_height, canvas_height))
     return {
         "slice_index": 1,
         "source_x": 0,
         "source_y": 0,
         "source_width": canvas_width,
         "source_height": canvas_height,
-        "output_x": round((output_width - scaled_width) / 2),
-        "output_y": round((output_height - scaled_height) / 2),
-        "output_width": scaled_width,
-        "output_height": scaled_height,
-        "scale_x": _round_scale(scaled_width / max(1, canvas_width)),
-        "scale_y": _round_scale(scaled_height / max(1, canvas_height)),
+        "output_x": 0,
+        "output_y": 0,
+        "output_width": viewport_width,
+        "output_height": viewport_height,
+        "scale_x": _round_scale(viewport_width / max(1, canvas_width)),
+        "scale_y": _round_scale(viewport_height / max(1, canvas_height)),
     }
 
 

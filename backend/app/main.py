@@ -2,8 +2,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
+from app.api.routes import media
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_db
@@ -40,7 +40,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/media", StaticFiles(directory=settings.MEDIA_ROOT), name="media")
+app.include_router(media.router)
 app.include_router(api_router, prefix=settings.API_PREFIX)
 
 

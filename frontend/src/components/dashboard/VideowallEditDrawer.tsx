@@ -2,7 +2,7 @@ import { X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "../../lib/api";
-import type { Videowall, VideowallNode } from "../../types/domain";
+import type { Channel, Videowall, VideowallNode, VideowallRenderMode } from "../../types/domain";
 import { getApiErrorMessage } from "./apiError";
 import { SimpleVideowallMatrix } from "./SimpleVideowallMatrix";
 
@@ -19,6 +19,7 @@ export function VideowallEditDrawer({
   token,
   videowall,
   nodes,
+  channels,
   onClose,
   onSaved,
 }: {
@@ -26,14 +27,19 @@ export function VideowallEditDrawer({
   token: string | null;
   videowall: Videowall | null;
   nodes: VideowallNode[];
+  channels: Channel[];
   onClose: () => void;
   onSaved: (videowall: Videowall) => Promise<void> | void;
 }) {
   const [name, setName] = useState("");
+  const [renderMode, setRenderMode] = useState<VideowallRenderMode>("multi-node");
   const [rows, setRows] = useState(1);
   const [columns, setColumns] = useState(1);
   const [totalWidth, setTotalWidth] = useState(1920);
   const [totalHeight, setTotalHeight] = useState(1080);
+  const [outputWidth, setOutputWidth] = useState(1920);
+  const [outputHeight, setOutputHeight] = useState(1080);
+  const [primaryChannelId, setPrimaryChannelId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -43,17 +49,27 @@ export function VideowallEditDrawer({
     }
 
     setName(videowall.name);
+    setRenderMode(videowall.render_mode);
     setRows(videowall.rows);
     setColumns(videowall.columns);
     setTotalWidth(videowall.total_width);
     setTotalHeight(videowall.total_height);
+    setOutputWidth(videowall.output_width || Math.max(1, Math.round(videowall.total_width / Math.max(1, videowall.columns))));
+    setOutputHeight(videowall.output_height || Math.max(1, Math.round(videowall.total_height / Math.max(1, videowall.rows))));
+    setPrimaryChannelId(videowall.primary_channel_id ?? "");
     setError(null);
   }, [open, videowall]);
 
+  const isHardwareSingleInput = renderMode === "hardware-single-input";
+  const videowallChannels = useMemo(() => channels.filter((channel) => channel.mode === "videowall"), [channels]);
   const previewOccupiedPositions = useMemo(() => {
     const safeTotal = Math.max(1, rows) * Math.max(1, columns);
     return nodes.map((node) => node.position_index).filter((position) => position <= safeTotal);
   }, [columns, nodes, rows]);
+  const primaryChannel = useMemo(
+    () => videowallChannels.find((channel) => channel.id === primaryChannelId) ?? null,
+    [primaryChannelId, videowallChannels],
+  );
 
   if (!open || !videowall) {
     return null;
@@ -76,10 +92,20 @@ export function VideowallEditDrawer({
         token,
         body: {
           name: name.trim(),
+          render_mode: renderMode,
           rows: normalizePositiveInt(rows, activeVideowall.rows),
           columns: normalizePositiveInt(columns, activeVideowall.columns),
           total_width: normalizePositiveInt(totalWidth, activeVideowall.total_width),
           total_height: normalizePositiveInt(totalHeight, activeVideowall.total_height),
+          output_width: normalizePositiveInt(
+            outputWidth,
+            activeVideowall.output_width || Math.max(1, Math.round(activeVideowall.total_width / Math.max(1, activeVideowall.columns))),
+          ),
+          output_height: normalizePositiveInt(
+            outputHeight,
+            activeVideowall.output_height || Math.max(1, Math.round(activeVideowall.total_height / Math.max(1, activeVideowall.rows))),
+          ),
+          primary_channel_id: isHardwareSingleInput ? primaryChannelId || null : null,
         },
       });
 
@@ -100,7 +126,9 @@ export function VideowallEditDrawer({
           <div>
             <p className="text-xs uppercase tracking-[0.24em] text-accent">Editar videowall</p>
             <h3 className="mt-2 font-display text-3xl text-ink">{activeVideowall.name}</h3>
-            <p className="mt-2 text-sm text-slate-600">Ajusta nombre, matriz y resolución total sin salir del dashboard.</p>
+            <p className="mt-2 text-sm text-slate-600">
+              Ajusta nombre, tipo y resolución del grupo sin salir del dashboard.
+            </p>
           </div>
           <button
             aria-label="Cerrar drawer"
@@ -115,11 +143,48 @@ export function VideowallEditDrawer({
         {error ? <div className="mt-5 rounded-[20px] bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
 
         <form className="mt-6 space-y-5" onSubmit={handleSubmit}>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div className="md:col-span-2 xl:col-span-3">
-              <label className="mb-2 block text-sm font-semibold text-slate-700">Nombre</label>
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+            <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+              <label className="mb-2 block text-sm font-semibold text-slate-700">Nombre del grupo</label>
               <input value={name} onChange={(event) => setName(event.target.value)} required />
             </div>
+            <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+              <p className="mb-3 text-sm font-semibold text-slate-700">Tipo de videowall</p>
+              <div className="grid gap-3 md:grid-cols-2">
+                {[
+                  {
+                    id: "multi-node" as VideowallRenderMode,
+                    title: "Distribuido por varios Players",
+                    description: "Mantiene nodos, crop por monitor y sincronización entre salidas.",
+                  },
+                  {
+                    id: "hardware-single-input" as VideowallRenderMode,
+                    title: "Cascada HDMI / una sola entrada",
+                    description: "Un solo canal principal para un muro lógico completo por HDMI.",
+                  },
+                ].map((option) => {
+                  const active = renderMode === option.id;
+
+                  return (
+                    <button
+                      key={option.id}
+                      className={[
+                        "rounded-[22px] border px-4 py-3 text-left transition",
+                        active ? "border-cyan-300 bg-cyan-50" : "border-slate-200 bg-white hover:border-slate-300",
+                      ].join(" ")}
+                      type="button"
+                      onClick={() => setRenderMode(option.id)}
+                    >
+                      <p className="font-semibold text-ink">{option.title}</p>
+                      <p className="mt-1 text-sm text-slate-600">{option.description}</p>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Filas</label>
               <input type="number" min={1} value={rows} onChange={(event) => setRows(Number(event.target.value) || 1)} />
@@ -129,42 +194,99 @@ export function VideowallEditDrawer({
               <input type="number" min={1} value={columns} onChange={(event) => setColumns(Number(event.target.value) || 1)} />
             </div>
             <div>
-              <label className="mb-2 block text-sm font-semibold text-slate-700">Resolución total ancho</label>
+              <label className="mb-2 block text-sm font-semibold text-slate-700">Ancho total del muro</label>
               <input type="number" min={1} value={totalWidth} onChange={(event) => setTotalWidth(Number(event.target.value) || 1)} />
             </div>
             <div>
-              <label className="mb-2 block text-sm font-semibold text-slate-700">Resolución total alto</label>
+              <label className="mb-2 block text-sm font-semibold text-slate-700">Alto total del muro</label>
               <input type="number" min={1} value={totalHeight} onChange={(event) => setTotalHeight(Number(event.target.value) || 1)} />
+            </div>
+            <div>
+              <label className="mb-2 block text-sm font-semibold text-slate-700">Salida HDMI ancho</label>
+              <input type="number" min={1} value={outputWidth} onChange={(event) => setOutputWidth(Number(event.target.value) || 1)} />
+            </div>
+            <div>
+              <label className="mb-2 block text-sm font-semibold text-slate-700">Salida HDMI alto</label>
+              <input type="number" min={1} value={outputHeight} onChange={(event) => setOutputHeight(Number(event.target.value) || 1)} />
             </div>
           </div>
 
-          <section className="rounded-[24px] border border-slate-200 bg-slate-50 p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Preview de matriz</p>
-                <p className="mt-2 text-sm text-slate-600">
-                  {Math.max(1, columns)}x{Math.max(1, rows)} · {Math.max(1, columns) * Math.max(1, rows)} monitores
-                </p>
+          {isHardwareSingleInput ? (
+            <section className="rounded-[24px] border border-slate-200 bg-slate-50 p-5">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="rounded-[20px] border border-cyan-200 bg-cyan-50 px-4 py-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-cyan-700">Modo guardado</p>
+                    <p className="mt-2 font-semibold text-ink">Cascada HDMI / una sola entrada</p>
+                    <p className="mt-2 text-sm text-slate-700">
+                      El player principal renderiza todo el muro lógico desde una sola salida HDMI.
+                    </p>
+                  </div>
+                  <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                    <label className="mb-2 block text-sm font-semibold text-slate-700">Canal principal</label>
+                    <select value={primaryChannelId} onChange={(event) => setPrimaryChannelId(event.target.value)}>
+                      <option value="">Selecciona un canal principal</option>
+                      {videowallChannels.map((channel) => (
+                        <option key={channel.id} value={channel.id}>
+                          {channel.name} · {channel.channel_code}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-2 text-xs text-slate-500">
+                      Se usará este canal como entrada HDMI base para todo el videowall por hardware.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid gap-3">
+                  <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Muro lógico</p>
+                    <p className="mt-2 font-semibold text-ink">
+                      {Math.max(1, totalWidth)}x{Math.max(1, totalHeight)}
+                    </p>
+                  </div>
+                  <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Salida HDMI</p>
+                    <p className="mt-2 font-semibold text-ink">
+                      {Math.max(1, outputWidth)}x{Math.max(1, outputHeight)}
+                    </p>
+                  </div>
+                  <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Canal actual</p>
+                    <p className="mt-2 font-semibold text-ink">{primaryChannel?.name ?? "Pendiente"}</p>
+                    <p className="mt-1 text-xs text-slate-500">{primaryChannel?.channel_code ?? "Sin canal asignado"}</p>
+                  </div>
+                </div>
               </div>
-              <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                <span className="rounded-full bg-emerald-50 px-3 py-1.5 text-emerald-700">{nodes.length} configurados</span>
-                <span className="rounded-full bg-slate-200 px-3 py-1.5 text-slate-700">
-                  {Math.max(0, Math.max(1, columns) * Math.max(1, rows) - nodes.length)} pendientes
-                </span>
+            </section>
+          ) : (
+            <section className="rounded-[24px] border border-slate-200 bg-slate-50 p-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Preview de matriz</p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    {Math.max(1, columns)}x{Math.max(1, rows)} · {Math.max(1, columns) * Math.max(1, rows)} monitores
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  <span className="rounded-full bg-emerald-50 px-3 py-1.5 text-emerald-700">{nodes.length} configurados</span>
+                  <span className="rounded-full bg-slate-200 px-3 py-1.5 text-slate-700">
+                    {Math.max(0, Math.max(1, columns) * Math.max(1, rows) - nodes.length)} pendientes
+                  </span>
+                </div>
               </div>
-            </div>
-            <div className="mt-4">
-              <SimpleVideowallMatrix
-                columns={Math.max(1, columns)}
-                rows={Math.max(1, rows)}
-                occupiedPositions={previewOccupiedPositions}
-                showLabels
-              />
-            </div>
-            <p className="mt-4 text-xs text-slate-500">
-              Si reduces filas o columnas y algún nodo queda fuera de rango, el backend bloqueará el cambio con un mensaje claro.
-            </p>
-          </section>
+              <div className="mt-4">
+                <SimpleVideowallMatrix
+                  columns={Math.max(1, columns)}
+                  rows={Math.max(1, rows)}
+                  occupiedPositions={previewOccupiedPositions}
+                  showLabels
+                />
+              </div>
+              <p className="mt-4 text-xs text-slate-500">
+                Los nodos actuales se conservan. Si reduces filas o columnas y algún nodo queda fuera de rango, el backend bloqueará el cambio.
+              </p>
+            </section>
+          )}
 
           <div className="flex flex-wrap gap-3">
             <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting} type="submit">

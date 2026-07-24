@@ -2,7 +2,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
-from app.models.entities import Branch, Campaign, CampaignChannelAssignment, CampaignPlaylistItem, Channel, Client, ContentItem, ContentFolder, DataSource, Dataset, Layout, LayoutDataBinding, Schedule, TouchExperience, User, UserRole, VideowallNode
+from app.models.entities import Branch, Campaign, CampaignChannelAssignment, CampaignPlaylistItem, Channel, Client, ContentItem, ContentFolder, DataSource, Dataset, Layout, LayoutDataBinding, Schedule, TouchExperience, User, UserRole, Videowall, VideowallNode
 
 
 GLOBAL_WORKSPACE_ROLES = {UserRole.SUPER_ADMIN, UserRole.STAFF_ADMIN, UserRole.STAFF_OPERATOR}
@@ -278,8 +278,14 @@ def branch_content_ids_query(branch_id: str):
 
 
 def branch_videowall_ids_query(branch_id: str):
-    return (
+    node_scoped_videowalls = (
         select(VideowallNode.videowall_id)
         .join(Channel, VideowallNode.channel_id == Channel.id)
         .where(Channel.branch_id == branch_id)
     )
+    hardware_scoped_videowalls = (
+        select(Videowall.id)
+        .join(Channel, Videowall.primary_channel_id == Channel.id)
+        .where(Channel.branch_id == branch_id)
+    )
+    return node_scoped_videowalls.union(hardware_scoped_videowalls)

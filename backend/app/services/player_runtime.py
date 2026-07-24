@@ -436,7 +436,32 @@ def _resolve_layout_runtime(layout: Layout | None, db: Session) -> tuple[dict[st
 def _resolve_videowall_runtime(channel: Channel, db: Session) -> dict[str, object]:
     node = db.scalar(select(VideowallNode).where(VideowallNode.channel_id == channel.id))
     if not node:
-        return {"enabled": False}
+        hardware_videowall = db.scalar(
+            select(Videowall)
+            .where(
+                Videowall.primary_channel_id == channel.id,
+                Videowall.render_mode == "hardware-single-input",
+            )
+            .limit(1)
+        )
+        if not hardware_videowall:
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "mode": "hardware_videowall",
+            "render_mode": "hardware-single-input",
+            "wall_id": hardware_videowall.id,
+            "videowall_id": hardware_videowall.id,
+            "name": hardware_videowall.name,
+            "columns": hardware_videowall.columns,
+            "rows": hardware_videowall.rows,
+            "total_width": hardware_videowall.total_width,
+            "total_height": hardware_videowall.total_height,
+            "output_width": hardware_videowall.output_width,
+            "output_height": hardware_videowall.output_height,
+            "node": None,
+        }
 
     videowall = db.get(Videowall, node.videowall_id)
     if not videowall:

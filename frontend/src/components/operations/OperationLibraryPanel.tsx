@@ -42,11 +42,28 @@ type OperationLibraryPanelProps = {
   onMoveContentToFolder: (contentId: string, folderId: string | null) => Promise<void> | void;
   onAddToPlaylist: (contentId: string) => void;
   onDeleteContent: (content: ContentItem) => void;
-  onUpload: (payload: { file: File; name: string; durationSeconds: number }) => Promise<void>;
+  onUpload: (payload: { file: File; name: string; durationSeconds: number; onProgress?: (progress: { loaded: number; total: number; percent: number }) => void }) => Promise<void>;
+  onRefreshAfterUpload: () => Promise<unknown>;
   onCreateUrlContent: (payload: { name: string; url: string; durationSeconds: number | null }) => Promise<void>;
   addingContentIds: string[];
   canEdit: boolean;
   selectedCampaignName: string | null;
+};
+
+type UploadQueueItemStatus = "pending" | "uploading" | "completed" | "error";
+
+type UploadQueueItem = {
+  id: string;
+  file: File;
+  name: string;
+  kindLabel: string;
+  sizeLabel: string;
+  durationSeconds: number;
+  status: UploadQueueItemStatus;
+  progressPercent: number;
+  loadedBytes: number;
+  totalBytes: number;
+  errorMessage: string | null;
 };
 
 function resolveAssetPath(path: string | null) {
@@ -114,6 +131,54 @@ function resolveLocalVideoDuration(file: File): Promise<number | null> {
   });
 }
 
+function formatFileSize(size: number) {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  if (size < 1024 * 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(size / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function inferUploadKind(file: File) {
+  if (file.type.startsWith("video/")) {
+    return "Video";
+  }
+  if (file.type.startsWith("image/")) {
+    return "Imagen";
+  }
+  return "Archivo";
+}
+
+function getUploadStatusMeta(status: UploadQueueItemStatus) {
+  switch (status) {
+    case "uploading":
+      return {
+        label: "Subiendo",
+        className: "bg-cyan-50 text-cyan-700 border-cyan-200",
+      };
+    case "completed":
+      return {
+        label: "Completado",
+        className: "bg-emerald-50 text-emerald-700 border-emerald-200",
+      };
+    case "error":
+      return {
+        label: "Error",
+        className: "bg-rose-50 text-rose-700 border-rose-200",
+      };
+    default:
+      return {
+        label: "Pendiente",
+        className: "bg-slate-100 text-slate-600 border-slate-200",
+      };
+  }
+}
+
 export function OperationLibraryPanel({
   allContents,
   folders,
@@ -134,16 +199,17 @@ export function OperationLibraryPanel({
   onAddToPlaylist,
   onDeleteContent,
   onUpload,
+  onRefreshAfterUpload,
   onCreateUrlContent,
   addingContentIds,
   canEdit,
   selectedCampaignName,
 }: OperationLibraryPanelProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [pendingFile, setPendingFile] = useState<File | null>(null);
-  const [uploadName, setUploadName] = useState("");
-  const [uploadDurationSeconds, setUploadDurationSeconds] = useState(15);
+  const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
+  const [preparingUploadBatch, setPreparingUploadBatch] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
   const [urlName, setUrlName] = useState("");
   const [urlValue, setUrlValue] = useState("");
   const [urlDurationSeconds, setUrlDurationSeconds] = useState("15");
@@ -151,6 +217,21 @@ export function OperationLibraryPanel({
   const [draggingContentId, setDraggingContentId] = useState<string | null>(null);
   const [dropFolderId, setDropFolderId] = useState<string | null>(null);
   const orderedFolders = useMemo(() => sortFolders(folders), [folders]);
+  const uploadGeneralProgress = useMemo(() => {
+    const totalBytes = uploadQueue.reduce((sum, item) => sum + Math.max(1, item.totalBytes || item.file.size || 1), 0);
+    if (!totalBytes) {
+      return 0;
+    }
+    const loadedBytes = uploadQueue.reduce((sum, item) => {
+      if (item.status === "completed") {
+        return sum + Math.max(item.totalBytes || item.file.size, item.loadedBytes);
+      }
+      return sum + item.loadedBytes;
+    }, 0);
+    return Math.min(100, Math.round((loadedBytes / totalBytes) * 100));
+  }, [uploadQueue]);
+  const uploadCompletedCount = useMemo(() => uploadQueue.filter((item) => item.status === "completed").length, [uploadQueue]);
+  const uploadErrorCount = useMemo(() => uploadQueue.filter((item) => item.status === "error").length, [uploadQueue]);
 
   const currentFolder = useMemo(
     () => (selectedFolderScope === "all" || selectedFolderScope === "uncategorized" ? null : folders.find((folder) => folder.id === selectedFolderScope) ?? null),
@@ -200,39 +281,130 @@ export function OperationLibraryPanel({
     return path;
   }, [currentFolder, folders]);
 
-  async function handlePickFile(event: ChangeEvent<HTMLInputElement>) {
-    const nextFile = event.target.files?.[0] ?? null;
-    setPendingFile(nextFile);
-    setUploadName(nextFile ? nextFile.name.replace(/\.[^.]+$/, "") : "");
-    if (!nextFile) {
-      setUploadDurationSeconds(15);
-      return;
-    }
-    const detectedDuration = await resolveLocalVideoDuration(nextFile);
-    setUploadDurationSeconds(detectedDuration ?? 15);
+  function updateUploadQueueItem(itemId: string, patch: Partial<UploadQueueItem>) {
+    setUploadQueue((current) => current.map((item) => (item.id === itemId ? { ...item, ...patch } : item)));
   }
 
-  async function handleUploadSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!pendingFile || uploading) {
+  async function runUploadBatch(items: UploadQueueItem[]) {
+    if (items.length === 0) {
       return;
     }
 
     setUploading(true);
+    setUploadFeedback(null);
+
     try {
-      await onUpload({
-        file: pendingFile,
-        name: uploadName.trim() || pendingFile.name.replace(/\.[^.]+$/, ""),
-        durationSeconds: uploadDurationSeconds,
-      });
-      setPendingFile(null);
-      setUploadName("");
-      setUploadDurationSeconds(15);
+      const queue = [...items];
+      let completed = 0;
+      let failed = 0;
+
+      await Promise.all(
+        Array.from({ length: Math.min(2, queue.length) }, async () => {
+          while (queue.length > 0) {
+            const currentItem = queue.shift();
+            if (!currentItem) {
+              return;
+            }
+
+            updateUploadQueueItem(currentItem.id, {
+              status: "uploading",
+              progressPercent: 0,
+              loadedBytes: 0,
+              totalBytes: currentItem.file.size,
+              errorMessage: null,
+            });
+
+            try {
+              await onUpload({
+                file: currentItem.file,
+                name: currentItem.name,
+                durationSeconds: currentItem.durationSeconds,
+                onProgress: (progress) => {
+                  updateUploadQueueItem(currentItem.id, {
+                    progressPercent: progress.percent,
+                    loadedBytes: progress.loaded,
+                    totalBytes: progress.total || currentItem.file.size,
+                  });
+                },
+              });
+              completed += 1;
+              updateUploadQueueItem(currentItem.id, {
+                status: "completed",
+                progressPercent: 100,
+                loadedBytes: currentItem.file.size,
+                totalBytes: currentItem.file.size,
+              });
+            } catch (error) {
+              failed += 1;
+              updateUploadQueueItem(currentItem.id, {
+                status: "error",
+                errorMessage: error instanceof Error ? error.message : "No se pudo subir el archivo.",
+              });
+            }
+          }
+        }),
+      );
+
+      if (completed > 0) {
+        try {
+          await onRefreshAfterUpload();
+        } catch {
+          setUploadFeedback("Los archivos se subieron, pero no se pudo refrescar la biblioteca automáticamente.");
+          return;
+        }
+      }
+
+      setUploadFeedback(`${completed} archivo(s) subidos, ${failed} con error.`);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handlePickFile(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    if (selectedFiles.length === 0 || preparingUploadBatch || uploading) {
+      return;
+    }
+
+    if (selectedFiles.length > 5) {
+      setUploadFeedback("Puedes subir un máximo de 5 archivos a la vez.");
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
+      return;
+    }
+
+    setPreparingUploadBatch(true);
+    setUploadFeedback(null);
+
+    try {
+      const preparedQueue = await Promise.all(
+        selectedFiles.map(async (file) => {
+          const detectedDuration = await resolveLocalVideoDuration(file);
+          return {
+            id: crypto.randomUUID(),
+            file,
+            name: file.name.replace(/\.[^.]+$/, ""),
+            kindLabel: inferUploadKind(file),
+            sizeLabel: formatFileSize(file.size),
+            durationSeconds: detectedDuration ?? 15,
+            status: "pending" as UploadQueueItemStatus,
+            progressPercent: 0,
+            loadedBytes: 0,
+            totalBytes: file.size,
+            errorMessage: null,
+          };
+        }),
+      );
+
+      setUploadQueue(preparedQueue);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+
+      await runUploadBatch(preparedQueue);
     } finally {
-      setUploading(false);
+      setPreparingUploadBatch(false);
     }
   }
 
@@ -281,12 +453,12 @@ export function OperationLibraryPanel({
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             className="inline-flex items-center gap-2 rounded-full bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-white transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={!canEdit}
+            disabled={!canEdit || preparingUploadBatch || uploading}
             type="button"
             onClick={() => fileInputRef.current?.click()}
           >
             <UploadCloud className="h-3.5 w-3.5" />
-            Subir archivos
+            {preparingUploadBatch ? "Preparando..." : uploading ? "Subiendo lote..." : "Subir archivos"}
           </button>
           <button
             className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-600 transition hover:border-slate-300 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
@@ -309,39 +481,66 @@ export function OperationLibraryPanel({
           ) : null}
         </div>
 
-        <input ref={fileInputRef} className="hidden" type="file" accept="image/*,video/*" onChange={handlePickFile} />
+        <input ref={fileInputRef} className="hidden" type="file" accept="image/*,video/*" multiple onChange={handlePickFile} />
 
-        {pendingFile ? (
-          <form className="mt-3 rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3" onSubmit={handleUploadSubmit}>
-            <div className="flex flex-wrap items-start justify-between gap-3">
+        {uploadFeedback ? (
+          <div className={`mt-3 rounded-[18px] px-4 py-3 text-sm ${uploadErrorCount > 0 ? "border border-amber-200 bg-amber-50 text-amber-900" : "border border-slate-200 bg-slate-50 text-slate-700"}`}>
+            {uploadFeedback}
+          </div>
+        ) : null}
+
+        {uploadQueue.length > 0 ? (
+          <div className="mt-3 rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Archivo listo para subir</p>
-                <p className="mt-1 truncate text-sm font-semibold text-ink" title={pendingFile.name}>
-                  {pendingFile.name}
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Cola de carga</p>
+                <p className="mt-1 text-sm font-semibold text-ink">
+                  {uploadQueue.length} archivo(s) en el lote · {uploadCompletedCount} completado(s)
                 </p>
               </div>
-              <span className="rounded-full bg-white px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500 shadow-sm">Media</span>
+              <span className="rounded-full bg-white px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500 shadow-sm">
+                {uploadGeneralProgress}%
+              </span>
             </div>
 
-            <div className="mt-3 grid gap-2 xl:grid-cols-[minmax(0,1fr)_90px_auto]">
-              <input value={uploadName} onChange={(event) => setUploadName(event.target.value)} disabled={uploading} placeholder="Nombre visible" />
-              <input
-                type="number"
-                min={1}
-                value={uploadDurationSeconds}
-                onChange={(event) => setUploadDurationSeconds(Number(event.target.value) || 1)}
-                disabled={uploading}
-                placeholder="Seg"
-              />
-              <button
-                className="rounded-[14px] bg-ink px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-                disabled={uploading}
-                type="submit"
-              >
-                {uploading ? "Subiendo..." : "Subir"}
-              </button>
+            <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200">
+              <div className="h-full rounded-full bg-slate-900 transition-all" style={{ width: `${uploadGeneralProgress}%` }} />
             </div>
-          </form>
+
+            <div className="mt-3 space-y-2">
+              {uploadQueue.map((item) => {
+                const statusMeta = getUploadStatusMeta(item.status);
+                return (
+                  <div key={item.id} className="rounded-[16px] border border-slate-200 bg-white px-3 py-3 shadow-sm">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-ink" title={item.file.name}>
+                          {item.file.name}
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {item.kindLabel} · {item.sizeLabel}
+                        </p>
+                      </div>
+                      <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] ${statusMeta.className}`}>
+                        {statusMeta.label}
+                      </span>
+                    </div>
+
+                    <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-200">
+                      <div className="h-full rounded-full bg-cyan-500 transition-all" style={{ width: `${item.progressPercent}%` }} />
+                    </div>
+
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                      <span>{item.progressPercent}%</span>
+                      <span>{item.durationSeconds}s</span>
+                    </div>
+
+                    {item.errorMessage ? <p className="mt-2 text-xs text-rose-700">{item.errorMessage}</p> : null}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         ) : null}
 
         <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">

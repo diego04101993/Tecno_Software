@@ -9,7 +9,7 @@ import { OperationItemInspector } from "../../components/operations/OperationIte
 import { OperationLibraryPanel } from "../../components/operations/OperationLibraryPanel";
 import { OperationPreviewSidebar } from "../../components/operations/OperationPreviewSidebar";
 import { OperationSequenceTimeline } from "../../components/operations/OperationSequenceTimeline";
-import { apiRequest } from "../../lib/api";
+import { apiRequest, uploadApiRequest, type UploadProgress } from "../../lib/api";
 import { useAuth } from "../../lib/auth";
 import { decorateResolvedSequenceEntries, enrichSequenceEntries, getSequenceTotalDuration, type PreviewSequenceEntry } from "../../lib/preview";
 import { canWriteClientScope } from "../../lib/rbac";
@@ -624,7 +624,7 @@ export function ClientOperationPage() {
       });
   }
 
-  async function handleQuickUpload(payload: { file: File; name: string; durationSeconds: number }) {
+  async function handleQuickUpload(payload: { file: File; name: string; durationSeconds: number; onProgress?: (progress: UploadProgress) => void }) {
     if (!token || !clientId) {
       return;
     }
@@ -639,22 +639,12 @@ export function ClientOperationPage() {
     }
 
     try {
-      await apiRequest<ContentItem>("/contents/upload", {
-        method: "POST",
+      await uploadApiRequest<ContentItem>("/contents/upload", {
         token,
         formData,
-      });
-      await loadContentsCatalog();
-      setError(null);
-      setNotice({
-        tone: "success",
-        message:
-          selectedFolderScope !== "all" && selectedFolderScope !== "uncategorized"
-            ? `Contenido subido correctamente a ${selectedFolderLabel}.`
-            : "Contenido subido correctamente a la biblioteca del studio.",
+        onProgress: payload.onProgress,
       });
     } catch (nextError) {
-      setError(resolveApiErrorMessage(nextError, "No se pudo subir el contenido"));
       throw nextError;
     }
   }
@@ -1183,6 +1173,7 @@ export function ClientOperationPage() {
                 nextEntry={nextEntry}
                 currentIndex={playbackEntries.length === 0 ? 0 : playbackCursor}
                 currentLoopTimeSeconds={currentLoopTimeSeconds}
+                currentClipElapsedSeconds={elapsedMs / 1000}
                 currentItemDurationSeconds={currentItemDurationSeconds}
                 totalDurationSeconds={totalSequenceDuration}
                 progressPercent={progressPercent}
@@ -1254,6 +1245,7 @@ export function ClientOperationPage() {
                 onAddToPlaylist={handleAddToSequence}
                 onDeleteContent={(content) => setDeleteTarget({ kind: "content", entity: content })}
                 onUpload={handleQuickUpload}
+                onRefreshAfterUpload={loadContentsCatalog}
                 onCreateUrlContent={handleCreateUrlContent}
                 addingContentIds={addingContentIds}
                 canEdit={canEditOperation}

@@ -73,6 +73,13 @@ def raise_channel_conflict(exc: IntegrityError) -> None:
     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No se pudo guardar la pantalla por un conflicto de datos") from exc
 
 
+def channel_belongs_to_videowall(db: Session, channel_id: str) -> bool:
+    return bool(
+        db.scalar(select(VideowallNode.id).where(VideowallNode.channel_id == channel_id).limit(1))
+        or db.scalar(select(Videowall.id).where(Videowall.primary_channel_id == channel_id).limit(1))
+    )
+
+
 def get_channel_dependency_errors(
     db: Session,
     channel: Channel,
@@ -84,7 +91,7 @@ def get_channel_dependency_errors(
         dependency_errors.append("campañas asignadas")
     if db.scalar(select(Schedule.id).where(Schedule.channel_id == channel.id).limit(1)):
         dependency_errors.append("programación activa")
-    if include_videowall_membership and db.scalar(select(VideowallNode.id).where(VideowallNode.channel_id == channel.id).limit(1)):
+    if include_videowall_membership and channel_belongs_to_videowall(db, channel.id):
         dependency_errors.append("relación con un videowall")
     if db.scalar(select(AudioAssignment.id).where(AudioAssignment.channel_id == channel.id).limit(1)):
         dependency_errors.append("configuración de audio")
@@ -103,7 +110,7 @@ def get_channel_delete_block_message(
 ) -> str | None:
     if is_player_online(channel.last_heartbeat_at):
         return "Esta pantalla est\u00e1 en l\u00ednea y no puede eliminarse. Solo puedes eliminar pantallas offline."
-    if include_videowall_membership and db.scalar(select(VideowallNode.id).where(VideowallNode.channel_id == channel.id).limit(1)):
+    if include_videowall_membership and channel_belongs_to_videowall(db, channel.id):
         return "Esta pantalla pertenece a un videowall. Elim\u00ednala desde el administrador del videowall."
     return None
 

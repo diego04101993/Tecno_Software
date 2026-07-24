@@ -29,6 +29,23 @@ type ScheduleFormState = {
   isActive: boolean;
 };
 
+function validateScheduleWindow({
+  startsOn,
+  endsOn,
+  startTime,
+  endTime,
+}: Pick<ScheduleFormState, "startsOn" | "endsOn" | "startTime" | "endTime">) {
+  if (startsOn && endsOn && startsOn > endsOn) {
+    return "La fecha de inicio no puede ser posterior a la fecha de fin.";
+  }
+
+  if (startTime && endTime && startTime >= endTime) {
+    return "La hora de inicio debe ser menor que la hora de fin.";
+  }
+
+  return null;
+}
+
 function chipClassName(active = false) {
   return [
     "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] transition",
@@ -252,6 +269,7 @@ export function ChannelSchedulesDrawer({
     [editingScheduleId, orderedSchedules],
   );
   const allDaysSelected = Boolean(formState && formState.weekdays.length === ALL_WEEKDAY_VALUES.length);
+  const formValidationError = formState ? validateScheduleWindow(formState) : null;
 
   useEffect(() => {
     if (!open) {
@@ -273,6 +291,12 @@ export function ChannelSchedulesDrawer({
 
   async function handleSaveSchedule() {
     if (!token || !editingSchedule || !formState) {
+      return;
+    }
+
+    if (formValidationError) {
+      setFeedback(null);
+      setError(formValidationError);
       return;
     }
 
@@ -508,6 +532,12 @@ export function ChannelSchedulesDrawer({
               <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Edicion</p>
               {editingSchedule && formState ? (
                 <div className="mt-4 space-y-4">
+                  {formValidationError ? (
+                    <div className="rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                      {formValidationError}
+                    </div>
+                  ) : null}
+
                   <div>
                     <label className="mb-2 block text-sm font-semibold text-slate-700">Campana</label>
                     <select
@@ -633,7 +663,7 @@ export function ChannelSchedulesDrawer({
                   <div className="flex flex-wrap gap-3">
                     <button
                       className="inline-flex items-center gap-2 rounded-[18px] bg-ink px-5 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-                      disabled={!formState.title.trim() || !formState.campaignId || busyAction !== null}
+                      disabled={!formState.title.trim() || !formState.campaignId || Boolean(formValidationError) || busyAction !== null}
                       type="button"
                       onClick={() => void handleSaveSchedule()}
                     >

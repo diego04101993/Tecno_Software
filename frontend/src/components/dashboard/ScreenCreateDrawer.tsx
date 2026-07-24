@@ -2,7 +2,7 @@ import { Columns2, Monitor, TvMinimalPlay, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "../../lib/api";
-import type { Branch, Channel, Orientation, Videowall, VideowallNode } from "../../types/domain";
+import type { Branch, Channel, Orientation, Videowall, VideowallNode, VideowallRenderMode } from "../../types/domain";
 import { getVideowallCellMetrics } from "../VideowallGridPreview";
 import { LedOutputMappingPanel, buildOutputMappingDraft, type ChannelOutputMappingDraft } from "./LedOutputMappingPanel";
 import { SimpleVideowallMatrix } from "./SimpleVideowallMatrix";
@@ -20,6 +20,7 @@ type SubmitNotice =
 
 const defaultVideowallDraft = {
   name: "",
+  render_mode: "multi-node" as VideowallRenderMode,
   columns: 2,
   rows: 2,
   resolution_basis: "monitor" as ResolutionBasis,
@@ -27,6 +28,8 @@ const defaultVideowallDraft = {
   monitor_height: 1080,
   total_width: 3840,
   total_height: 2160,
+  output_width: 1920,
+  output_height: 1080,
   position_index: 1,
 };
 
@@ -123,7 +126,7 @@ export function ScreenCreateDrawer({
     apiRequest<Videowall[]>(`/videowalls?client_id=${clientId}&branch_id=${branch?.id ?? ""}`, { token })
       .then((response) => {
         setVideowalls(response);
-        setSelectedVideowallId((current) => current || response[0]?.id || "");
+        setSelectedVideowallId((current) => current || response.find((item) => item.render_mode === "multi-node")?.id || "");
         setCatalogError(null);
       })
       .catch((nextError) => {
@@ -151,7 +154,7 @@ export function ScreenCreateDrawer({
   }, [mode, open, selectedVideowallId, token, videowallFlow]);
 
   const selectedExistingVideowall = useMemo(
-    () => videowalls.find((item) => item.id === selectedVideowallId) ?? null,
+    () => videowalls.find((item) => item.id === selectedVideowallId && item.render_mode === "multi-node") ?? null,
     [selectedVideowallId, videowalls],
   );
   const occupiedPositions = useMemo(
@@ -161,6 +164,8 @@ export function ScreenCreateDrawer({
 
   const videowallDerived = useMemo(() => {
     const usingExistingVideowall = mode === "videowall" && videowallFlow === "existing" && selectedExistingVideowall;
+    const renderMode = usingExistingVideowall ? selectedExistingVideowall.render_mode : videowallDraft.render_mode;
+    const isHardwareSingleInput = renderMode === "hardware-single-input";
     const columns = usingExistingVideowall
       ? selectedExistingVideowall.columns
       : normalizePositiveInt(videowallDraft.columns, 2);
@@ -168,14 +173,20 @@ export function ScreenCreateDrawer({
     const totalMonitors = columns * rows;
     const totalWidth = usingExistingVideowall
       ? selectedExistingVideowall.total_width
-      : videowallDraft.resolution_basis === "monitor"
+      : !isHardwareSingleInput && videowallDraft.resolution_basis === "monitor"
         ? normalizePositiveInt(videowallDraft.monitor_width, 1920) * columns
         : Math.max(columns, normalizePositiveInt(videowallDraft.total_width, 3840));
     const totalHeight = usingExistingVideowall
       ? selectedExistingVideowall.total_height
-      : videowallDraft.resolution_basis === "monitor"
+      : !isHardwareSingleInput && videowallDraft.resolution_basis === "monitor"
         ? normalizePositiveInt(videowallDraft.monitor_height, 1080) * rows
         : Math.max(rows, normalizePositiveInt(videowallDraft.total_height, 2160));
+    const outputWidth = usingExistingVideowall
+      ? selectedExistingVideowall.output_width
+      : normalizePositiveInt(videowallDraft.output_width, 1920);
+    const outputHeight = usingExistingVideowall
+      ? selectedExistingVideowall.output_height
+      : normalizePositiveInt(videowallDraft.output_height, 1080);
     const takenPositions = usingExistingVideowall ? occupiedPositions : [];
     const availablePositions = Array.from({ length: totalMonitors }, (_, index) => index + 1).filter(
       (position) => !takenPositions.includes(position),
@@ -183,14 +194,18 @@ export function ScreenCreateDrawer({
     const safePosition = availablePositions.includes(videowallDraft.position_index)
       ? videowallDraft.position_index
       : availablePositions[0] ?? 1;
-    const selectedCell = getVideowallCellMetrics(columns, rows, totalWidth, totalHeight, safePosition);
+    const selectedCell = isHardwareSingleInput ? null : getVideowallCellMetrics(columns, rows, totalWidth, totalHeight, safePosition);
 
     return {
+      renderMode,
+      isHardwareSingleInput,
       columns,
       rows,
       totalMonitors,
       totalWidth,
       totalHeight,
+      outputWidth,
+      outputHeight,
       configuredNodes: takenPositions.length,
       pendingNodes: Math.max(0, totalMonitors - takenPositions.length),
       selectedPosition: safePosition,
@@ -201,7 +216,7 @@ export function ScreenCreateDrawer({
   }, [mode, occupiedPositions, selectedExistingVideowall, videowallDraft, videowallFlow]);
 
   useEffect(() => {
-    if (mode !== "videowall") {
+    if (mode !== "videowall" || videowallDerived.isHardwareSingleInput) {
       return;
     }
 
@@ -218,6 +233,7 @@ export function ScreenCreateDrawer({
   }
 
   const targetBranch = branch;
+  const compatibleExistingVideowalls = videowalls.filter((item) => item.render_mode === "multi-node");
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -225,7 +241,7 @@ export function ScreenCreateDrawer({
       return;
     }
 
-    if (mode === "videowall" && videowallFlow === "existing") {
+    if (mode === "videowall" && !videowallDerived.isHardwareSingleInput && videowallFlow === "existing") {
       if (!selectedExistingVideowall) {
         setError("Selecciona un videowall existente antes de guardar la pantalla.");
         return;
@@ -237,6 +253,11 @@ export function ScreenCreateDrawer({
       }
     }
 
+    if (mode === "videowall" && !videowallDerived.isHardwareSingleInput && !videowallDerived.selectedCell) {
+      setError("No se pudo calcular la posición del nodo seleccionado.");
+      return;
+    }
+
     setIsSubmitting(true);
     setError(null);
     setNotice(null);
@@ -246,8 +267,18 @@ export function ScreenCreateDrawer({
         client_id: clientId,
         branch_id: targetBranch.id,
         name,
-        resolution_width: mode === "videowall" ? videowallDerived.selectedCell.width : resolutionWidth,
-        resolution_height: mode === "videowall" ? videowallDerived.selectedCell.height : resolutionHeight,
+        resolution_width:
+          mode === "videowall"
+            ? videowallDerived.isHardwareSingleInput
+              ? videowallDerived.outputWidth
+              : (videowallDerived.selectedCell?.width ?? resolutionWidth)
+            : resolutionWidth,
+        resolution_height:
+          mode === "videowall"
+            ? videowallDerived.isHardwareSingleInput
+              ? videowallDerived.outputHeight
+              : (videowallDerived.selectedCell?.height ?? resolutionHeight)
+            : resolutionHeight,
         orientation,
         mode,
         screen_count: mode === "expanded" ? screenCount : 1,
@@ -269,48 +300,77 @@ export function ScreenCreateDrawer({
       let nextNotice: SubmitNotice = { tone: "success", text: "Pantalla creada correctamente." };
 
       if (mode === "videowall") {
-        let targetVideowall = selectedExistingVideowall;
-
-        if (videowallFlow === "create") {
-          targetVideowall = await apiRequest<Videowall>("/videowalls", {
+        if (videowallDerived.isHardwareSingleInput) {
+          await apiRequest<Videowall>("/videowalls", {
             method: "POST",
             token,
             body: {
               client_id: clientId,
               name: videowallDraft.name.trim() || `${name} Videowall`,
+              render_mode: "hardware-single-input",
               columns: videowallDerived.columns,
               rows: videowallDerived.rows,
               total_width: videowallDerived.totalWidth,
               total_height: videowallDerived.totalHeight,
+              output_width: videowallDerived.outputWidth,
+              output_height: videowallDerived.outputHeight,
+              primary_channel_id: channel.id,
               sync_mode: "play_at_timestamp",
             },
           });
-        }
 
-        try {
+          nextNotice = {
+            tone: "success",
+            text: `Pantalla y videowall HDMI creados. ${name} quedó como canal principal de la salida ${videowallDerived.outputWidth}x${videowallDerived.outputHeight}.`,
+          };
+        } else {
+          let targetVideowall = selectedExistingVideowall;
+
+          if (videowallFlow === "create") {
+            targetVideowall = await apiRequest<Videowall>("/videowalls", {
+              method: "POST",
+              token,
+              body: {
+                client_id: clientId,
+                name: videowallDraft.name.trim() || `${name} Videowall`,
+                render_mode: "multi-node",
+                columns: videowallDerived.columns,
+                rows: videowallDerived.rows,
+                total_width: videowallDerived.totalWidth,
+                total_height: videowallDerived.totalHeight,
+                output_width: videowallDerived.selectedCell?.width ?? videowallDerived.outputWidth,
+                output_height: videowallDerived.selectedCell?.height ?? videowallDerived.outputHeight,
+                sync_mode: "play_at_timestamp",
+              },
+            });
+          }
+
+          const selectedCell = videowallDerived.selectedCell;
+
+          try {
           await apiRequest(`/videowalls/${targetVideowall?.id}/nodes`, {
             method: "POST",
             token,
             body: {
               channel_id: channel.id,
               position_index: videowallDerived.selectedPosition,
-              row_index: videowallDerived.selectedCell.rowIndex,
-              column_index: videowallDerived.selectedCell.columnIndex,
-              x: videowallDerived.selectedCell.x,
-              y: videowallDerived.selectedCell.y,
-              width: videowallDerived.selectedCell.width,
-              height: videowallDerived.selectedCell.height,
+              row_index: selectedCell?.rowIndex,
+              column_index: selectedCell?.columnIndex,
+              x: selectedCell?.x,
+              y: selectedCell?.y,
+              width: selectedCell?.width,
+              height: selectedCell?.height,
             },
           });
           nextNotice =
             videowallFlow === "create"
               ? {
                   tone: "success",
-                  text: `Pantalla y grupo videowall creados. Nodo asignado en fila ${videowallDerived.selectedCell.rowIndex + 1}, columna ${videowallDerived.selectedCell.columnIndex + 1}.`,
+                  text: `Pantalla y grupo videowall creados. Nodo asignado en fila ${(selectedCell?.rowIndex ?? 0) + 1}, columna ${(selectedCell?.columnIndex ?? 0) + 1}.`,
                 }
               : {
                   tone: "success",
-                  text: `Pantalla creada y asignada al videowall existente en fila ${videowallDerived.selectedCell.rowIndex + 1}, columna ${videowallDerived.selectedCell.columnIndex + 1}.`,
+                  text: `Pantalla creada y asignada al videowall existente en fila ${(selectedCell?.rowIndex ?? 0) + 1}, columna ${(selectedCell?.columnIndex ?? 0) + 1}.`,
                 };
         } catch (nodeError) {
           nextNotice = {
@@ -320,6 +380,7 @@ export function ScreenCreateDrawer({
                 ? `La pantalla se creó, pero la posición del videowall quedó pendiente: ${nodeError.message}`
                 : "La pantalla se creó, pero la posición del videowall quedó pendiente.",
           };
+        }
         }
       } else if (mode === "expanded") {
         nextNotice = {
@@ -488,7 +549,62 @@ export function ScreenCreateDrawer({
 
           {mode === "videowall" ? (
             <section className="rounded-[28px] border border-slate-200 bg-slate-50 p-5">
-              <div className="flex flex-wrap gap-3">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+                <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+                  <label className="mb-2 block text-sm font-semibold text-slate-700">Nombre del grupo</label>
+                  <input
+                    value={videowallDraft.name}
+                    onChange={(event) => setVideowallDraft((current) => ({ ...current, name: event.target.value }))}
+                    placeholder="Videowall lobby"
+                  />
+                </div>
+                <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+                  <p className="mb-3 text-sm font-semibold text-slate-700">Tipo de videowall</p>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {[
+                      {
+                        id: "multi-node" as VideowallRenderMode,
+                        title: "Distribuido por varios Players",
+                        description: "Un canal por monitor, con crop individual y sincronización por nodo.",
+                      },
+                      {
+                        id: "hardware-single-input" as VideowallRenderMode,
+                        title: "Cascada HDMI / una sola entrada",
+                        description: "Una sola PC y una sola salida HDMI para todo el muro lógico.",
+                      },
+                    ].map((option) => {
+                      const active = videowallDraft.render_mode === option.id;
+
+                      return (
+                        <button
+                          key={option.id}
+                          className={[
+                            "rounded-[22px] border px-4 py-3 text-left transition",
+                            active ? "border-cyan-300 bg-cyan-50" : "border-slate-200 bg-white hover:border-slate-300",
+                          ].join(" ")}
+                          type="button"
+                          onClick={() => {
+                            setVideowallDraft((current) => ({
+                              ...current,
+                              render_mode: option.id,
+                            }));
+                            if (option.id === "hardware-single-input") {
+                              setVideowallFlow("create");
+                            }
+                          }}
+                        >
+                          <p className="font-semibold text-ink">{option.title}</p>
+                          <p className="mt-1 text-sm text-slate-600">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {!videowallDerived.isHardwareSingleInput ? (
+                <>
+              <div className="mt-5 flex flex-wrap gap-3">
                 <button
                   className={`rounded-full px-4 py-2 text-sm font-semibold ${videowallFlow === "create" ? "bg-ink text-white" : "border border-slate-200 bg-white text-slate-700"}`}
                   type="button"
@@ -513,14 +629,6 @@ export function ScreenCreateDrawer({
 
               {videowallFlow === "create" ? (
                 <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                  <div className="md:col-span-2 xl:col-span-3">
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">Nombre del grupo</label>
-                    <input
-                      value={videowallDraft.name}
-                      onChange={(event) => setVideowallDraft({ ...videowallDraft, name: event.target.value })}
-                      placeholder="Videowall lobby"
-                    />
-                  </div>
                   <div>
                     <label className="mb-2 block text-sm font-semibold text-slate-700">Columnas</label>
                     <input
@@ -632,8 +740,8 @@ export function ScreenCreateDrawer({
                 <div className="mt-5">
                   <label className="mb-2 block text-sm font-semibold text-slate-700">Selecciona un grupo</label>
                   <select value={selectedVideowallId} onChange={(event) => setSelectedVideowallId(event.target.value)}>
-                    {videowalls.length === 0 ? <option value="">No hay videowalls disponibles</option> : null}
-                    {videowalls.map((item) => (
+                    {compatibleExistingVideowalls.length === 0 ? <option value="">No hay videowalls multi-nodo disponibles</option> : null}
+                    {compatibleExistingVideowalls.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name}
                       </option>
@@ -698,19 +806,141 @@ export function ScreenCreateDrawer({
                   <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
                     <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Nodo seleccionado</p>
                     <p className="mt-2 font-semibold text-ink">
-                      Fila {videowallDerived.selectedCell.rowIndex + 1} · Columna {videowallDerived.selectedCell.columnIndex + 1}
+                      Fila {(videowallDerived.selectedCell?.rowIndex ?? 0) + 1} · Columna {(videowallDerived.selectedCell?.columnIndex ?? 0) + 1}
                     </p>
                     <p className="mt-1 text-xs text-slate-500">Posición {videowallDerived.selectedPosition}</p>
                   </div>
                   <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
                     <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Recorte del nodo</p>
                     <p className="mt-2 text-sm text-slate-700">
-                      x:{videowallDerived.selectedCell.x} · y:{videowallDerived.selectedCell.y} · {videowallDerived.selectedCell.width}x
-                      {videowallDerived.selectedCell.height}
+                      x:{videowallDerived.selectedCell?.x ?? 0} · y:{videowallDerived.selectedCell?.y ?? 0} · {videowallDerived.selectedCell?.width ?? 0}x
+                      {videowallDerived.selectedCell?.height ?? 0}
                     </p>
                   </div>
                 </div>
               </div>
+                </>
+              ) : (
+                <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                  <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3 xl:col-span-2">
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Columnas</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.columns}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            columns: normalizePositiveInt(Number(event.target.value), current.columns),
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Filas</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.rows}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            rows: normalizePositiveInt(Number(event.target.value), current.rows),
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Ancho total del muro</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.total_width}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            total_width: normalizePositiveInt(Number(event.target.value), current.total_width),
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Alto total del muro</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.total_height}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            total_height: normalizePositiveInt(Number(event.target.value), current.total_height),
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Salida HDMI ancho</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.output_width}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            output_width: normalizePositiveInt(Number(event.target.value), current.output_width),
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Salida HDMI alto</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={videowallDraft.output_height}
+                        onChange={(event) =>
+                          setVideowallDraft((current) => ({
+                            ...current,
+                            output_height: normalizePositiveInt(Number(event.target.value), current.output_height),
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="grid gap-3">
+                    <div className="rounded-[20px] border border-cyan-200 bg-cyan-50 px-4 py-4">
+                      <p className="text-xs uppercase tracking-[0.2em] text-cyan-700">Canal principal</p>
+                      <p className="mt-2 text-base font-semibold text-ink">{name || "Pantalla en creación"}</p>
+                      <p className="mt-2 text-sm text-slate-700">
+                        Esta pantalla será el canal principal del muro HDMI. No se crearán nodos ni crops individuales.
+                      </p>
+                    </div>
+                    <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Tipo</p>
+                      <p className="mt-2 font-semibold text-ink">Cascada HDMI / una sola entrada</p>
+                    </div>
+                    <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Muro lógico</p>
+                      <p className="mt-2 font-semibold text-ink">
+                        {videowallDerived.totalWidth}x{videowallDerived.totalHeight}
+                      </p>
+                    </div>
+                    <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Salida HDMI</p>
+                      <p className="mt-2 font-semibold text-ink">
+                        {videowallDerived.outputWidth}x{videowallDerived.outputHeight}
+                      </p>
+                    </div>
+                    <div className="rounded-[20px] border border-slate-200 bg-white px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Distribución</p>
+                      <p className="mt-2 font-semibold text-ink">
+                        {videowallDerived.columns}x{videowallDerived.rows}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </section>
           ) : null}
 

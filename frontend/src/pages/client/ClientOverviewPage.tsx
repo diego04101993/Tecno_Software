@@ -70,6 +70,7 @@ type VideowallGroupView = {
   pendingNodes: number;
   videowall: Videowall;
   nodes: ScreenTileView[];
+  primaryTile: ScreenTileView | null;
 };
 
 type BranchInfrastructureView = {
@@ -335,16 +336,32 @@ export function ClientOverviewPage() {
     }
 
     try {
-      const [clientResponse, branchesResponse, channelsResponse, campaignsResponse, videowallsResponse, screensResponse, schedulesResponse] =
-        await Promise.all([
-          apiRequest<Client>(`/clients/${clientId}`, { token }),
-          apiRequest<Branch[]>(`/branches?client_id=${clientId}`, { token }),
-          apiRequest<Channel[]>(`/channels?client_id=${clientId}`, { token }),
-          apiRequest<Campaign[]>(`/campaigns?client_id=${clientId}`, { token }),
-          apiRequest<Videowall[]>(`/videowalls?client_id=${clientId}`, { token }),
-          apiRequest<KioskScreen[]>(`/kiosk/screens?client_id=${clientId}`, { token }),
-          apiRequest<ScheduleItem[]>(`/schedules?client_id=${clientId}`, { token }),
-        ]);
+      const criticalRequests = Promise.all([
+        apiRequest<Client>(`/clients/${clientId}`, { token }),
+        apiRequest<Branch[]>(`/branches?client_id=${clientId}`, { token }),
+        apiRequest<Channel[]>(`/channels?client_id=${clientId}`, { token }),
+        apiRequest<Campaign[]>(`/campaigns?client_id=${clientId}`, { token }),
+        apiRequest<KioskScreen[]>(`/kiosk/screens?client_id=${clientId}`, { token }),
+      ]);
+      const secondaryRequests = Promise.allSettled([
+        apiRequest<Videowall[]>(`/videowalls?client_id=${clientId}`, { token }),
+        apiRequest<ScheduleItem[]>(`/schedules?client_id=${clientId}`, { token }),
+      ]);
+      const [
+        [clientResponse, branchesResponse, channelsResponse, campaignsResponse, screensResponse],
+        [videowallsResult, schedulesResult],
+      ] = await Promise.all([criticalRequests, secondaryRequests]);
+
+      const degradedModules: string[] = [];
+      const videowallsResponse = videowallsResult.status === "fulfilled" ? videowallsResult.value : [];
+      const schedulesResponse = schedulesResult.status === "fulfilled" ? schedulesResult.value : [];
+
+      if (videowallsResult.status === "rejected") {
+        degradedModules.push("videowalls");
+      }
+      if (schedulesResult.status === "rejected") {
+        degradedModules.push("programaciones");
+      }
 
       const nodesPerWall = await Promise.all(
         videowallsResponse.map((videowall) =>
@@ -373,6 +390,17 @@ export function ClientOverviewPage() {
       setScreens(screensResponse);
       setSchedules(schedulesResponse);
       setError(null);
+
+      if (degradedModules.length > 0) {
+        setFeedback({
+          tone: "error",
+          text: `El dashboard se cargó parcialmente. No se pudo cargar ${degradedModules.join(" y ")}.`,
+        });
+      } else {
+        setFeedback((current) =>
+          current?.tone === "error" && current.text.startsWith("El dashboard se cargó parcialmente.") ? null : current,
+        );
+      }
     } catch (nextError) {
       setError(getApiErrorMessage(nextError, "No se pudo cargar el dashboard del cliente."));
     }
@@ -410,6 +438,15 @@ export function ClientOverviewPage() {
 
   const campaignsById = useMemo(() => new Map(campaigns.map((campaign) => [campaign.id, campaign])), [campaigns]);
   const videowallNodeByChannelId = useMemo(() => new Map(videowallNodes.map((node) => [node.channel_id, node])), [videowallNodes]);
+  const hardwareVideowallByPrimaryChannelId = useMemo(
+    () =>
+      new Map(
+        videowalls
+          .filter((videowall) => videowall.render_mode === "hardware-single-input" && videowall.primary_channel_id)
+          .map((videowall) => [videowall.primary_channel_id as string, videowall]),
+      ),
+    [videowalls],
+  );
   const nodesByVideowallId = useMemo(() => {
     const map = new Map<string, VideowallNode[]>();
     videowallNodes.forEach((node) => {
@@ -466,11 +503,18 @@ export function ClientOverviewPage() {
           .map((channel) => channelContextById.get(channel.id)?.currentCampaignId ?? null)
           .filter((campaignId): campaignId is string => Boolean(campaignId)),
       );
-      const branchVideowalls = videowalls.filter((videowall) =>
-        (nodesByVideowallId.get(videowall.id) ?? []).some((node) => branchChannelIds.has(node.channel_id)),
-      );
+      const branchVideowalls = videowalls.filter((videowall) => {
+        if (videowall.render_mode === "hardware-single-input") {
+          return Boolean(videowall.primary_channel_id && branchChannelIds.has(videowall.primary_channel_id));
+        }
 
-      const standaloneChannels = branchChannels.filter((channel) => channel.mode !== "expanded" && !videowallNodeByChannelId.has(channel.id));
+        return (nodesByVideowallId.get(videowall.id) ?? []).some((node) => branchChannelIds.has(node.channel_id));
+      });
+
+      const standaloneChannels = branchChannels.filter(
+        (channel) =>
+          channel.mode !== "expanded" && !videowallNodeByChannelId.has(channel.id) && !hardwareVideowallByPrimaryChannelId.has(channel.id),
+      );
       const expandedChannels = branchChannels.filter((channel) => channel.mode === "expanded" && !videowallNodeByChannelId.has(channel.id));
 
       const standaloneTiles = standaloneChannels.map<ScreenTileView>((channel) => {
@@ -544,6 +588,62 @@ export function ClientOverviewPage() {
       });
 
       const videowallGroups = branchVideowalls.map<VideowallGroupView>((videowall) => {
+        if (videowall.render_mode === "hardware-single-input") {
+          const primaryChannel = branchChannels.find((channel) => channel.id === videowall.primary_channel_id) ?? null;
+          const context = primaryChannel ? channelContextById.get(primaryChannel.id) : null;
+          const scheduleSnapshot = primaryChannel
+            ? buildScheduleSnapshot(primaryChannel, schedules, campaignsById)
+            : { scheduleCount: 0, scheduleSummary: "Sin programaciones" };
+
+          const primaryTile: ScreenTileView | null = primaryChannel
+            ? {
+                id: primaryChannel.id,
+                title: primaryChannel.name,
+                status: getPresenceStatus(primaryChannel.is_online),
+                isOnline: primaryChannel.is_online,
+                mode: primaryChannel.mode,
+                resolutionLabel: getResolutionLabel(primaryChannel),
+                channelCode: primaryChannel.channel_code,
+                campaignLabel: context?.campaignLabel ?? "Sin campaña visible",
+                currentCampaignId: context?.currentCampaignId ?? null,
+                hasAssignedCampaign: context?.hasAssignedCampaign ?? false,
+                playbackLabel: primaryChannel.current_playback,
+                hardwareLabel: primaryChannel.hardware_identifier,
+                lastHeartbeatAt: primaryChannel.last_heartbeat_at ?? primaryChannel.last_ping_at,
+                heartbeatAgeSeconds: primaryChannel.heartbeat_age_seconds,
+                scheduleCount: scheduleSnapshot.scheduleCount,
+                scheduleSummary: scheduleSnapshot.scheduleSummary,
+                eyebrow: videowall.name,
+                channel: primaryChannel,
+                node: null,
+                videowall,
+              }
+            : null;
+
+          return {
+            id: videowall.id,
+            title: videowall.name,
+            subtitle: "Cascada HDMI / una sola entrada",
+            status: primaryChannel ? getPresenceStatus(primaryChannel.is_online) : "unknown",
+            summary: [
+              { label: "Tipo", value: "Cascada HDMI" },
+              { label: "Muro", value: `${videowall.total_width}x${videowall.total_height}` },
+              { label: "Salida HDMI", value: `${videowall.output_width}x${videowall.output_height}` },
+              { label: "Canal principal", value: primaryChannel?.name ?? "Pendiente" },
+              { label: "Online", value: primaryChannel?.is_online ? "1" : "0" },
+              { label: "Offline", value: primaryChannel && !primaryChannel.is_online ? "1" : "0" },
+            ],
+            columns: videowall.columns,
+            rows: videowall.rows,
+            occupiedPositions: [],
+            configuredNodes: primaryTile ? 1 : 0,
+            pendingNodes: 0,
+            videowall,
+            nodes: primaryTile ? [primaryTile] : [],
+            primaryTile,
+          };
+        }
+
         const nodes = (nodesByVideowallId.get(videowall.id) ?? [])
           .filter((node) => branchChannelIds.has(node.channel_id))
           .sort((left, right) => left.position_index - right.position_index);
@@ -606,6 +706,7 @@ export function ClientOverviewPage() {
           pendingNodes,
           videowall,
           nodes: nodeTiles,
+          primaryTile: null,
         };
       });
 
@@ -620,7 +721,7 @@ export function ClientOverviewPage() {
         videowallGroups,
       };
     });
-  }, [branches, campaignsById, channelContextById, channels, nodesByVideowallId, schedules, videowallNodeByChannelId, videowalls]);
+  }, [branches, campaignsById, channelContextById, channels, hardwareVideowallByPrimaryChannelId, nodesByVideowallId, schedules, videowallNodeByChannelId, videowalls]);
 
   const publishTargetGroups = useMemo<PublishTargetBranchGroup[]>(() => {
     return branchInfrastructure.map((branchCard) => {
@@ -806,13 +907,24 @@ export function ClientOverviewPage() {
         channelName: (tile.channel as Channel).name,
         channelCode: (tile.channel as Channel).channel_code,
         mode: (tile.channel as Channel).mode,
-        status: (tile.channel as Channel).status,
+        status: getPresenceStatus((tile.channel as Channel).is_online),
         hasCampaign: tile.hasAssignedCampaign,
         currentCampaignId: tile.currentCampaignId,
         currentCampaignLabel: tile.campaignLabel,
         slotIndex: tile.node?.position_index ?? index + 1,
-        visualLabel: `Monitor ${tile.node?.position_index ?? index + 1}`,
+        visualLabel:
+          group.videowall.render_mode === "hardware-single-input"
+            ? "Canal principal"
+            : `Monitor ${tile.node?.position_index ?? index + 1}`,
       }));
+
+    if (fixedTargets.length === 0) {
+      setFeedback({
+        tone: "error",
+        text: `El videowall ${group.title} aún no tiene un canal publicable configurado.`,
+      });
+      return;
+    }
 
     const uniqueCampaignIds = Array.from(new Set(fixedTargets.map((target) => target.currentCampaignId).filter(Boolean)));
     const primaryTarget = fixedTargets[0] ?? null;
@@ -821,7 +933,10 @@ export function ClientOverviewPage() {
     setPublishDrawerState({
       scope: "videowall",
       title: `Publicar campana en ${group.title}`,
-      subtitle: "Todos los nodos del videowall recibiran la misma campana y cada uno mantendra su crop individual en runtime.",
+      subtitle:
+        group.videowall.render_mode === "hardware-single-input"
+          ? "La campaña se publicará en el canal principal y el Player la renderizará como una sola entrada HDMI para todo el muro."
+          : "Todos los nodos del videowall recibirán la misma campaña y cada uno mantendrá su crop individual en runtime.",
       fixedTargets,
       currentCampaignId: uniqueCampaignIds.length === 1 ? uniqueCampaignIds[0] ?? null : null,
       currentCampaignLabel,
@@ -834,7 +949,10 @@ export function ClientOverviewPage() {
         {
           label: "Videowall",
           title: group.title,
-          helper: `${group.columns}x${group.rows} · ${group.configuredNodes} nodo(s) configurado(s)`,
+          helper:
+            group.videowall.render_mode === "hardware-single-input"
+              ? `${group.columns}x${group.rows} · HDMI ${group.videowall.output_width}x${group.videowall.output_height}`
+              : `${group.columns}x${group.rows} · ${group.configuredNodes} nodo(s) configurado(s)`,
         },
         {
           label: "Campana visible actual",
@@ -850,6 +968,14 @@ export function ClientOverviewPage() {
   }
 
   function openVideowallMonitorDrawer(branch: Branch, videowall: Videowall, preferredPosition?: number) {
+    if (videowall.render_mode === "hardware-single-input") {
+      setFeedback({
+        tone: "error",
+        text: `El videowall ${videowall.name} usa una sola entrada HDMI. Edita el grupo para cambiar su canal principal o su resolución, pero no agrega nodos individuales.`,
+      });
+      return;
+    }
+
     const wallNodes = (nodesByVideowallId.get(videowall.id) ?? []).sort((left, right) => left.position_index - right.position_index);
     const totalPositions = videowall.columns * videowall.rows;
     const occupiedPositions = wallNodes.map((node) => node.position_index);
@@ -903,6 +1029,15 @@ export function ClientOverviewPage() {
     }
 
     if (deleteTarget.kind === "videowall") {
+      if (deleteTarget.videowall.render_mode === "hardware-single-input") {
+        return {
+          title: `Eliminar videowall ${deleteTarget.videowall.name}`,
+          description:
+            "Se eliminará el grupo de cascada HDMI junto con su vínculo al canal principal. Solo se bloqueará si ese canal sigue en línea; si está offline, el sistema permitirá borrarlo.",
+          confirmLabel: "Eliminar videowall",
+        };
+      }
+
       return {
         title: `Eliminar videowall ${deleteTarget.videowall.name}`,
         description: `\u00bfEliminar videowall completo? Esta acci\u00f3n intentar\u00e1 borrar el grupo, ${deleteTarget.nodesCount} monitor(es) y sus canales asociados. Solo se bloquear\u00e1 si alg\u00fan monitor sigue en l\u00ednea; en ese caso, el sistema te dir\u00e1 exactamente cu\u00e1l es.`,
@@ -1259,14 +1394,16 @@ export function ClientOverviewPage() {
                                 <ArrowRightLeft className="h-3.5 w-3.5" />
                                 Publicar campana
                               </button>
-                              <button
-                                className="inline-flex items-center gap-2 rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-cyan-300 hover:text-ink"
-                                type="button"
-                                onClick={() => openVideowallMonitorDrawer(branchCard.branch, group.videowall)}
-                              >
-                                <PlusCircle className="h-3.5 w-3.5" />
-                                Agregar monitor
-                              </button>
+                              {group.videowall.render_mode === "multi-node" ? (
+                                <button
+                                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-cyan-300 hover:text-ink"
+                                  type="button"
+                                  onClick={() => openVideowallMonitorDrawer(branchCard.branch, group.videowall)}
+                                >
+                                  <PlusCircle className="h-3.5 w-3.5" />
+                                  Agregar monitor
+                                </button>
+                              ) : null}
                               <button
                                 className="inline-flex items-center gap-2 rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-cyan-300 hover:text-ink"
                                 type="button"
@@ -1293,36 +1430,63 @@ export function ClientOverviewPage() {
                         }
                       >
                         <div className="grid gap-4 xl:grid-cols-[220px_1fr]">
-                          <div className="rounded-[24px] border border-slate-200 bg-white p-4">
-                            <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Matriz interactiva</p>
-                            <div className="mt-4">
-                              <SimpleVideowallMatrix
-                                columns={group.columns}
-                                rows={group.rows}
-                                occupiedPositions={group.occupiedPositions}
-                                selectedPosition={selectedVideowallCell?.videowallId === group.id ? selectedVideowallCell.position : undefined}
-                                showLabels
-                                onSelectPosition={
-                                  canManageInfrastructure
-                                    ? (position) => {
-                                        const isOccupied = group.occupiedPositions.includes(position);
-                                        setSelectedVideowallCell({ videowallId: group.id, position });
-                                        if (!isOccupied) {
-                                          openVideowallMonitorDrawer(branchCard.branch, group.videowall, position);
+                          {group.videowall.render_mode === "hardware-single-input" ? (
+                            <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+                              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Entrada HDMI</p>
+                              <div className="mt-4 grid gap-3">
+                                <div className="rounded-[18px] border border-cyan-200 bg-cyan-50 px-3 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-700">Modo</p>
+                                  <p className="mt-2 text-sm font-semibold text-ink">Cascada HDMI</p>
+                                </div>
+                                <div className="rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Muro total</p>
+                                  <p className="mt-2 text-sm font-semibold text-ink">
+                                    {group.videowall.total_width}x{group.videowall.total_height}
+                                  </p>
+                                </div>
+                                <div className="rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Salida HDMI</p>
+                                  <p className="mt-2 text-sm font-semibold text-ink">
+                                    {group.videowall.output_width}x{group.videowall.output_height}
+                                  </p>
+                                </div>
+                              </div>
+                              <p className="mt-4 text-xs text-slate-500">
+                                Este videowall usa un solo canal principal. No hay nodos ni crops individuales por monitor.
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="rounded-[24px] border border-slate-200 bg-white p-4">
+                              <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Matriz interactiva</p>
+                              <div className="mt-4">
+                                <SimpleVideowallMatrix
+                                  columns={group.columns}
+                                  rows={group.rows}
+                                  occupiedPositions={group.occupiedPositions}
+                                  selectedPosition={selectedVideowallCell?.videowallId === group.id ? selectedVideowallCell.position : undefined}
+                                  showLabels
+                                  onSelectPosition={
+                                    canManageInfrastructure
+                                      ? (position) => {
+                                          const isOccupied = group.occupiedPositions.includes(position);
+                                          setSelectedVideowallCell({ videowallId: group.id, position });
+                                          if (!isOccupied) {
+                                            openVideowallMonitorDrawer(branchCard.branch, group.videowall, position);
+                                          }
                                         }
-                                      }
-                                    : undefined
-                                }
-                              />
+                                      : undefined
+                                  }
+                                />
+                              </div>
+                              <p className="mt-4 text-xs text-slate-500">
+                                Haz clic en una celda vacía para agregar un monitor. Las celdas verdes ya están configuradas.
+                              </p>
+                              <div className="mt-4 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                                <span className="rounded-full bg-emerald-50 px-3 py-1.5 text-emerald-700">{group.configuredNodes} configurados</span>
+                                <span className="rounded-full bg-slate-200 px-3 py-1.5 text-slate-700">{group.pendingNodes} pendientes</span>
+                              </div>
                             </div>
-                            <p className="mt-4 text-xs text-slate-500">
-                              Haz clic en una celda vacía para agregar un monitor. Las celdas verdes ya están configuradas.
-                            </p>
-                            <div className="mt-4 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                              <span className="rounded-full bg-emerald-50 px-3 py-1.5 text-emerald-700">{group.configuredNodes} configurados</span>
-                              <span className="rounded-full bg-slate-200 px-3 py-1.5 text-slate-700">{group.pendingNodes} pendientes</span>
-                            </div>
-                          </div>
+                          )}
                           <div className="grid gap-4 md:grid-cols-2">
                             {group.nodes.map((tile) => (
                               <ScreenTile
@@ -1464,6 +1628,7 @@ export function ClientOverviewPage() {
         token={token}
         videowall={videowallEditTarget?.videowall ?? null}
         nodes={videowallEditTarget ? nodesByVideowallId.get(videowallEditTarget.videowall.id) ?? [] : []}
+        channels={videowallEditTarget ? channels.filter((channel) => channel.branch_id === videowallEditTarget.branch.id) : []}
         onClose={() => setVideowallEditTarget(null)}
         onSaved={handleVideowallSaved}
       />

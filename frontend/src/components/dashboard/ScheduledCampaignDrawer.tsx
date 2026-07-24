@@ -32,6 +32,28 @@ const WEEKDAY_OPTIONS = [
   { value: 7, label: "Dom" },
 ];
 
+function validateScheduleWindow({
+  startsOn,
+  endsOn,
+  startTime,
+  endTime,
+}: {
+  startsOn: string;
+  endsOn: string;
+  startTime: string;
+  endTime: string;
+}) {
+  if (startsOn && endsOn && startsOn > endsOn) {
+    return "La fecha de inicio no puede ser posterior a la fecha de fin.";
+  }
+
+  if (startTime && endTime && startTime >= endTime) {
+    return "La hora de inicio debe ser menor que la hora de fin.";
+  }
+
+  return null;
+}
+
 function chipClassName(active = false) {
   return [
     "rounded-full border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] transition",
@@ -206,6 +228,15 @@ export function ScheduledCampaignDrawer({
     [campaigns, selectedCampaignId],
   );
   const allWeekdaysSelected = weekdays.length === WEEKDAY_OPTIONS.length;
+  const scheduleValidationError =
+    publishMode === "scheduled"
+      ? validateScheduleWindow({
+          startsOn,
+          endsOn,
+          startTime,
+          endTime,
+        })
+      : null;
 
   const visibleBranchGroups = useMemo(() => {
     if (selectionMode === "fixed") {
@@ -384,6 +415,11 @@ export function ScheduledCampaignDrawer({
 
   async function handleScheduledPublish() {
     if (!token || !selectedCampaignId || selectedCount === 0) {
+      return;
+    }
+
+    if (scheduleValidationError) {
+      setError(scheduleValidationError);
       return;
     }
 
@@ -573,6 +609,12 @@ export function ScheduledCampaignDrawer({
                   </div>
                 </div>
 
+                {scheduleValidationError ? (
+                  <div className="mt-4 rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                    {scheduleValidationError}
+                  </div>
+                ) : null}
+
                 <div className="mt-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-sm font-semibold text-slate-700">Dias de la semana</p>
@@ -743,7 +785,7 @@ export function ScheduledCampaignDrawer({
               <div className="mt-4 flex flex-wrap gap-3">
                 <button
                   className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={!selectedCampaignId || selectedCount === 0 || isSubmitting}
+                  disabled={!selectedCampaignId || selectedCount === 0 || isSubmitting || (publishMode === "scheduled" && Boolean(scheduleValidationError))}
                   type="button"
                   onClick={() => {
                     void handleSubmit();

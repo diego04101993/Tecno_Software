@@ -266,14 +266,14 @@ export function ClientsPage() {
 
               return (
                 <article key={client.id} className="rounded-[28px] border border-slate-300 bg-white p-5 shadow-sm">
-                  <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
-                    <div className="min-w-0 flex-1 space-y-5">
+                  <div className="grid gap-5 xl:grid-cols-[minmax(0,1.05fr)_minmax(430px,0.95fr)_220px] xl:items-start">
+                    <div className="min-w-0 space-y-5">
                       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                         <div className="min-w-0">
-                          <p className="truncate font-display text-[1.9rem] leading-tight text-ink" title={client.name}>
+                          <p className="truncate font-display text-[2rem] leading-tight text-ink" title={client.name}>
                             {client.name}
                           </p>
-                          <p className="mt-2 text-sm text-slate-500">
+                          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
                             Cliente SaaS listo para administrar sucursales, pantallas y operación diaria.
                           </p>
                         </div>
@@ -282,47 +282,55 @@ export function ClientsPage() {
                         </span>
                       </div>
 
-                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Cliente</p>
-                          <p className="mt-2 truncate font-semibold text-ink" title={client.name}>
+                      <div className="flex flex-wrap gap-3">
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] text-slate-500">Marca</p>
+                          <p className="mt-2 font-semibold text-ink">{client.brand_name ?? "Sin marca definida"}</p>
+                        </div>
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] text-slate-500">Slug</p>
+                          <p className="mt-2 font-semibold text-ink">{client.slug}</p>
+                        </div>
+                      </div>
+
+                      <div className="rounded-[24px] border border-slate-300 bg-slate-50 px-4 py-4">
+                        <p className="text-[11px] uppercase tracking-[0.14em] text-slate-500">Contacto principal</p>
+                        <p className="mt-2 truncate text-base font-semibold text-ink" title={client.contact_email ?? "Sin correo definido"}>
+                          {client.contact_email ?? "Sin correo definido"}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="min-w-0">
+                      <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-3">
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Nombre del cliente</p>
+                          <p className="mt-3 line-clamp-2 text-base font-semibold leading-6 text-ink" title={client.name}>
                             {client.name}
                           </p>
                         </div>
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Marca</p>
-                          <p className="mt-2 truncate font-semibold text-ink" title={client.brand_name ?? "Sin marca definida"}>
-                            {client.brand_name ?? "Sin marca definida"}
-                          </p>
-                        </div>
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Slug</p>
-                          <p className="mt-2 truncate font-semibold text-ink" title={client.slug}>
-                            {client.slug}
-                          </p>
-                        </div>
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-700">
                           <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Sucursales</p>
-                          <p className="mt-2 font-semibold text-ink">{branchCount}</p>
+                          <p className="mt-3 text-[1.4rem] font-semibold leading-none text-ink">{branchCount}</p>
                         </div>
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Pantallas</p>
-                          <p className="mt-2 font-semibold text-ink">{channelCount}</p>
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Pantallas totales</p>
+                          <p className="mt-3 text-[1.4rem] font-semibold leading-none text-ink">{channelCount}</p>
                         </div>
-                        <div className="min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Online</p>
-                          <p className="mt-2 font-semibold text-ink">{onlineChannels}</p>
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-700">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Pantallas online</p>
+                          <p className="mt-3 text-[1.4rem] font-semibold leading-none text-ink">{onlineChannels}</p>
                         </div>
-                        <div className="col-span-full min-w-0 rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Contacto</p>
-                          <p className="mt-2 truncate font-semibold text-ink" title={client.contact_email ?? "Sin correo definido"}>
-                            {client.contact_email ?? "Sin correo definido"}
+                        <div className="rounded-2xl border border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-700 sm:col-span-2 2xl:col-span-2">
+                          <p className="text-[11px] uppercase tracking-[0.14em] leading-4 text-slate-500">Resumen</p>
+                          <p className="mt-3 text-sm leading-6 text-slate-600">
+                            {branchCount} sucursal(es), {channelCount} pantalla(s) registradas y {onlineChannels} en línea para esta operación.
                           </p>
                         </div>
                       </div>
                     </div>
 
-                    <div className="w-full xl:w-[220px] xl:shrink-0">
+                    <div className="w-full xl:w-[220px] xl:justify-self-end">
                       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
                         <Link
                           className="inline-flex justify-center rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-accent hover:text-ink"

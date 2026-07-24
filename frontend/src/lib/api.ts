@@ -37,6 +37,34 @@ type RequestOptions = {
   formData?: FormData;
 };
 
+type UploadRequestOptions = {
+  method?: string;
+  token?: string | null;
+  formData: FormData;
+  onProgress?: (progress: UploadProgress) => void;
+};
+
+export type UploadProgress = {
+  loaded: number;
+  total: number;
+  percent: number;
+};
+
+function extractApiErrorMessage(detail: string, status: number) {
+  let message = detail || `Request failed with status ${status}`;
+  try {
+    const parsed = detail ? JSON.parse(detail) : null;
+    if (typeof parsed?.detail === "string" && parsed.detail.trim()) {
+      message = parsed.detail;
+    } else if (typeof parsed?.message === "string" && parsed.message.trim()) {
+      message = parsed.message;
+    }
+  } catch {
+    // Keep original text when the backend returned plain text or HTML.
+  }
+  return message;
+}
+
 
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers();
@@ -57,17 +85,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
   if (!response.ok) {
     const detail = await response.text();
-    let message = detail || `Request failed with status ${response.status}`;
-    try {
-      const parsed = detail ? JSON.parse(detail) : null;
-      if (typeof parsed?.detail === "string" && parsed.detail.trim()) {
-        message = parsed.detail;
-      } else if (typeof parsed?.message === "string" && parsed.message.trim()) {
-        message = parsed.message;
-      }
-    } catch {
-      // Keep original text when the backend returned plain text or HTML.
-    }
+    const message = extractApiErrorMessage(detail, response.status);
     throw new Error(message);
   }
 
@@ -76,6 +94,56 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   }
 
   return response.json() as Promise<T>;
+}
+
+export function uploadApiRequest<T>(path: string, options: UploadRequestOptions): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(options.method ?? "POST", `${API_URL}${path}`);
+    xhr.responseType = "text";
+
+    if (options.token) {
+      xhr.setRequestHeader("Authorization", `Bearer ${options.token}`);
+    }
+
+    xhr.upload.onprogress = (event) => {
+      const total = event.total || 0;
+      const loaded = event.loaded || 0;
+      const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      options.onProgress?.({ loaded, total, percent });
+    };
+
+    xhr.onerror = () => {
+      reject(new Error("Failed to fetch"));
+    };
+
+    xhr.onabort = () => {
+      reject(new Error("Upload aborted"));
+    };
+
+    xhr.onload = () => {
+      const status = xhr.status;
+      const responseText = typeof xhr.responseText === "string" ? xhr.responseText : "";
+
+      if (status < 200 || status >= 300) {
+        reject(new Error(extractApiErrorMessage(responseText, status)));
+        return;
+      }
+
+      if (status === 204 || !responseText.trim()) {
+        resolve(undefined as T);
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(responseText) as T);
+      } catch {
+        reject(new Error("No se pudo interpretar la respuesta del upload."));
+      }
+    };
+
+    xhr.send(options.formData);
+  });
 }
 
 export { API_ORIGIN, API_URL };

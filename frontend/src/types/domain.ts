@@ -17,6 +17,7 @@ export type CampaignSequenceItemType = "content" | "layout";
 export type LayoutTemplate = "single" | "two_columns" | "four_grid" | "custom";
 export type ScheduleRecurrence = "once" | "daily" | "weekly" | "custom";
 export type ChannelStatus = "online" | "offline" | "unknown";
+export type VideowallRenderMode = "multi-node" | "hardware-single-input";
 export type KioskActionType = "open_url" | "switch_screen" | "play_video" | "navigate_menu";
 export type AudioPlaylistKind = "music" | "spot";
 export type AudioSpotRotationMode = "sequential" | "random";
@@ -411,10 +412,14 @@ export interface Videowall {
   updated_at: string | null;
   client_id: string;
   name: string;
+  render_mode: VideowallRenderMode;
   columns: number;
   rows: number;
   total_width: number;
   total_height: number;
+  output_width: number;
+  output_height: number;
+  primary_channel_id: string | null;
   start_tolerance_ms: number;
   sync_mode: string;
 }

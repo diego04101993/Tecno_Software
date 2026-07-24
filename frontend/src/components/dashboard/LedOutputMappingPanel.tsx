@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+
 import type {
   ChannelOutputMapping,
   OutputMappingMode,
@@ -309,9 +311,8 @@ function buildAutoSlices(draft: {
 }
 
 function buildCustomDefaultSlice(outputWidth: number, outputHeight: number, canvasWidth: number, canvasHeight: number): OutputMappingSlice {
-  const scale = Math.min(outputWidth / Math.max(1, canvasWidth), outputHeight / Math.max(1, canvasHeight));
-  const scaledWidth = Math.max(1, Math.round(canvasWidth * scale));
-  const scaledHeight = Math.max(1, Math.round(canvasHeight * scale));
+  const fittedWidth = Math.max(1, Math.min(canvasWidth, outputWidth));
+  const fittedHeight = Math.max(1, Math.min(canvasHeight, outputHeight));
 
   return {
     slice_index: 1,
@@ -319,12 +320,31 @@ function buildCustomDefaultSlice(outputWidth: number, outputHeight: number, canv
     source_y: 0,
     source_width: canvasWidth,
     source_height: canvasHeight,
-    output_x: Math.round((outputWidth - scaledWidth) / 2),
-    output_y: Math.round((outputHeight - scaledHeight) / 2),
-    output_width: scaledWidth,
-    output_height: scaledHeight,
-    scale_x: roundScale(scaledWidth / Math.max(1, canvasWidth)),
-    scale_y: roundScale(scaledHeight / Math.max(1, canvasHeight)),
+    output_x: 0,
+    output_y: 0,
+    output_width: fittedWidth,
+    output_height: fittedHeight,
+    scale_x: roundScale(fittedWidth / Math.max(1, canvasWidth)),
+    scale_y: roundScale(fittedHeight / Math.max(1, canvasHeight)),
+  };
+}
+
+function clampSliceWithinOutput(slice: OutputMappingSlice, outputWidth: number, outputHeight: number): OutputMappingSlice {
+  const safeOutputWidth = Math.max(1, outputWidth);
+  const safeOutputHeight = Math.max(1, outputHeight);
+  const nextWidth = Math.min(Math.max(1, slice.output_width), safeOutputWidth);
+  const nextHeight = Math.min(Math.max(1, slice.output_height), safeOutputHeight);
+  const nextX = Math.min(Math.max(0, slice.output_x), Math.max(0, safeOutputWidth - nextWidth));
+  const nextY = Math.min(Math.max(0, slice.output_y), Math.max(0, safeOutputHeight - nextHeight));
+
+  return {
+    ...slice,
+    output_x: nextX,
+    output_y: nextY,
+    output_width: nextWidth,
+    output_height: nextHeight,
+    scale_x: roundScale(nextWidth / Math.max(1, slice.source_width)),
+    scale_y: roundScale(nextHeight / Math.max(1, slice.source_height)),
   };
 }
 
@@ -532,12 +552,21 @@ function getProfileLabel(profile: OutputMappingProfile) {
 }
 
 function getOverflowMessage(value: ChannelOutputMappingDraft) {
-  if (value.mapping_mode !== "sliced" || !value.slices.length) {
+  if (!value.slices.length) {
     return null;
   }
 
+  const minLeft = Math.min(...value.slices.map((slice) => slice.output_x));
+  const minTop = Math.min(...value.slices.map((slice) => slice.output_y));
   const maxRight = Math.max(...value.slices.map((slice) => slice.output_x + slice.output_width));
   const maxBottom = Math.max(...value.slices.map((slice) => slice.output_y + slice.output_height));
+
+  if (value.mapping_mode === "custom") {
+    if (minLeft < 0 || minTop < 0 || maxRight > value.output_width || maxBottom > value.output_height) {
+      return "El bloque LED sale del HDMI. Ajusta X, Y, ancho o alto, o usa “Ajustar dentro del HDMI” para corregirlo.";
+    }
+    return null;
+  }
 
   if (value.slice_direction === "horizontal_stack" && maxBottom > value.output_height) {
     return "Las franjas no caben completas en la salida HDMI. Reduce altura, aumenta escala o usa configuracion avanzada.";
@@ -563,6 +592,15 @@ export function LedOutputMappingPanel({
   disabled?: boolean;
   onChange: (nextValue: ChannelOutputMappingDraft) => void;
 }) {
+  const previewFrameRef = useRef<HTMLDivElement | null>(null);
+  const [dragState, setDragState] = useState<{
+    startClientX: number;
+    startClientY: number;
+    startOutputX: number;
+    startOutputY: number;
+    frameWidth: number;
+    frameHeight: number;
+  } | null>(null);
   const aspectPreview = getAspectPreviewLabel(value.source_canvas_width, value.source_canvas_height);
   const previewFrame = fitBox(value.output_width, value.output_height, 620, 320);
   const previewCanvas = fitBox(value.source_canvas_width, value.source_canvas_height, 180, 72);
@@ -665,7 +703,20 @@ export function LedOutputMappingPanel({
       return;
     }
 
-    const nextSlices = value.slices.map((slice, index) => (index === sliceIndex ? { ...slice, ...partial } : slice));
+    const nextSlices = value.slices.map((slice, index) => {
+      if (index !== sliceIndex) {
+        return slice;
+      }
+
+      const merged = { ...slice, ...partial };
+      return {
+        ...merged,
+        scale_x:
+          partial.scale_x !== undefined ? positiveNumber(partial.scale_x, merged.scale_x) : roundScale(merged.output_width / Math.max(1, merged.source_width)),
+        scale_y:
+          partial.scale_y !== undefined ? positiveNumber(partial.scale_y, merged.scale_y) : roundScale(merged.output_height / Math.max(1, merged.source_height)),
+      };
+    });
     onChange(normalizeDraft({ ...value, slices: nextSlices }, fallbackWidth, fallbackHeight));
   }
 
@@ -707,11 +758,100 @@ export function LedOutputMappingPanel({
       return;
     }
 
-    updateSlice(sliceIndex, {
+    const nextSlice = {
+      ...slice,
       output_x: slice.output_x + deltaX,
       output_y: slice.output_y + deltaY,
+    };
+
+    updateSlice(
+      sliceIndex,
+      value.mapping_mode === "custom" ? clampSliceWithinOutput(nextSlice, value.output_width, value.output_height) : nextSlice,
+    );
+  }
+
+  function fitSliceInsideOutput(sliceIndex: number) {
+    const slice = value.slices[sliceIndex];
+    if (!slice) {
+      return;
+    }
+
+    updateSlice(sliceIndex, clampSliceWithinOutput(slice, value.output_width, value.output_height));
+  }
+
+  function resetSliceToOrigin(sliceIndex: number) {
+    const slice = value.slices[sliceIndex];
+    if (!slice) {
+      return;
+    }
+
+    const width = Math.min(Math.max(1, slice.output_width), value.output_width);
+    const height = Math.min(Math.max(1, slice.output_height), value.output_height);
+    updateSlice(sliceIndex, {
+      output_x: 0,
+      output_y: 0,
+      output_width: width,
+      output_height: height,
+      scale_x: roundScale(width / Math.max(1, slice.source_width)),
+      scale_y: roundScale(height / Math.max(1, slice.source_height)),
     });
   }
+
+  function beginCustomDrag(clientX: number, clientY: number) {
+    if (disabled || value.mapping_mode !== "custom" || !primarySlice || !previewFrameRef.current) {
+      return;
+    }
+
+    const rect = previewFrameRef.current.getBoundingClientRect();
+    setDragState({
+      startClientX: clientX,
+      startClientY: clientY,
+      startOutputX: primarySlice.output_x,
+      startOutputY: primarySlice.output_y,
+      frameWidth: rect.width,
+      frameHeight: rect.height,
+    });
+  }
+
+  useEffect(() => {
+    if (!dragState || disabled || value.mapping_mode !== "custom" || !primarySlice) {
+      return;
+    }
+
+    const activeDragState = dragState;
+
+    function handlePointerMove(event: PointerEvent) {
+      const deltaX = event.clientX - activeDragState.startClientX;
+      const deltaY = event.clientY - activeDragState.startClientY;
+      const outputDeltaX = Math.round((deltaX * value.output_width) / Math.max(1, activeDragState.frameWidth));
+      const outputDeltaY = Math.round((deltaY * value.output_height) / Math.max(1, activeDragState.frameHeight));
+
+      updateSlice(
+        0,
+        clampSliceWithinOutput(
+          {
+            ...primarySlice,
+            output_x: activeDragState.startOutputX + outputDeltaX,
+            output_y: activeDragState.startOutputY + outputDeltaY,
+          },
+          value.output_width,
+          value.output_height,
+        ),
+      );
+    }
+
+    function handlePointerUp() {
+      setDragState(null);
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [disabled, dragState, primarySlice, value.mapping_mode, value.output_height, value.output_width]);
 
   function renderSliceCard(slice: OutputMappingSlice, index: number) {
     const style = SLICE_STYLES[index % SLICE_STYLES.length];
@@ -860,6 +1000,14 @@ export function LedOutputMappingPanel({
             <button disabled={disabled} type="button" className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-ink" onClick={() => centerSlice(index)}>
               Centrar
             </button>
+            <button
+              disabled={disabled}
+              type="button"
+              className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-ink"
+              onClick={() => fitSliceInsideOutput(index)}
+            >
+              Ajustar dentro del HDMI
+            </button>
             <button disabled={disabled} type="button" className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-ink" onClick={() => nudgeSlice(index, 0, -1)}>
               Subir 1px
             </button>
@@ -872,8 +1020,13 @@ export function LedOutputMappingPanel({
             <button disabled={disabled} type="button" className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-ink" onClick={() => nudgeSlice(index, 1, 0)}>
               Derecha 1px
             </button>
-            <button disabled={disabled} type="button" className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:border-rose-300 hover:text-rose-800" onClick={() => resetSlice(index)}>
-              Reset
+            <button
+              disabled={disabled}
+              type="button"
+              className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:border-rose-300 hover:text-rose-800"
+              onClick={() => (value.mapping_mode === "custom" ? resetSliceToOrigin(index) : resetSlice(index))}
+            >
+              {value.mapping_mode === "custom" ? "Reset 0,0" : "Reset"}
             </button>
           </div>
         </div>
@@ -1080,14 +1233,24 @@ export function LedOutputMappingPanel({
                 Usa un bloque libre para decidir que parte del canvas se manda al HDMI y donde se acomoda.
               </p>
             </div>
-            <button
-              disabled={disabled}
-              type="button"
-              className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:border-rose-300 hover:text-rose-800"
-              onClick={() => resetSlice(0)}
-            >
-              Reset bloque
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                disabled={disabled}
+                type="button"
+                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-ink"
+                onClick={() => fitSliceInsideOutput(0)}
+              >
+                Ajustar dentro del HDMI
+              </button>
+              <button
+                disabled={disabled}
+                type="button"
+                className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:border-rose-300 hover:text-rose-800"
+                onClick={() => resetSliceToOrigin(0)}
+              >
+                Reset 0,0
+              </button>
+            </div>
           </div>
 
           <div className="mt-4 rounded-[18px] border border-slate-200 bg-slate-50 p-4">
@@ -1099,6 +1262,10 @@ export function LedOutputMappingPanel({
               En este modo, Output X/Y y Output ancho/alto funcionan como viewport_x, viewport_y, viewport_width y viewport_height.
             </p>
           </div>
+
+          {overflowMessage ? (
+            <div className="mt-4 rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">{overflowMessage}</div>
+          ) : null}
 
           {renderSliceCard(primarySlice, 0)}
         </div>
@@ -1148,6 +1315,11 @@ export function LedOutputMappingPanel({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {value.mapping_mode === "custom" && primarySlice ? (
+              <span className="rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-900">
+                X {primarySlice.output_x} · Y {primarySlice.output_y} · {primarySlice.output_width}x{primarySlice.output_height}
+              </span>
+            ) : null}
             <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-600">
               {aspectPreview.label}
             </span>
@@ -1185,6 +1357,7 @@ export function LedOutputMappingPanel({
 
           <div className="mt-6 grid min-h-[340px] place-items-center">
             <div
+              ref={previewFrameRef}
               className="relative overflow-hidden rounded-[16px] border border-slate-500 bg-slate-900 shadow-inner"
               style={{ width: `${previewFrame.width}px`, height: `${previewFrame.height}px` }}
             >
@@ -1205,13 +1378,26 @@ export function LedOutputMappingPanel({
                   return (
                     <div
                       key={`preview-slice-${slice.slice_index}`}
-                      className={["absolute rounded-[12px] border-2 shadow-[0_12px_30px_rgba(15,23,42,0.18)]", style.border, style.background].join(" ")}
+                      className={[
+                        "absolute rounded-[12px] border-2 shadow-[0_12px_30px_rgba(15,23,42,0.18)]",
+                        style.border,
+                        style.background,
+                        value.mapping_mode === "custom" && index === 0 && !disabled ? "cursor-move" : "",
+                      ].join(" ")}
                       style={{
                         left: `${left}%`,
                         top: `${top}%`,
                         width: `${width}%`,
                         height: `${height}%`,
                       }}
+                      onPointerDown={
+                        value.mapping_mode === "custom" && index === 0 && !disabled
+                          ? (event) => {
+                              event.preventDefault();
+                              beginCustomDrag(event.clientX, event.clientY);
+                            }
+                          : undefined
+                      }
                     >
                       <div className={["absolute left-2 top-2 rounded-full border px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em]", style.label].join(" ")}>
                         Franja {slice.slice_index}
@@ -1224,6 +1410,11 @@ export function LedOutputMappingPanel({
               <div className="absolute bottom-3 left-3 rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-200">
                 Preview HDMI
               </div>
+              {value.mapping_mode === "custom" && !disabled ? (
+                <div className="absolute bottom-3 right-3 rounded-full border border-white/10 bg-slate-950/70 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+                  Arrastra el bloque LED
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

@@ -34,6 +34,8 @@ from app.services.videowall_geometry import (
 
 
 router = APIRouter()
+MULTI_NODE_RENDER_MODE = "multi-node"
+HARDWARE_SINGLE_INPUT_RENDER_MODE = "hardware-single-input"
 
 
 def build_videowall_delete_block_message(videowall: Videowall, blocked_nodes: list[str]) -> str:
@@ -74,12 +76,75 @@ def _validate_videowall_geometry(columns: int, rows: int, total_width: int, tota
     return safe_columns, safe_rows, safe_total_width, safe_total_height
 
 
+def _normalize_render_mode(raw_render_mode: str | None) -> str:
+    return HARDWARE_SINGLE_INPUT_RENDER_MODE if raw_render_mode == HARDWARE_SINGLE_INPUT_RENDER_MODE else MULTI_NODE_RENDER_MODE
+
+
+def _ensure_multi_node_videowall(videowall: Videowall) -> None:
+    if _normalize_render_mode(videowall.render_mode) != MULTI_NODE_RENDER_MODE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este videowall usa una sola entrada HDMI y no admite nodos ni crop individual",
+        )
+
+
+def _require_hardware_primary_channel(
+    *,
+    db: Session,
+    current_user: User,
+    client_id: str,
+    primary_channel_id: str | None,
+    exclude_videowall_id: str | None = None,
+) -> Channel:
+    if not primary_channel_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debes seleccionar un canal principal para un videowall en cascada por hardware",
+        )
+
+    channel = get_channel_in_scope(db, primary_channel_id, current_user)
+    if channel.client_id != client_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El canal principal no pertenece a este cliente")
+    if channel.mode != ChannelMode.VIDEOWALL:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El canal principal debe estar en modo videowall para usar cascada por hardware",
+        )
+    if db.scalar(select(VideowallNode.id).where(VideowallNode.channel_id == channel.id).limit(1)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El canal principal ya pertenece a un videowall distribuido por nodos",
+        )
+
+    existing_videowall = db.scalar(
+        select(Videowall.id)
+        .where(Videowall.primary_channel_id == channel.id)
+        .limit(1)
+    )
+    if existing_videowall and existing_videowall != exclude_videowall_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este canal ya está asignado como entrada principal de otro videowall",
+        )
+
+    return channel
+
+
 def _resolve_videowall_branch_id(videowall_id: str, db: Session) -> str | None:
-    return db.scalar(
+    branch_id = db.scalar(
         select(Channel.branch_id)
         .join(VideowallNode, VideowallNode.channel_id == Channel.id)
         .where(VideowallNode.videowall_id == videowall_id)
         .order_by(VideowallNode.created_at.asc())
+        .limit(1)
+    )
+    if branch_id:
+        return branch_id
+
+    return db.scalar(
+        select(Channel.branch_id)
+        .join(Videowall, Videowall.primary_channel_id == Channel.id)
+        .where(Videowall.id == videowall_id)
         .limit(1)
     )
 
@@ -114,7 +179,7 @@ def _resolve_node_geometry(
 
         computed_position = position_from_row_col(columns, resolved_row, resolved_column)
         if resolved_position is not None and resolved_position != computed_position:
-            raise HTTPException(
+                raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="La posición solicitada no coincide con node_row/node_col",
             )
@@ -220,20 +285,37 @@ def create_videowall(
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre del videowall es obligatorio")
+    render_mode = _normalize_render_mode(payload.render_mode)
     columns, rows, total_width, total_height = _validate_videowall_geometry(
         payload.columns,
         payload.rows,
         payload.total_width,
         payload.total_height,
     )
+    output_width = _require_positive_int(payload.output_width, "output_width")
+    output_height = _require_positive_int(payload.output_height, "output_height")
+    primary_channel = (
+        _require_hardware_primary_channel(
+            db=db,
+            current_user=current_user,
+            client_id=client_id,
+            primary_channel_id=payload.primary_channel_id,
+        )
+        if render_mode == HARDWARE_SINGLE_INPUT_RENDER_MODE
+        else None
+    )
 
     videowall = Videowall(
         client_id=client_id,
         name=name,
+        render_mode=render_mode,
         columns=columns,
         rows=rows,
         total_width=total_width,
         total_height=total_height,
+        output_width=output_width,
+        output_height=output_height,
+        primary_channel_id=primary_channel.id if primary_channel else None,
         start_tolerance_ms=_require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms"),
         sync_mode=(payload.sync_mode or "play_at_timestamp").strip() or "play_at_timestamp",
     )
@@ -254,16 +336,21 @@ def update_videowall(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    next_render_mode = _normalize_render_mode(payload.render_mode if payload.render_mode is not None else videowall.render_mode)
     next_columns = payload.columns if payload.columns is not None else videowall.columns
     next_rows = payload.rows if payload.rows is not None else videowall.rows
     next_total_width = payload.total_width if payload.total_width is not None else videowall.total_width
     next_total_height = payload.total_height if payload.total_height is not None else videowall.total_height
+    next_output_width = payload.output_width if payload.output_width is not None else videowall.output_width
+    next_output_height = payload.output_height if payload.output_height is not None else videowall.output_height
     columns, rows, total_width, total_height = _validate_videowall_geometry(
         next_columns,
         next_rows,
         next_total_width,
         next_total_height,
     )
+    output_width = _require_positive_int(next_output_width, "output_width")
+    output_height = _require_positive_int(next_output_height, "output_height")
 
     nodes = list(
         db.scalars(
@@ -273,9 +360,16 @@ def update_videowall(
         )
     )
 
-    for node in nodes:
-        if node.row_index < 0 or node.row_index >= rows or node.column_index < 0 or node.column_index >= columns:
-            raise HTTPException(
+    if next_render_mode == HARDWARE_SINGLE_INPUT_RENDER_MODE and nodes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No puedes cambiar este videowall a cascada por hardware mientras existan nodos configurados",
+        )
+
+    if next_render_mode == MULTI_NODE_RENDER_MODE:
+        for node in nodes:
+            if node.row_index < 0 or node.row_index >= rows or node.column_index < 0 or node.column_index >= columns:
+                raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="No se puede redimensionar la matriz porque uno o más nodos quedarían fuera de rango",
             )
@@ -285,25 +379,42 @@ def update_videowall(
         if not next_name:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre del videowall es obligatorio")
         videowall.name = next_name
+    if next_render_mode == HARDWARE_SINGLE_INPUT_RENDER_MODE:
+        requested_primary_channel_id = payload.primary_channel_id if "primary_channel_id" in payload.model_fields_set else videowall.primary_channel_id
+        primary_channel = _require_hardware_primary_channel(
+            db=db,
+            current_user=current_user,
+            client_id=videowall.client_id,
+            primary_channel_id=requested_primary_channel_id,
+            exclude_videowall_id=videowall.id,
+        )
+        videowall.primary_channel_id = primary_channel.id
+    else:
+        videowall.primary_channel_id = None
+
+    videowall.render_mode = next_render_mode
     videowall.columns = columns
     videowall.rows = rows
     videowall.total_width = total_width
     videowall.total_height = total_height
+    videowall.output_width = output_width
+    videowall.output_height = output_height
     if payload.start_tolerance_ms is not None:
         videowall.start_tolerance_ms = _require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms")
     if payload.sync_mode is not None:
         videowall.sync_mode = payload.sync_mode.strip() or videowall.sync_mode
 
-    for node in nodes:
-        geometry = compute_videowall_cell_by_row_col(
-            columns=columns,
-            rows=rows,
-            total_width=total_width,
-            total_height=total_height,
-            row_index=node.row_index,
-            column_index=node.column_index,
-        )
-        _apply_geometry_to_node(node, geometry)
+    if next_render_mode == MULTI_NODE_RENDER_MODE:
+        for node in nodes:
+            geometry = compute_videowall_cell_by_row_col(
+                columns=columns,
+                rows=rows,
+                total_width=total_width,
+                total_height=total_height,
+                row_index=node.row_index,
+                column_index=node.column_index,
+            )
+            _apply_geometry_to_node(node, geometry)
 
     db.add(videowall)
     db.commit()
@@ -331,12 +442,20 @@ def delete_videowall(
 
     blocked_nodes: list[str] = []
     channels_to_delete: list[Channel] = []
-    for node in nodes:
-        channel = get_channel_in_scope(db, node.channel_id, current_user)
-        if is_player_online(channel.last_heartbeat_at):
-            blocked_nodes.append(f"el monitor {node.position_index} ({channel.name}) est\u00e1 en l\u00ednea")
-            continue
-        channels_to_delete.append(channel)
+    if _normalize_render_mode(videowall.render_mode) == HARDWARE_SINGLE_INPUT_RENDER_MODE:
+        if videowall.primary_channel_id:
+            primary_channel = get_channel_in_scope(db, videowall.primary_channel_id, current_user)
+            if is_player_online(primary_channel.last_heartbeat_at):
+                blocked_nodes.append(f"la entrada HDMI principal ({primary_channel.name}) está en línea")
+            else:
+                channels_to_delete.append(primary_channel)
+    else:
+        for node in nodes:
+            channel = get_channel_in_scope(db, node.channel_id, current_user)
+            if is_player_online(channel.last_heartbeat_at):
+                blocked_nodes.append(f"el monitor {node.position_index} ({channel.name}) está en línea")
+                continue
+            channels_to_delete.append(channel)
 
     if blocked_nodes:
         raise HTTPException(
@@ -359,7 +478,9 @@ def list_nodes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[VideowallNode]:
-    get_videowall_in_scope(videowall_id, db, current_user)
+    videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    if _normalize_render_mode(videowall.render_mode) != MULTI_NODE_RENDER_MODE:
+        return []
     return list(
         db.scalars(
             select(VideowallNode)
@@ -380,6 +501,7 @@ def upsert_node(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    _ensure_multi_node_videowall(videowall)
     channel = get_channel_in_scope(db, payload.channel_id, current_user)
     if channel.client_id != videowall.client_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Videowall or channel not found")
@@ -446,6 +568,7 @@ def update_node_position(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    _ensure_multi_node_videowall(videowall)
     node = db.scalar(
         select(VideowallNode)
         .where(
@@ -486,6 +609,7 @@ def delete_node_screen(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    _ensure_multi_node_videowall(videowall)
     node = db.scalar(
         select(VideowallNode).where(
             VideowallNode.id == node_id,

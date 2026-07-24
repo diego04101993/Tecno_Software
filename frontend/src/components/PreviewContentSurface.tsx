@@ -1,6 +1,9 @@
+import { useEffect, useRef, useState } from "react";
 import { FileCode2, Globe, ImageIcon, LayoutTemplate, Type, Video } from "lucide-react";
 
 import { isStreamLikeContent, resolvePreviewMediaUrl, type PreviewRenderableEntry } from "../lib/preview";
+
+const VIDEO_METADATA_TIMEOUT_MS = 10_000;
 
 function resolveUrlPreviewFrame(url: string | null) {
   if (!url) {
@@ -77,21 +80,281 @@ function PreviewMediaPlaceholder({
   );
 }
 
+type PreviewVideoStatus = "loading" | "ready" | "buffering" | "error" | "timeout";
+
+function PreviewVideoSurface({
+  mediaUrl,
+  entry,
+  title,
+  compact,
+  controlledPlayback = false,
+  isPlaying = false,
+  playbackPositionSeconds = 0,
+}: {
+  mediaUrl: string;
+  entry: PreviewRenderableEntry;
+  title?: string;
+  compact: boolean;
+  controlledPlayback?: boolean;
+  isPlaying?: boolean;
+  playbackPositionSeconds?: number;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const timeoutRef = useRef<number | null>(null);
+  const pendingSeekRef = useRef<number | null>(null);
+  const [status, setStatus] = useState<PreviewVideoStatus>("loading");
+  const overlayLabel = getOverlayLabel(entry);
+  const safePlaybackPositionSeconds = Number.isFinite(playbackPositionSeconds) ? Math.max(0, playbackPositionSeconds) : 0;
+
+  useEffect(() => {
+    setStatus("loading");
+
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+    }
+
+    timeoutRef.current = window.setTimeout(() => {
+      setStatus((current) => (current === "ready" ? current : "timeout"));
+    }, VIDEO_METADATA_TIMEOUT_MS);
+
+    return () => {
+      if (timeoutRef.current !== null) {
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    };
+  }, [entry.id, mediaUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    pendingSeekRef.current = safePlaybackPositionSeconds;
+
+    if (!controlledPlayback || !video) {
+      return;
+    }
+
+    video.pause();
+    try {
+      video.currentTime = 0;
+    } catch {
+      // El navegador puede bloquear el seek antes de cargar metadata; se reintentará después.
+    }
+    video.load();
+  }, [controlledPlayback, entry.id, mediaUrl]);
+
+  function clearTimeoutGuard() {
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }
+
+  function getSeekTarget(video: HTMLVideoElement, targetSeconds: number) {
+    const safeTarget = Math.max(0, targetSeconds);
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      return Math.max(0, Math.min(safeTarget, Math.max(0, video.duration - 0.05)));
+    }
+    return safeTarget;
+  }
+
+  function applyPendingSeek() {
+    const video = videoRef.current;
+    if (!video || pendingSeekRef.current === null) {
+      return;
+    }
+
+    const nextTarget = getSeekTarget(video, pendingSeekRef.current);
+    if (Math.abs(video.currentTime - nextTarget) <= 0.05) {
+      pendingSeekRef.current = null;
+      return;
+    }
+
+    try {
+      video.currentTime = nextTarget;
+      pendingSeekRef.current = null;
+    } catch {
+      pendingSeekRef.current = nextTarget;
+    }
+  }
+
+  function tryPlayVideo() {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    const playAttempt = video.play();
+    if (playAttempt && typeof playAttempt.catch === "function") {
+      void playAttempt.catch(() => {
+        // El usuario puede seguir navegando el preview aunque el navegador bloquee autoplay.
+      });
+    }
+  }
+
+  useEffect(() => {
+    if (!controlledPlayback) {
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    if (!isPlaying) {
+      video.pause();
+      if (video.readyState >= 1) {
+        applyPendingSeek();
+      }
+      return;
+    }
+
+    const playAttempt = video.play();
+    if (playAttempt && typeof playAttempt.catch === "function") {
+      void playAttempt.catch((error: unknown) => {
+        const errorName =
+          error instanceof DOMException
+            ? error.name
+            : typeof error === "object" && error !== null && "name" in error
+              ? String((error as { name?: unknown }).name)
+              : "";
+
+        if (errorName === "AbortError") {
+          return;
+        }
+
+        clearTimeoutGuard();
+        setStatus("error");
+      });
+    }
+  }, [controlledPlayback, entry.id, isPlaying, mediaUrl]);
+
+  useEffect(() => {
+    if (!controlledPlayback || isPlaying) {
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    pendingSeekRef.current = safePlaybackPositionSeconds;
+    if (video.readyState >= 1) {
+      applyPendingSeek();
+    }
+  }, [controlledPlayback, entry.id, isPlaying, mediaUrl, safePlaybackPositionSeconds]);
+
+  useEffect(
+    () => () => {
+      const video = videoRef.current;
+      if (video) {
+        video.pause();
+      }
+    },
+    [],
+  );
+
+  const showFallback = status === "error" || status === "timeout";
+  const showLoadingBadge = !showFallback && (status === "loading" || status === "buffering");
+  const statusLabel = status === "buffering" ? "Buffering..." : "Cargando metadata...";
+
+  return (
+    <>
+      <video
+        ref={videoRef}
+        autoPlay={!controlledPlayback}
+        className="h-full w-full object-contain"
+        controls={!compact && !controlledPlayback}
+        loop={!controlledPlayback}
+        muted
+        playsInline
+        preload="metadata"
+        src={mediaUrl}
+        onCanPlay={() => {
+          clearTimeoutGuard();
+          setStatus("ready");
+          applyPendingSeek();
+          if (!controlledPlayback) {
+            tryPlayVideo();
+          }
+        }}
+        onEnded={() => {
+          setStatus("ready");
+        }}
+        onError={() => {
+          clearTimeoutGuard();
+          setStatus("error");
+        }}
+        onLoadedMetadata={() => {
+          applyPendingSeek();
+          setStatus((current) => (current === "loading" ? "buffering" : current));
+        }}
+        onPlaying={() => {
+          clearTimeoutGuard();
+          setStatus("ready");
+        }}
+        onStalled={() => {
+          setStatus((current) => (current === "ready" ? "buffering" : current));
+        }}
+        onWaiting={() => {
+          setStatus((current) => (current === "ready" ? "buffering" : current));
+        }}
+      />
+
+      {showLoadingBadge ? (
+        <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-full border border-cyan-300/35 bg-slate-950/70 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-cyan-100 backdrop-blur">
+          {statusLabel}
+        </div>
+      ) : null}
+
+      {showFallback ? (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/88 px-6 text-center text-slate-100">
+          <div className="max-w-md">
+            <span className="mx-auto grid h-14 w-14 place-items-center rounded-2xl border border-white/10 bg-white/5">
+              <Video className="h-6 w-6" />
+            </span>
+            <p className={`mt-4 font-semibold text-white ${compact ? "text-sm" : "text-base"}`}>
+              {status === "timeout" ? "El preview tardó demasiado en cargar." : "No se pudo reproducir este video en el navegador."}
+            </p>
+            <p className="mt-2 text-xs text-slate-300">
+              Este video es demasiado pesado o utiliza un códec no compatible con el navegador. El archivo seguirá disponible para publicarse en el Player.
+            </p>
+            <p className="mt-3 truncate text-[11px] text-slate-400" title={entry.content?.file_path ?? mediaUrl}>
+              {entry.content?.file_path ?? mediaUrl}
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {overlayLabel ? (
+        <span className="absolute right-4 top-4 z-10 rounded-full border border-white/20 bg-black/45 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-white/90 backdrop-blur">
+          {overlayLabel}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 function PreviewVisualSurface({
   entry,
   title,
   compact,
+  controlledPlayback = false,
+  isPlaying = false,
+  playbackPositionSeconds = 0,
 }: {
   entry: PreviewRenderableEntry;
   title?: string;
   compact: boolean;
+  controlledPlayback?: boolean;
+  isPlaying?: boolean;
+  playbackPositionSeconds?: number;
 }) {
   const content = entry.content;
   if (!content || (content.type !== "image" && content.type !== "video")) {
     return null;
   }
 
-  const overlayLabel = getOverlayLabel(entry);
   const mediaUrl = resolvePreviewMediaUrl(content);
   const baseChrome = compact ? "rounded-[18px]" : "rounded-[24px]";
 
@@ -108,16 +371,14 @@ function PreviewVisualSurface({
               src={mediaUrl}
             />
           ) : (
-            <video
-              key={`${entry.id}:${mediaUrl}`}
-              autoPlay
-              className="h-full w-full object-contain"
-              controls={false}
-              loop
-              muted
-              playsInline
-              preload="metadata"
-              src={mediaUrl}
+            <PreviewVideoSurface
+              compact={compact}
+              controlledPlayback={controlledPlayback}
+              entry={entry}
+              isPlaying={isPlaying}
+              mediaUrl={mediaUrl}
+              playbackPositionSeconds={playbackPositionSeconds}
+              title={title}
             />
           )
         ) : (
@@ -128,12 +389,6 @@ function PreviewVisualSurface({
           />
         )}
       </div>
-
-      {overlayLabel ? (
-        <span className="absolute right-4 top-4 z-10 rounded-full border border-white/20 bg-black/45 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-white/90 backdrop-blur">
-          {overlayLabel}
-        </span>
-      ) : null}
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-black via-black/72 to-transparent px-5 py-4 text-white">
         <div className="flex items-end justify-between gap-4">
@@ -157,10 +412,16 @@ export function PreviewContentSurface({
   entry,
   title,
   compact = false,
+  controlledPlayback = false,
+  isPlaying = false,
+  playbackPositionSeconds = 0,
 }: {
   entry: PreviewRenderableEntry | null;
   title?: string;
   compact?: boolean;
+  controlledPlayback?: boolean;
+  isPlaying?: boolean;
+  playbackPositionSeconds?: number;
 }) {
   if (!entry) {
     return (
@@ -185,7 +446,16 @@ export function PreviewContentSurface({
   const baseChrome = compact ? "rounded-[18px]" : "rounded-[24px]";
 
   if (content && (content.type === "image" || content.type === "video")) {
-    return <PreviewVisualSurface compact={compact} entry={entry} title={title} />;
+    return (
+      <PreviewVisualSurface
+        compact={compact}
+        controlledPlayback={controlledPlayback}
+        entry={entry}
+        isPlaying={isPlaying}
+        playbackPositionSeconds={playbackPositionSeconds}
+        title={title}
+      />
+    );
   }
 
   if (content?.type === "url") {

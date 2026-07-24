@@ -21,6 +21,7 @@ type OperationPreviewSidebarProps = {
   nextEntry: PreviewSequenceEntry | null;
   currentIndex: number;
   currentLoopTimeSeconds: number;
+  currentClipElapsedSeconds: number;
   currentItemDurationSeconds: number;
   totalDurationSeconds: number;
   progressPercent: number;
@@ -38,6 +39,7 @@ export function OperationPreviewSidebar({
   nextEntry,
   currentIndex,
   currentLoopTimeSeconds,
+  currentClipElapsedSeconds,
   currentItemDurationSeconds,
   totalDurationSeconds,
   progressPercent,
@@ -213,7 +215,13 @@ export function OperationPreviewSidebar({
                 style={{ aspectRatio: `${Math.max(1, previewChannel.resolution_width)} / ${Math.max(1, previewChannel.resolution_height)}` }}
               >
                 <div className="absolute inset-0 p-3">
-                  <PreviewContentSurface entry={currentEntry} title={currentEntry?.itemLabel ?? campaign.name} />
+                  <PreviewContentSurface
+                    controlledPlayback
+                    entry={currentEntry}
+                    isPlaying={isPlaying}
+                    playbackPositionSeconds={currentClipElapsedSeconds}
+                    title={currentEntry?.itemLabel ?? campaign.name}
+                  />
                 </div>
               </div>
             </div>

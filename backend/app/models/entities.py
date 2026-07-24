@@ -714,15 +714,20 @@ class Videowall(UUIDMixin, TimestampMixin, Base):
 
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    render_mode: Mapped[str] = mapped_column(String(40), default="multi-node")
     columns: Mapped[int] = mapped_column(Integer, default=2)
     rows: Mapped[int] = mapped_column(Integer, default=2)
     total_width: Mapped[int] = mapped_column(Integer, default=3840)
     total_height: Mapped[int] = mapped_column(Integer, default=2160)
+    output_width: Mapped[int] = mapped_column(Integer, default=1920)
+    output_height: Mapped[int] = mapped_column(Integer, default=1080)
+    primary_channel_id: Mapped[str | None] = mapped_column(ForeignKey("channels.id", ondelete="SET NULL"), unique=True)
     start_tolerance_ms: Mapped[int] = mapped_column(Integer, default=250)
     sync_mode: Mapped[str] = mapped_column(String(40), default="play_at_timestamp")
 
     client: Mapped[Client] = relationship(back_populates="videowalls")
     nodes: Mapped[list["VideowallNode"]] = relationship(back_populates="videowall", cascade="all, delete-orphan")
+    primary_channel: Mapped[Channel | None] = relationship(foreign_keys=[primary_channel_id])
 
 
 class VideowallNode(UUIDMixin, TimestampMixin, Base):

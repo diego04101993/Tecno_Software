@@ -649,20 +649,28 @@ class ScheduleRead(TimestampedModel):
 class VideowallCreate(BaseModel):
     client_id: str | None = None
     name: str
+    render_mode: Literal["multi-node", "hardware-single-input"] = "multi-node"
     columns: int = 2
     rows: int = 2
     total_width: int = 3840
     total_height: int = 2160
+    output_width: int = 1920
+    output_height: int = 1080
+    primary_channel_id: str | None = None
     start_tolerance_ms: int = 250
     sync_mode: str = "play_at_timestamp"
 
 
 class VideowallUpdate(BaseModel):
     name: str | None = None
+    render_mode: Literal["multi-node", "hardware-single-input"] | None = None
     columns: int | None = None
     rows: int | None = None
     total_width: int | None = None
     total_height: int | None = None
+    output_width: int | None = None
+    output_height: int | None = None
+    primary_channel_id: str | None = None
     start_tolerance_ms: int | None = None
     sync_mode: str | None = None
 
@@ -670,10 +678,14 @@ class VideowallUpdate(BaseModel):
 class VideowallRead(TimestampedModel):
     client_id: str
     name: str
+    render_mode: Literal["multi-node", "hardware-single-input"]
     columns: int
     rows: int
     total_width: int
     total_height: int
+    output_width: int
+    output_height: int
+    primary_channel_id: str | None = None
     start_tolerance_ms: int
     sync_mode: str
 
