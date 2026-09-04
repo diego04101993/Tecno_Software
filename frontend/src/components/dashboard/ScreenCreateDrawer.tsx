@@ -2,12 +2,13 @@ import { Columns2, Monitor, TvMinimalPlay, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "../../lib/api";
-import type { Branch, Channel, Orientation, Videowall, VideowallNode, VideowallRenderMode } from "../../types/domain";
+import type { Branch, Channel, DeviceMode, Orientation, Videowall, VideowallNode, VideowallRenderMode } from "../../types/domain";
 import { getVideowallCellMetrics } from "../VideowallGridPreview";
+import { DeviceOutputsPreview, getSuggestedCanvas } from "./DeviceOutputsPreview";
 import { LedOutputMappingPanel, buildOutputMappingDraft, type ChannelOutputMappingDraft } from "./LedOutputMappingPanel";
 import { SimpleVideowallMatrix } from "./SimpleVideowallMatrix";
 
-type ScreenMode = "normal" | "expanded" | "videowall";
+type ScreenMode = DeviceMode | "videowall";
 type VideowallFlow = "create" | "existing";
 type ResolutionBasis = "monitor" | "total";
 
@@ -33,12 +34,38 @@ const defaultVideowallDraft = {
   position_index: 1,
 };
 
-function buildExpandedOutputs(screenCount: number) {
-  return Array.from({ length: screenCount }, (_, index) => ({
-    output_index: index + 1,
-    label: `HDMI ${index + 1}`,
-    role: index === 0 ? "primary" : "extended",
-  }));
+function isMultiOutputMode(mode: ScreenMode) {
+  return mode === "mirror" || mode === "extended" || mode === "independent";
+}
+
+function getLegacyMode(mode: ScreenMode): Channel["mode"] {
+  if (mode === "videowall") {
+    return "videowall";
+  }
+  if (mode === "single") {
+    return "normal";
+  }
+  return "expanded";
+}
+
+function getOutputCount(mode: ScreenMode, screenCount: number) {
+  if (!isMultiOutputMode(mode)) {
+    return 1;
+  }
+  return Math.max(2, screenCount);
+}
+
+function getDeviceModeLabel(mode: DeviceMode) {
+  switch (mode) {
+    case "mirror":
+      return "Mirror";
+    case "extended":
+      return "Extended";
+    case "independent":
+      return "Independent";
+    default:
+      return "Single";
+  }
 }
 
 function normalizePositiveInt(value: number, fallback: number) {
@@ -76,12 +103,15 @@ export function ScreenCreateDrawer({
   onClose: () => void;
   onCreated: () => Promise<void> | void;
 }) {
-  const [mode, setMode] = useState<ScreenMode>("normal");
+  const [mode, setMode] = useState<ScreenMode>("single");
   const [name, setName] = useState("");
   const [orientation, setOrientation] = useState<Orientation>("horizontal");
   const [resolutionWidth, setResolutionWidth] = useState(1920);
   const [resolutionHeight, setResolutionHeight] = useState(1080);
   const [screenCount, setScreenCount] = useState(2);
+  const [canvasWidth, setCanvasWidth] = useState(1920);
+  const [canvasHeight, setCanvasHeight] = useState(1080);
+  const [isCanvasCustom, setIsCanvasCustom] = useState(false);
   const [hardwareIdentifier, setHardwareIdentifier] = useState("");
   const [notes, setNotes] = useState("");
   const [outputMapping, setOutputMapping] = useState<ChannelOutputMappingDraft>(buildOutputMappingDraft(null, 1920, 1080));
@@ -100,12 +130,15 @@ export function ScreenCreateDrawer({
       return;
     }
 
-    setMode("normal");
+    setMode("single");
     setName("");
     setOrientation("horizontal");
     setResolutionWidth(1920);
     setResolutionHeight(1080);
     setScreenCount(2);
+    setCanvasWidth(1920);
+    setCanvasHeight(1080);
+    setIsCanvasCustom(false);
     setHardwareIdentifier("");
     setNotes("");
     setOutputMapping(buildOutputMappingDraft(null, 1920, 1080));
@@ -161,6 +194,29 @@ export function ScreenCreateDrawer({
     () => existingVideowallNodes.map((node) => node.position_index).sort((left, right) => left - right),
     [existingVideowallNodes],
   );
+  const effectiveOutputCount = useMemo(() => getOutputCount(mode, screenCount), [mode, screenCount]);
+  const suggestedCanvas = useMemo(
+    () => getSuggestedCanvas(mode === "videowall" ? "single" : mode, resolutionWidth, resolutionHeight, effectiveOutputCount),
+    [effectiveOutputCount, mode, resolutionHeight, resolutionWidth],
+  );
+
+  useEffect(() => {
+    if (mode === "videowall") {
+      return;
+    }
+
+    if (mode === "single") {
+      setCanvasWidth(resolutionWidth);
+      setCanvasHeight(resolutionHeight);
+      setIsCanvasCustom(false);
+      return;
+    }
+
+    if (!isCanvasCustom) {
+      setCanvasWidth(suggestedCanvas.width);
+      setCanvasHeight(suggestedCanvas.height);
+    }
+  }, [isCanvasCustom, mode, resolutionHeight, resolutionWidth, suggestedCanvas.height, suggestedCanvas.width]);
 
   const videowallDerived = useMemo(() => {
     const usingExistingVideowall = mode === "videowall" && videowallFlow === "existing" && selectedExistingVideowall;
@@ -263,30 +319,41 @@ export function ScreenCreateDrawer({
     setNotice(null);
 
     try {
+      const legacyMode = getLegacyMode(mode);
+      const deviceMode = mode === "videowall" ? "single" : mode;
       const channelPayload = {
         client_id: clientId,
         branch_id: targetBranch.id,
         name,
         resolution_width:
-          mode === "videowall"
+          legacyMode === "videowall"
             ? videowallDerived.isHardwareSingleInput
               ? videowallDerived.outputWidth
               : (videowallDerived.selectedCell?.width ?? resolutionWidth)
             : resolutionWidth,
         resolution_height:
-          mode === "videowall"
+          legacyMode === "videowall"
             ? videowallDerived.isHardwareSingleInput
               ? videowallDerived.outputHeight
               : (videowallDerived.selectedCell?.height ?? resolutionHeight)
             : resolutionHeight,
         orientation,
-        mode,
-        screen_count: mode === "expanded" ? screenCount : 1,
+        mode: legacyMode,
+        device_mode: deviceMode,
+        screen_count: effectiveOutputCount,
+        canvas_width:
+          legacyMode === "videowall"
+            ? (videowallDerived.isHardwareSingleInput ? videowallDerived.outputWidth : (videowallDerived.selectedCell?.width ?? resolutionWidth))
+            : canvasWidth,
+        canvas_height:
+          legacyMode === "videowall"
+            ? (videowallDerived.isHardwareSingleInput ? videowallDerived.outputHeight : (videowallDerived.selectedCell?.height ?? resolutionHeight))
+            : canvasHeight,
         hardware_identifier: hardwareIdentifier || null,
         notes: notes || null,
-        expanded_outputs: mode === "expanded" ? buildExpandedOutputs(screenCount) : [],
+        expanded_outputs: [],
         output_mapping_json:
-          mode === "videowall"
+          legacyMode === "videowall"
             ? {}
             : buildOutputMappingDraft(outputMapping, resolutionWidth, resolutionHeight),
       };
@@ -382,10 +449,10 @@ export function ScreenCreateDrawer({
           };
         }
         }
-      } else if (mode === "expanded") {
+      } else if (isMultiOutputMode(mode)) {
         nextNotice = {
           tone: "success",
-          text: `Grupo expandido creado con ${screenCount} salidas sobre la misma PC.`,
+          text: `${getDeviceModeLabel(mode)} preparado con ${effectiveOutputCount} salidas y canvas ${canvasWidth}x${canvasHeight}.`,
         };
       }
 
@@ -410,7 +477,7 @@ export function ScreenCreateDrawer({
             <p className="text-xs uppercase tracking-[0.24em] text-accent">Agregar pantalla</p>
             <h3 className="mt-2 font-display text-3xl text-ink">{targetBranch.name}</h3>
             <p className="mt-2 text-sm text-slate-600">
-              Crea una pantalla normal, un grupo expandido o un nodo dentro de un videowall sin salir del dashboard.
+              Crea una pantalla single o multi-output, o agrega un nodo a un videowall, sin salir del dashboard.
             </p>
           </div>
           <button
@@ -436,18 +503,30 @@ export function ScreenCreateDrawer({
         ) : null}
 
         <form className="mt-6 space-y-5" onSubmit={handleSubmit}>
-          <div className="grid gap-3 md:grid-cols-3">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             {[
               {
-                id: "normal" as const,
-                title: "Normal",
+                id: "single" as const,
+                title: "Single",
                 description: "Una pantalla por canal.",
                 icon: Monitor,
               },
               {
-                id: "expanded" as const,
-                title: "Expandido",
-                description: "2 o 3 salidas desde la misma PC.",
+                id: "mirror" as const,
+                title: "Mirror",
+                description: "Varias salidas repiten el mismo contenido.",
+                icon: Columns2,
+              },
+              {
+                id: "extended" as const,
+                title: "Extended",
+                description: "Canvas panorámico con slices automáticos.",
+                icon: Columns2,
+              },
+              {
+                id: "independent" as const,
+                title: "Independent",
+                description: "Preparado para campañas distintas por salida.",
                 icon: Columns2,
               },
               {
@@ -470,6 +549,14 @@ export function ScreenCreateDrawer({
                   type="button"
                   onClick={() => {
                     setMode(option.id);
+                    if (option.id !== "videowall") {
+                      const nextOutputCount = getOutputCount(option.id, screenCount);
+                      const nextCanvas = getSuggestedCanvas(option.id, resolutionWidth, resolutionHeight, nextOutputCount);
+                      setScreenCount(nextOutputCount);
+                      setCanvasWidth(nextCanvas.width);
+                      setCanvasHeight(nextCanvas.height);
+                      setIsCanvasCustom(false);
+                    }
                     setError(null);
                     setNotice(null);
                   }}
@@ -490,13 +577,23 @@ export function ScreenCreateDrawer({
               <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Ej. Pantalla caja 1" required />
             </div>
 
-            {mode === "expanded" ? (
+            {isMultiOutputMode(mode) ? (
               <div>
                 <label className="mb-2 block text-sm font-semibold text-slate-700">Salidas</label>
-                <select value={screenCount} onChange={(event) => setScreenCount(Number(event.target.value))}>
-                  <option value={2}>2 salidas</option>
-                  <option value={3}>3 salidas</option>
-                </select>
+                <input
+                  type="number"
+                  min={2}
+                  value={effectiveOutputCount}
+                  onChange={(event) => {
+                    const nextCount = Math.max(2, normalizePositiveInt(Number(event.target.value), effectiveOutputCount));
+                    setScreenCount(nextCount);
+                    if (!isCanvasCustom) {
+                      const nextCanvas = getSuggestedCanvas(mode, resolutionWidth, resolutionHeight, nextCount);
+                      setCanvasWidth(nextCanvas.width);
+                      setCanvasHeight(nextCanvas.height);
+                    }
+                  }}
+                />
               </div>
             ) : null}
 
@@ -504,7 +601,7 @@ export function ScreenCreateDrawer({
               <>
                 <div>
                   <label className="mb-2 block text-sm font-semibold text-slate-700">
-                    {mode === "expanded" ? "Resolución por salida" : "Resolución ancho"}
+                    {isMultiOutputMode(mode) ? "Resolución por salida" : "Resolución ancho"}
                   </label>
                   <input
                     type="number"
@@ -515,13 +612,39 @@ export function ScreenCreateDrawer({
                 </div>
                 <div>
                   <label className="mb-2 block text-sm font-semibold text-slate-700">
-                    {mode === "expanded" ? "Resolución alto por salida" : "Resolución alto"}
+                    {isMultiOutputMode(mode) ? "Resolución alto por salida" : "Resolución alto"}
                   </label>
                   <input
                     type="number"
                     min={1}
                     value={resolutionHeight}
                     onChange={(event) => setResolutionHeight(normalizePositiveInt(Number(event.target.value), resolutionHeight))}
+                  />
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-semibold text-slate-700">Canvas ancho</label>
+                  <input
+                    type="number"
+                    min={1}
+                    disabled={mode === "single"}
+                    value={mode === "single" ? resolutionWidth : canvasWidth}
+                    onChange={(event) => {
+                      setCanvasWidth(normalizePositiveInt(Number(event.target.value), canvasWidth));
+                      setIsCanvasCustom(true);
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-semibold text-slate-700">Canvas alto</label>
+                  <input
+                    type="number"
+                    min={1}
+                    disabled={mode === "single"}
+                    value={mode === "single" ? resolutionHeight : canvasHeight}
+                    onChange={(event) => {
+                      setCanvasHeight(normalizePositiveInt(Number(event.target.value), canvasHeight));
+                      setIsCanvasCustom(true);
+                    }}
                   />
                 </div>
               </>
@@ -546,6 +669,19 @@ export function ScreenCreateDrawer({
               />
             </div>
           </div>
+
+          {mode !== "videowall" ? (
+            <DeviceOutputsPreview
+              model={{
+                deviceMode: mode,
+                outputCount: effectiveOutputCount,
+                outputWidth: resolutionWidth,
+                outputHeight: resolutionHeight,
+                canvasWidth: mode === "single" ? resolutionWidth : canvasWidth,
+                canvasHeight: mode === "single" ? resolutionHeight : canvasHeight,
+              }}
+            />
+          ) : null}
 
           {mode === "videowall" ? (
             <section className="rounded-[28px] border border-slate-200 bg-slate-50 p-5">

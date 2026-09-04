@@ -35,6 +35,7 @@ from app.models.entities import (
     VideowallNode,
 )
 from app.services.campaign_sequence import normalize_playback_mode, resolve_effective_sequence_items, sequence_item_zone_key
+from app.services.device_outputs import serialize_runtime_device, serialize_runtime_output
 from app.services.layout_bindings import build_layout_data_preview
 from app.services.layout_editor import build_layout_preview_state, get_current_draft_revision, get_current_published_revision
 from app.services.output_mapping import normalize_output_mapping
@@ -43,7 +44,7 @@ from app.services.videowall_geometry import compute_videowall_cell_by_row_col
 
 
 settings = get_settings()
-RUNTIME_VERSION = 2
+RUNTIME_VERSION = 3
 SYNC_LEAD_MS = 5000
 
 
@@ -110,7 +111,10 @@ def serialize_channel(channel: Channel) -> dict[str, object]:
         "resolution_height": channel.resolution_height,
         "orientation": channel.orientation.value,
         "mode": channel.mode.value,
+        "device_mode": channel.device_mode.value,
         "screen_count": channel.screen_count,
+        "canvas_width": channel.canvas_width,
+        "canvas_height": channel.canvas_height,
         "status": presence["status"],
         "is_online": presence["is_online"],
         "heartbeat_age_seconds": presence["heartbeat_age_seconds"],
@@ -780,6 +784,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str) ->
         "server_time": generated_at.isoformat(),
         "play_at_timestamp": play_at_timestamp,
         "channel": serialize_channel(channel),
+        "device": serialize_runtime_device(channel),
         "branch": serialize_branch(branch) if branch else None,
         "client": serialize_client(client) if client else None,
         "mode": effective_mode,
@@ -793,6 +798,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str) ->
         "layout_runtime_snapshot": layout_revision_payload,
         "dataset_runtime_data": dataset_runtime_data,
         "videowall": videowall_payload,
+        "outputs": [serialize_runtime_output(output) for output in channel.device_outputs if output.enabled],
         "output_mapping": output_mapping_payload,
         "audio": audio_payload,
         "touch": touch_payload,

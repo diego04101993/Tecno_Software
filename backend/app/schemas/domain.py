@@ -13,6 +13,8 @@ from app.models.entities import (
     ContentType,
     DataSourceStatus,
     DataSourceType,
+    DeviceMode,
+    DeviceOutputOrientation,
     DatasetColumnType,
     DatasetImportStatus,
     DatasetStatus,
@@ -238,7 +240,10 @@ class ChannelCreate(BaseModel):
     resolution_height: int = 1080
     orientation: Orientation = Orientation.HORIZONTAL
     mode: ChannelMode = ChannelMode.NORMAL
+    device_mode: DeviceMode = DeviceMode.SINGLE
     screen_count: int = 1
+    canvas_width: int | None = None
+    canvas_height: int | None = None
     hardware_identifier: str | None = None
     expanded_outputs: list[dict] = Field(default_factory=list)
     output_mapping_json: dict = Field(default_factory=dict)
@@ -250,11 +255,35 @@ class ChannelUpdate(BaseModel):
     resolution_width: int | None = None
     resolution_height: int | None = None
     orientation: Orientation | None = None
+    mode: ChannelMode | None = None
+    device_mode: DeviceMode | None = None
     screen_count: int | None = None
+    canvas_width: int | None = None
+    canvas_height: int | None = None
     hardware_identifier: str | None = None
     expanded_outputs: list[dict] | None = None
     output_mapping_json: dict | None = None
     notes: str | None = None
+
+
+class DeviceOutputRead(TimestampedModel):
+    root_channel_id: str
+    name: str
+    display_order: int
+    display_uid: str | None = None
+    channel_id: str | None = None
+    x: int
+    y: int
+    width: int
+    height: int
+    source_x: int
+    source_y: int
+    source_width: int
+    source_height: int
+    rotation: int
+    orientation: DeviceOutputOrientation
+    sync_group: str | None = None
+    enabled: bool
 
 
 class ChannelRead(TimestampedModel):
@@ -266,11 +295,15 @@ class ChannelRead(TimestampedModel):
     resolution_height: int
     orientation: Orientation
     mode: ChannelMode
+    device_mode: DeviceMode
     screen_count: int
+    canvas_width: int
+    canvas_height: int
     status: ChannelConnectionStatus = Field(validation_alias=AliasChoices("computed_status", "status"))
     current_playback: str | None = None
     hardware_identifier: str | None = None
     expanded_outputs: list[dict]
+    device_outputs: list[DeviceOutputRead] = Field(default_factory=list)
     output_mapping_json: dict
     last_ping_at: datetime | None = Field(default=None, validation_alias=AliasChoices("last_heartbeat_at", "last_ping_at"))
     last_heartbeat_at: datetime | None = Field(default=None, validation_alias=AliasChoices("last_heartbeat_at", "last_ping_at"))

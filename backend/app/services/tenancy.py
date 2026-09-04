@@ -2,7 +2,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
-from app.models.entities import Branch, Campaign, CampaignChannelAssignment, CampaignPlaylistItem, Channel, Client, ContentItem, ContentFolder, DataSource, Dataset, Layout, LayoutDataBinding, Schedule, TouchExperience, User, UserRole, Videowall, VideowallNode
+from app.models.entities import Branch, Campaign, CampaignChannelAssignment, CampaignPlaylistItem, Channel, Client, ContentItem, ContentFolder, DataSource, Dataset, DeviceOutput, Layout, LayoutDataBinding, Schedule, TouchExperience, User, UserRole, Videowall, VideowallNode
 
 
 GLOBAL_WORKSPACE_ROLES = {UserRole.SUPER_ADMIN, UserRole.STAFF_ADMIN, UserRole.STAFF_OPERATOR}
@@ -145,6 +145,22 @@ def get_channel_in_scope(db: Session, channel_id: str, current_user: User) -> Ch
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Channel access denied")
 
     return channel
+
+
+def get_device_output_in_scope(db: Session, device_output_id: str, current_user: User) -> DeviceOutput:
+    device_output = db.get(DeviceOutput, device_output_id)
+    if not device_output:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device output not found")
+
+    root_channel = db.get(Channel, device_output.root_channel_id)
+    if not root_channel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Root channel not found")
+
+    require_client_scope(current_user, root_channel.client_id)
+    if is_branch_scoped(current_user) and root_channel.branch_id != require_branch_assignment(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Device output access denied")
+
+    return device_output
 
 
 def get_data_source_in_scope(db: Session, data_source_id: str, current_user: User) -> DataSource:

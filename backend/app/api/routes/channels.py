@@ -25,6 +25,7 @@ from app.models.entities import (
 )
 from app.schemas.domain import ChannelCreate, ChannelRead, ChannelUpdate
 from app.schemas.domain import CampaignAssignmentResult, ChannelCampaignAssignmentReplaceRequest
+from app.services.device_outputs import normalize_channel_device_fields, sync_channel_device_outputs
 from app.services.output_mapping import normalize_output_mapping
 from app.services.presence import is_player_online
 from app.services.player_runtime import build_player_runtime_config, resolve_runtime_campaign_context
@@ -173,9 +174,7 @@ def create_channel(
         resolution_height=max(1, payload.resolution_height),
         orientation=payload.orientation,
         mode=payload.mode,
-        screen_count=max(1, payload.screen_count),
         hardware_identifier=payload.hardware_identifier.strip() if payload.hardware_identifier else None,
-        expanded_outputs=payload.expanded_outputs,
         output_mapping_json=normalize_output_mapping(
             payload.output_mapping_json,
             resolution_width=max(1, payload.resolution_width),
@@ -183,8 +182,17 @@ def create_channel(
         ),
         notes=payload.notes.strip() if payload.notes else None,
     )
+    normalize_channel_device_fields(
+        channel,
+        requested_device_mode=payload.device_mode,
+        requested_screen_count=payload.screen_count,
+        requested_canvas_width=payload.canvas_width,
+        requested_canvas_height=payload.canvas_height,
+    )
     db.add(channel)
     try:
+        db.flush()
+        sync_channel_device_outputs(channel)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -214,12 +222,10 @@ def update_channel(
         channel.resolution_height = max(1, changes["resolution_height"])
     if "orientation" in changes and changes["orientation"] is not None:
         channel.orientation = changes["orientation"]
-    if "screen_count" in changes and changes["screen_count"] is not None:
-        channel.screen_count = min(3, max(2, changes["screen_count"])) if channel.mode == "expanded" else 1
+    if "mode" in changes and changes["mode"] is not None:
+        channel.mode = changes["mode"]
     if "hardware_identifier" in changes:
         channel.hardware_identifier = changes["hardware_identifier"].strip() if changes["hardware_identifier"] else None
-    if "expanded_outputs" in changes and changes["expanded_outputs"] is not None:
-        channel.expanded_outputs = changes["expanded_outputs"]
     if "output_mapping_json" in changes and changes["output_mapping_json"] is not None:
         channel.output_mapping_json = normalize_output_mapping(
             changes["output_mapping_json"],
@@ -235,6 +241,14 @@ def update_channel(
     if "notes" in changes:
         channel.notes = changes["notes"].strip() if changes["notes"] else None
 
+    normalize_channel_device_fields(
+        channel,
+        requested_device_mode=changes.get("device_mode"),
+        requested_screen_count=changes.get("screen_count"),
+        requested_canvas_width=changes.get("canvas_width"),
+        requested_canvas_height=changes.get("canvas_height"),
+    )
+    sync_channel_device_outputs(channel)
     db.add(channel)
     try:
         db.commit()

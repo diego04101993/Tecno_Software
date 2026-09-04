@@ -32,6 +32,18 @@ class Orientation(str, Enum):
     VERTICAL = "vertical"
 
 
+class DeviceMode(str, Enum):
+    SINGLE = "single"
+    MIRROR = "mirror"
+    EXTENDED = "extended"
+    INDEPENDENT = "independent"
+
+
+class DeviceOutputOrientation(str, Enum):
+    LANDSCAPE = "landscape"
+    PORTRAIT = "portrait"
+
+
 class ContentType(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -260,7 +272,10 @@ class Channel(UUIDMixin, TimestampMixin, Base):
     resolution_height: Mapped[int] = mapped_column(Integer, default=1080)
     orientation: Mapped[Orientation] = mapped_column(SqlEnum(Orientation), default=Orientation.HORIZONTAL)
     mode: Mapped[ChannelMode] = mapped_column(SqlEnum(ChannelMode), default=ChannelMode.NORMAL)
+    device_mode: Mapped[DeviceMode] = mapped_column(SqlEnum(DeviceMode), default=DeviceMode.SINGLE)
     screen_count: Mapped[int] = mapped_column(Integer, default=1)
+    canvas_width: Mapped[int] = mapped_column(Integer, default=1920)
+    canvas_height: Mapped[int] = mapped_column(Integer, default=1080)
     status: Mapped[ChannelConnectionStatus] = mapped_column(
         SqlEnum(ChannelConnectionStatus),
         default=ChannelConnectionStatus.UNKNOWN,
@@ -286,6 +301,12 @@ class Channel(UUIDMixin, TimestampMixin, Base):
     player_device: Mapped["PlayerDevice | None"] = relationship(back_populates="channel", uselist=False)
     player_heartbeats: Mapped[list["PlayerHeartbeat"]] = relationship(back_populates="channel")
     player_playback_events: Mapped[list["PlayerPlaybackEvent"]] = relationship(back_populates="channel")
+    device_outputs: Mapped[list["DeviceOutput"]] = relationship(
+        back_populates="root_channel",
+        cascade="all, delete-orphan",
+        foreign_keys="DeviceOutput.root_channel_id",
+        order_by="DeviceOutput.display_order",
+    )
 
     @property
     def last_heartbeat_at(self) -> datetime | None:
@@ -308,6 +329,41 @@ class Channel(UUIDMixin, TimestampMixin, Base):
         from app.services.presence import resolve_presence_status
 
         return resolve_presence_status(self.last_heartbeat_at)
+
+
+class DeviceOutput(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "device_outputs"
+    __table_args__ = (
+        UniqueConstraint("root_channel_id", "display_order", name="uq_device_outputs_root_display_order"),
+        UniqueConstraint("root_channel_id", "name", name="uq_device_outputs_root_name"),
+    )
+
+    root_channel_id: Mapped[str] = mapped_column(ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0)
+    display_uid: Mapped[str | None] = mapped_column(String(160))
+    channel_id: Mapped[str | None] = mapped_column(ForeignKey("channels.id", ondelete="SET NULL"))
+    x: Mapped[int] = mapped_column(Integer, default=0)
+    y: Mapped[int] = mapped_column(Integer, default=0)
+    width: Mapped[int] = mapped_column(Integer, default=1920)
+    height: Mapped[int] = mapped_column(Integer, default=1080)
+    source_x: Mapped[int] = mapped_column(Integer, default=0)
+    source_y: Mapped[int] = mapped_column(Integer, default=0)
+    source_width: Mapped[int] = mapped_column(Integer, default=1920)
+    source_height: Mapped[int] = mapped_column(Integer, default=1080)
+    rotation: Mapped[int] = mapped_column(Integer, default=0)
+    orientation: Mapped[DeviceOutputOrientation] = mapped_column(
+        SqlEnum(DeviceOutputOrientation),
+        default=DeviceOutputOrientation.LANDSCAPE,
+    )
+    sync_group: Mapped[str | None] = mapped_column(String(120), default="main")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    root_channel: Mapped["Channel"] = relationship(
+        back_populates="device_outputs",
+        foreign_keys=[root_channel_id],
+    )
+    channel: Mapped["Channel | None"] = relationship(foreign_keys=[channel_id])
 
 
 class Campaign(UUIDMixin, TimestampMixin, Base):

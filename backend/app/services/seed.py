@@ -88,8 +88,10 @@ def seed_initial_data(db: Session) -> None:
         name="Menu Board 2x1",
         mode=ChannelMode.EXPANDED,
         screen_count=2,
-        resolution_width=3840,
+        resolution_width=1920,
         resolution_height=1080,
+        canvas_width=3840,
+        canvas_height=1080,
         orientation=Orientation.HORIZONTAL,
     )
     channel_wall = Channel(

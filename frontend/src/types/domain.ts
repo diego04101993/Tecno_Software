@@ -11,6 +11,8 @@ export type UserStatus = "active" | "suspended";
 export type ClientStatus = "active" | "suspended";
 export type ChannelMode = "normal" | "expanded" | "videowall" | "audio" | "touch";
 export type Orientation = "horizontal" | "vertical";
+export type DeviceMode = "single" | "mirror" | "extended" | "independent";
+export type DeviceOutputOrientation = "landscape" | "portrait";
 export type ContentType = "image" | "video" | "url" | "html" | "text" | "audio";
 export type CampaignPlaybackMode = "sequential" | "random";
 export type CampaignSequenceItemType = "content" | "layout";
@@ -86,6 +88,29 @@ export interface ChannelOutputMapping {
   scale_y: number;
 }
 
+export interface DeviceOutput {
+  id: string;
+  created_at: string;
+  updated_at: string | null;
+  root_channel_id: string;
+  name: string;
+  display_order: number;
+  display_uid: string | null;
+  channel_id: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  source_x: number;
+  source_y: number;
+  source_width: number;
+  source_height: number;
+  rotation: number;
+  orientation: DeviceOutputOrientation;
+  sync_group: string | null;
+  enabled: boolean;
+}
+
 export interface SessionUser {
   id: string;
   created_at: string;
@@ -149,11 +174,15 @@ export interface Channel {
   resolution_height: number;
   orientation: Orientation;
   mode: ChannelMode;
+  device_mode: DeviceMode;
   screen_count: number;
+  canvas_width: number;
+  canvas_height: number;
   status: ChannelStatus;
   current_playback: string | null;
   hardware_identifier: string | null;
   expanded_outputs: Array<Record<string, unknown>>;
+  device_outputs: DeviceOutput[];
   output_mapping_json: ChannelOutputMapping;
   last_ping_at: string | null;
   last_heartbeat_at: string | null;
