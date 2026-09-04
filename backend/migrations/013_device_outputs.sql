@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS device_outputs (
     CONSTRAINT uq_device_outputs_root_display_order UNIQUE (root_channel_id, display_order),
     CONSTRAINT uq_device_outputs_root_name UNIQUE (root_channel_id, name),
     CONSTRAINT ck_device_outputs_rotation CHECK (rotation IN (0, 90, 180, 270)),
-    CONSTRAINT ck_device_outputs_orientation CHECK (lower(orientation::text) IN ('landscape', 'portrait'))
+    CONSTRAINT ck_device_outputs_orientation CHECK (orientation IN ('LANDSCAPE', 'PORTRAIT'))
 );
 
 CREATE INDEX IF NOT EXISTS ix_device_outputs_root_channel_id
@@ -177,7 +177,7 @@ BEGIN
     ) THEN
             ALTER TABLE device_outputs
             ADD CONSTRAINT ck_device_outputs_orientation
-            CHECK (lower(orientation::text) IN ('landscape', 'portrait'));
+            CHECK (orientation::text IN ('LANDSCAPE', 'PORTRAIT'));
     END IF;
 END
 $$;
@@ -189,7 +189,7 @@ BEGIN
     SELECT CASE
         WHEN udt_name = 'deviceoutputorientation'
             THEN $expr$CASE WHEN channel.orientation::text = 'VERTICAL' THEN 'PORTRAIT'::deviceoutputorientation ELSE 'LANDSCAPE'::deviceoutputorientation END$expr$
-        ELSE $expr$CASE WHEN channel.orientation::text = 'VERTICAL' THEN 'portrait' ELSE 'landscape' END$expr$
+        ELSE $expr$CASE WHEN channel.orientation::text = 'VERTICAL' THEN 'PORTRAIT' ELSE 'LANDSCAPE' END$expr$
     END
     INTO orientation_expression
     FROM information_schema.columns
