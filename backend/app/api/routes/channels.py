@@ -28,7 +28,7 @@ from app.schemas.domain import CampaignAssignmentResult, ChannelCampaignAssignme
 from app.services.device_outputs import normalize_channel_device_fields, sync_channel_device_outputs
 from app.services.output_mapping import normalize_output_mapping
 from app.services.presence import is_player_online
-from app.services.player_runtime import build_player_runtime_config, resolve_runtime_campaign_context
+from app.services.player_runtime import build_player_runtime_from_snapshot, resolve_runtime_campaign_context
 from app.services.realtime import manager
 from app.services.tenancy import (
     apply_client_filter,
@@ -454,4 +454,4 @@ def get_channel_runtime_config(
     current_user: User = Depends(get_current_user),
 ) -> dict[str, object]:
     channel = get_channel_in_scope(db, channel_id, current_user)
-    return build_player_runtime_config(channel, db, build_public_base_url(request))
+    return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))

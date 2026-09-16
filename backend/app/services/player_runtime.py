@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
+from logging import getLogger
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from fastapi import HTTPException, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
@@ -38,12 +40,14 @@ from app.services.campaign_sequence import normalize_playback_mode, resolve_effe
 from app.services.device_outputs import serialize_runtime_device, serialize_runtime_output
 from app.services.layout_bindings import build_layout_data_preview
 from app.services.layout_editor import build_layout_preview_state, get_current_draft_revision, get_current_published_revision
+from app.services.media_retention import RetentionIncomplete, build_media_retention, incomplete_retention
 from app.services.output_mapping import normalize_output_mapping
 from app.services.presence import build_presence_snapshot
 from app.services.videowall_geometry import compute_videowall_cell_by_row_col
 
 
 settings = get_settings()
+logger = getLogger(__name__)
 RUNTIME_VERSION = 3
 SYNC_LEAD_MS = 5000
 
@@ -738,7 +742,7 @@ def build_campaign_sequence_preview_payload(
     }
 
 
-def build_player_runtime_config(channel: Channel, db: Session, base_url: str) -> dict[str, object]:
+def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *, snapshot_coherent: bool = False) -> dict[str, object]:
     generated_at = now_utc()
     play_at_timestamp = int((generated_at + timedelta(milliseconds=SYNC_LEAD_MS)).timestamp() * 1000)
 
@@ -778,6 +782,20 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str) ->
     elif playlist_payload:
         fallback_reason = ""
 
+    if snapshot_coherent:
+        try:
+            media_retention = build_media_retention(
+                channel, db, base_url, primary_campaign, generated_at,
+                unknown_runtime_media=bool(audio_payload or touch_payload),
+            )
+        except RetentionIncomplete as error:
+            media_retention = incomplete_retention(channel.id, generated_at, error.reason)
+        except Exception:
+            logger.exception("Failed to enumerate media retention for channel %s", channel.id)
+            media_retention = incomplete_retention(channel.id, generated_at, "internal_error")
+    else:
+        media_retention = incomplete_retention(channel.id, generated_at, "snapshot_unavailable")
+
     return {
         "runtime_version": RUNTIME_VERSION,
         "runtime_generated_at": generated_at.isoformat(),
@@ -803,4 +821,37 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str) ->
         "audio": audio_payload,
         "touch": touch_payload,
         "fallback": _fallback_payload(fallback_reason) if fallback_reason else None,
+        "media_retention": media_retention,
     }
+
+
+def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: str) -> dict[str, object]:
+    """Read selection and retention under one PostgreSQL MVCC snapshot."""
+    expected_client_id, expected_branch_id = channel.client_id, channel.branch_id
+
+    def fallback() -> dict[str, object]:
+        try:
+            db.refresh(channel)
+        except Exception as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from error
+        if channel.client_id != expected_client_id or channel.branch_id != expected_branch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+        return build_player_runtime_config(channel, db, base_url)
+
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return build_player_runtime_config(channel, db, base_url)
+    try:
+        with bind.connect().execution_options(isolation_level="REPEATABLE READ") as connection:
+            with Session(bind=connection, autoflush=False) as snapshot_db:
+                snapshot_channel = snapshot_db.get(Channel, channel.id)
+                if snapshot_channel is None:
+                    return fallback()
+                if snapshot_channel.client_id != expected_client_id or snapshot_channel.branch_id != expected_branch_id:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+                return build_player_runtime_config(snapshot_channel, snapshot_db, base_url, snapshot_coherent=True)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Could not create coherent runtime snapshot for channel %s", channel.id)
+        return fallback()

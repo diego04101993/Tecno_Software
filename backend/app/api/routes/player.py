@@ -27,7 +27,7 @@ from app.schemas.domain import (
     PlayerPlaybackEventCreate,
     PlayerTimeResponse,
 )
-from app.services.player_runtime import build_player_runtime_config, build_server_time_payload
+from app.services.player_runtime import build_player_runtime_from_snapshot, build_server_time_payload
 
 
 router = APIRouter()
@@ -166,11 +166,13 @@ def get_runtime_config(
     channel = db.get(Channel, player_device.channel_id)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    if channel.client_id != player_device.client_id or channel.branch_id != player_device.branch_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
 
     player_device.last_seen_at = datetime.now(UTC)
     db.add(player_device)
     db.commit()
-    return build_player_runtime_config(channel, db, build_public_base_url(request))
+    return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
 
 
 @router.post("/heartbeat", response_model=PlayerHeartbeatAck)
