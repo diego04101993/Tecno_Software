@@ -7,6 +7,7 @@ import type { Branch, Channel, DeviceMode, Orientation } from "../../types/domai
 import { getApiErrorMessage } from "./apiError";
 import { DeviceOutputsPreview, getSuggestedCanvas } from "./DeviceOutputsPreview";
 import { LedOutputMappingPanel, buildOutputMappingDraft, type ChannelOutputMappingDraft } from "./LedOutputMappingPanel";
+import { ContentRotationField } from "../ContentRotationField";
 
 type ScreenMode = DeviceMode | "videowall";
 
@@ -82,6 +83,10 @@ export function ScreenEditDrawer({
   const [name, setName] = useState("");
   const [mode, setMode] = useState<ScreenMode>("single");
   const [orientation, setOrientation] = useState<Orientation>("horizontal");
+  const [rotation, setRotation] = useState<number | null>(null);
+  const [rotationChanged, setRotationChanged] = useState(false);
+  const [deviceGeometryChanged, setDeviceGeometryChanged] = useState(false);
+  const [outputMappingChanged, setOutputMappingChanged] = useState(false);
   const [resolutionWidth, setResolutionWidth] = useState(1920);
   const [resolutionHeight, setResolutionHeight] = useState(1080);
   const [screenCount, setScreenCount] = useState(2);
@@ -102,6 +107,10 @@ export function ScreenEditDrawer({
     setName(channel.name);
     setMode(getScreenModeFromChannel(channel));
     setOrientation(channel.orientation);
+    setRotation(channel.device_outputs.find((output) => output.display_order === 0)?.rotation ?? null);
+    setRotationChanged(false);
+    setDeviceGeometryChanged(false);
+    setOutputMappingChanged(false);
     setResolutionWidth(channel.resolution_width);
     setResolutionHeight(channel.resolution_height);
     setScreenCount(channel.mode === "expanded" ? Math.max(2, channel.screen_count) : 1);
@@ -118,7 +127,7 @@ export function ScreenEditDrawer({
   const suggestedCanvas = getSuggestedCanvas(mode === "videowall" ? "single" : mode, resolutionWidth, resolutionHeight, effectiveOutputCount);
 
   useEffect(() => {
-    if (mode === "videowall") {
+    if (mode === "videowall" || !deviceGeometryChanged) {
       return;
     }
 
@@ -133,13 +142,14 @@ export function ScreenEditDrawer({
       setCanvasWidth(suggestedCanvas.width);
       setCanvasHeight(suggestedCanvas.height);
     }
-  }, [isCanvasCustom, mode, resolutionHeight, resolutionWidth, suggestedCanvas.height, suggestedCanvas.width]);
+  }, [deviceGeometryChanged, isCanvasCustom, mode, resolutionHeight, resolutionWidth, suggestedCanvas.height, suggestedCanvas.width]);
 
   if (!open || !channel || !branch) {
     return null;
   }
 
   const targetChannel = channel;
+  const canEditRotation = targetChannel.mode === "normal" && targetChannel.device_mode === "single" && mode === "single";
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -157,20 +167,21 @@ export function ScreenEditDrawer({
         token,
         body: {
           name: name.trim(),
-          mode: legacyMode === "videowall" ? undefined : legacyMode,
-          device_mode: legacyMode === "videowall" ? undefined : mode,
-          resolution_width: legacyMode === "videowall" ? undefined : Math.max(1, resolutionWidth),
-          resolution_height: legacyMode === "videowall" ? undefined : Math.max(1, resolutionHeight),
-          orientation: legacyMode === "videowall" ? undefined : orientation,
-          screen_count: legacyMode === "expanded" ? effectiveOutputCount : 1,
-          canvas_width: legacyMode === "videowall" ? undefined : (mode === "single" ? resolutionWidth : canvasWidth),
-          canvas_height: legacyMode === "videowall" ? undefined : (mode === "single" ? resolutionHeight : canvasHeight),
+          mode: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : legacyMode,
+          device_mode: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : mode,
+          resolution_width: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : Math.max(1, resolutionWidth),
+          resolution_height: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : Math.max(1, resolutionHeight),
+          orientation: legacyMode === "videowall" || orientation === targetChannel.orientation ? undefined : orientation,
+          rotation: canEditRotation && rotationChanged ? rotation : undefined,
+          screen_count: !deviceGeometryChanged ? undefined : (legacyMode === "expanded" ? effectiveOutputCount : 1),
+          canvas_width: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : (mode === "single" ? resolutionWidth : canvasWidth),
+          canvas_height: legacyMode === "videowall" || !deviceGeometryChanged ? undefined : (mode === "single" ? resolutionHeight : canvasHeight),
           hardware_identifier: hardwareIdentifier.trim() || null,
           output_mapping_json:
-            legacyMode === "videowall"
+            legacyMode === "videowall" || !outputMappingChanged
               ? undefined
               : buildOutputMappingDraft(outputMapping, resolutionWidth, resolutionHeight),
-          notes: notes.trim() || null,
+          notes: notes === (targetChannel.notes ?? "") ? undefined : notes.trim() || null,
         },
       });
 
@@ -269,6 +280,7 @@ export function ScreenEditDrawer({
                     ].join(" ")}
                     type="button"
                     onClick={() => {
+                      setDeviceGeometryChanged(true);
                       const nextOutputCount = getOutputCount(option.id, screenCount);
                       const nextCanvas = getSuggestedCanvas(option.id, resolutionWidth, resolutionHeight, nextOutputCount);
                       setMode(option.id);
@@ -303,6 +315,7 @@ export function ScreenEditDrawer({
                   min={2}
                   value={effectiveOutputCount}
                   onChange={(event) => {
+                    setDeviceGeometryChanged(true);
                     const nextCount = Math.max(2, Number(event.target.value) || 2);
                     setScreenCount(nextCount);
                     if (!isCanvasCustom) {
@@ -325,7 +338,7 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     value={resolutionWidth}
-                    onChange={(event) => setResolutionWidth(Math.max(1, Number(event.target.value) || 1))}
+                    onChange={(event) => { setDeviceGeometryChanged(true); setResolutionWidth(Math.max(1, Number(event.target.value) || 1)); }}
                   />
                 </div>
                 <div>
@@ -336,7 +349,7 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     value={resolutionHeight}
-                    onChange={(event) => setResolutionHeight(Math.max(1, Number(event.target.value) || 1))}
+                    onChange={(event) => { setDeviceGeometryChanged(true); setResolutionHeight(Math.max(1, Number(event.target.value) || 1)); }}
                   />
                 </div>
                 <div>
@@ -345,9 +358,10 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     disabled={mode === "single"}
-                    value={mode === "single" ? resolutionWidth : canvasWidth}
+                    value={canvasWidth}
                     onChange={(event) => {
                       setCanvasWidth(Math.max(1, Number(event.target.value) || 1));
+                      setDeviceGeometryChanged(true);
                       setIsCanvasCustom(true);
                     }}
                   />
@@ -358,9 +372,10 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     disabled={mode === "single"}
-                    value={mode === "single" ? resolutionHeight : canvasHeight}
+                    value={canvasHeight}
                     onChange={(event) => {
                       setCanvasHeight(Math.max(1, Number(event.target.value) || 1));
+                      setDeviceGeometryChanged(true);
                       setIsCanvasCustom(true);
                     }}
                   />
@@ -375,9 +390,17 @@ export function ScreenEditDrawer({
               </>
             ) : null}
 
+            {canEditRotation ? (
+              <ContentRotationField value={rotation} onChange={(value) => { setRotation(value); setRotationChanged(true); }} />
+            ) : null}
+
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Hardware opcional</label>
               <input value={hardwareIdentifier} onChange={(event) => setHardwareIdentifier(event.target.value)} placeholder="Mini PC lobby" />
+            </div>
+            <div className="md:col-span-2 xl:col-span-3">
+              <label className="mb-2 block text-sm font-semibold text-slate-700" htmlFor="screen-edit-notes">Notas</label>
+              <textarea id="screen-edit-notes" value={notes} onChange={(event) => setNotes(event.target.value)} />
             </div>
           </div>
 
@@ -399,7 +422,7 @@ export function ScreenEditDrawer({
               value={outputMapping}
               fallbackWidth={resolutionWidth}
               fallbackHeight={resolutionHeight}
-              onChange={setOutputMapping}
+              onChange={(value) => { setOutputMapping(value); setOutputMappingChanged(true); }}
             />
           ) : null}
 

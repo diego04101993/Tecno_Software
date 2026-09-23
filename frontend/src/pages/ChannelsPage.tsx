@@ -13,6 +13,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import { ChannelOperationalCard } from "../components/ChannelOperationalCard";
+import { ContentRotationField, type ContentRotation } from "../components/ContentRotationField";
 import { ExpandedOutputsPreview } from "../components/ExpandedOutputsPreview";
 import { SectionCard } from "../components/SectionCard";
 import { StatCard } from "../components/StatCard";
@@ -192,6 +193,7 @@ export function ChannelsPage() {
     resolution_width: 1920,
     resolution_height: 1080,
     orientation: "horizontal",
+    rotation: 0 as ContentRotation,
     mode: "normal" as ChannelMode,
     screen_count: 1,
     hardware_identifier: "",
@@ -544,6 +546,7 @@ export function ChannelsPage() {
     try {
       const channelPayload = {
         ...form,
+        rotation: form.mode === "normal" ? form.rotation : undefined,
         resolution_width: form.mode === "videowall" ? videowallDerived.selectedCell.width : form.resolution_width,
         resolution_height: form.mode === "videowall" ? videowallDerived.selectedCell.height : form.resolution_height,
         screen_count: form.mode === "expanded" ? form.screen_count : 1,
@@ -633,6 +636,7 @@ export function ChannelsPage() {
         resolution_width: 1920,
         resolution_height: 1080,
         orientation: "horizontal",
+        rotation: 0,
         mode: "normal",
         screen_count: 1,
         hardware_identifier: "",
@@ -828,6 +832,10 @@ export function ChannelsPage() {
               <option value="vertical">Vertical</option>
             </select>
           </div>
+
+          {form.mode === "normal" ? (
+            <ContentRotationField value={form.rotation} onChange={(rotation) => setForm({ ...form, rotation })} />
+          ) : null}
 
           <div>
             <label className="mb-2 block text-sm font-semibold text-slate-700">Hardware ID</label>

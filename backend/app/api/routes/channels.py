@@ -14,6 +14,8 @@ from app.models.entities import (
     CampaignChannelAssignment,
     Channel,
     ChannelConnectionStatus,
+    ChannelMode,
+    DeviceMode,
     PlayerDevice,
     PlayerHeartbeat,
     PlayerPlaybackEvent,
@@ -152,6 +154,23 @@ def list_channels(
     return list(db.scalars(query))
 
 
+def validate_rotation_scope(rotation: int | None, mode: ChannelMode, device_mode: DeviceMode) -> None:
+    if rotation is not None and (mode != ChannelMode.NORMAL or device_mode != DeviceMode.SINGLE):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="rotation can only be set on normal/single channels")
+
+
+def apply_channel_rotation(channel: Channel, rotation: int | None) -> None:
+    if rotation is None:
+        return
+    # A legacy channel without outputs can acquire its first canonical output.
+    if not channel.device_outputs:
+        sync_channel_device_outputs(channel)
+    output = next((item for item in channel.device_outputs if item.display_order == 0), None)
+    if output is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Primary device output is missing")
+    output.rotation = rotation
+
+
 @router.post("/", response_model=ChannelRead, status_code=status.HTTP_201_CREATED)
 def create_channel(
     payload: ChannelCreate,
@@ -166,6 +185,7 @@ def create_channel(
     if branch.client_id != client_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Branch not found for this client")
 
+    validate_rotation_scope(payload.rotation, payload.mode, payload.device_mode)
     channel = Channel(
         client_id=client_id,
         branch_id=payload.branch_id,
@@ -193,6 +213,7 @@ def create_channel(
     try:
         db.flush()
         sync_channel_device_outputs(channel)
+        apply_channel_rotation(channel, payload.rotation)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -213,6 +234,19 @@ def update_channel(
 
     channel = get_channel_in_scope(db, channel_id, current_user)
     changes = payload.model_dump(exclude_unset=True)
+    validate_rotation_scope(
+        payload.rotation,
+        changes.get("mode") or channel.mode,
+        changes.get("device_mode") or channel.device_mode,
+    )
+    device_fields = {
+        "resolution_width", "resolution_height", "orientation", "mode", "device_mode",
+        "screen_count", "canvas_width", "canvas_height",
+    }
+    device_configuration_changed = any(
+        field in changes and changes[field] is not None and changes[field] != getattr(channel, field)
+        for field in device_fields
+    )
 
     if "name" in changes and changes["name"] is not None:
         channel.name = changes["name"].strip()
@@ -241,14 +275,17 @@ def update_channel(
     if "notes" in changes:
         channel.notes = changes["notes"].strip() if changes["notes"] else None
 
-    normalize_channel_device_fields(
-        channel,
-        requested_device_mode=changes.get("device_mode"),
-        requested_screen_count=changes.get("screen_count"),
-        requested_canvas_width=changes.get("canvas_width"),
-        requested_canvas_height=changes.get("canvas_height"),
-    )
-    sync_channel_device_outputs(channel)
+    # Metadata-only edits must not regenerate outputs or normalize historical dimensions.
+    if device_configuration_changed:
+        normalize_channel_device_fields(
+            channel,
+            requested_device_mode=changes.get("device_mode"),
+            requested_screen_count=changes.get("screen_count"),
+            requested_canvas_width=changes.get("canvas_width"),
+            requested_canvas_height=changes.get("canvas_height"),
+        )
+        sync_channel_device_outputs(channel)
+    apply_channel_rotation(channel, payload.rotation)
     db.add(channel)
     try:
         db.commit()

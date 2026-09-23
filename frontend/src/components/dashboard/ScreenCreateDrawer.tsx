@@ -6,6 +6,7 @@ import type { Branch, Channel, DeviceMode, Orientation, Videowall, VideowallNode
 import { getVideowallCellMetrics } from "../VideowallGridPreview";
 import { DeviceOutputsPreview, getSuggestedCanvas } from "./DeviceOutputsPreview";
 import { LedOutputMappingPanel, buildOutputMappingDraft, type ChannelOutputMappingDraft } from "./LedOutputMappingPanel";
+import { ContentRotationField, type ContentRotation } from "../ContentRotationField";
 import { SimpleVideowallMatrix } from "./SimpleVideowallMatrix";
 
 type ScreenMode = DeviceMode | "videowall";
@@ -106,6 +107,7 @@ export function ScreenCreateDrawer({
   const [mode, setMode] = useState<ScreenMode>("single");
   const [name, setName] = useState("");
   const [orientation, setOrientation] = useState<Orientation>("horizontal");
+  const [rotation, setRotation] = useState<ContentRotation>(0);
   const [resolutionWidth, setResolutionWidth] = useState(1920);
   const [resolutionHeight, setResolutionHeight] = useState(1080);
   const [screenCount, setScreenCount] = useState(2);
@@ -133,6 +135,7 @@ export function ScreenCreateDrawer({
     setMode("single");
     setName("");
     setOrientation("horizontal");
+    setRotation(0);
     setResolutionWidth(1920);
     setResolutionHeight(1080);
     setScreenCount(2);
@@ -338,6 +341,7 @@ export function ScreenCreateDrawer({
               : (videowallDerived.selectedCell?.height ?? resolutionHeight)
             : resolutionHeight,
         orientation,
+        rotation: mode === "single" ? rotation : undefined,
         mode: legacyMode,
         device_mode: deviceMode,
         screen_count: effectiveOutputCount,
@@ -659,6 +663,8 @@ export function ScreenCreateDrawer({
                 </select>
               </div>
             ) : null}
+
+            {mode === "single" ? <ContentRotationField value={rotation} onChange={setRotation} /> : null}
 
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Hardware opcional</label>

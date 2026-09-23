@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, EmailStr, Field
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator
 
 from app.models.entities import (
     AudioNormalizationStatus,
@@ -232,7 +232,23 @@ class LayoutBindingValidationRequest(BaseModel):
     fields: list[LayoutBindingFieldCreate] = Field(default_factory=list)
 
 
-class ChannelCreate(BaseModel):
+class ChannelRotationInput(BaseModel):
+    rotation: Literal[0, 90, 180, 270] | None = Field(
+        default=None,
+        description="Optional clockwise content rotation relative to the Player OS surface. Omit to preserve; null is rejected. Only normal/single channels.",
+        json_schema_extra={"not": {"type": "null"}},
+    )
+
+    @field_validator("rotation", mode="before")
+    @classmethod
+    def validate_rotation(cls, value: Any) -> int:
+        # Defaults are not validated: internal None means the field was omitted.
+        if type(value) is not int or value not in (0, 90, 180, 270):
+            raise ValueError("rotation must be an integer: 0, 90, 180 or 270; omit it to preserve the current rotation")
+        return value
+
+
+class ChannelCreate(ChannelRotationInput):
     client_id: str | None = None
     branch_id: str
     name: str
@@ -250,7 +266,7 @@ class ChannelCreate(BaseModel):
     notes: str | None = None
 
 
-class ChannelUpdate(BaseModel):
+class ChannelUpdate(ChannelRotationInput):
     name: str | None = None
     resolution_width: int | None = None
     resolution_height: int | None = None

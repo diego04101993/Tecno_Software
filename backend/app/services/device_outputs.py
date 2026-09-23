@@ -135,6 +135,8 @@ def _distribute(total: int, count: int) -> list[int]:
 
 
 def build_device_output_definitions(channel: Channel) -> list[dict[str, object]]:
+    # The existing synchronizer identifies outputs by (root_channel_id, display_order).
+    rotations_by_order = {output.display_order: output.rotation for output in channel.device_outputs or []}
     safe_width = _positive_int(channel.resolution_width, 1920)
     safe_height = _positive_int(channel.resolution_height, 1080)
     safe_canvas_width = _positive_int(channel.canvas_width, safe_width)
@@ -164,7 +166,7 @@ def build_device_output_definitions(channel: Channel) -> list[dict[str, object]]
                     "source_y": 0,
                     "source_width": slice_width,
                     "source_height": safe_canvas_height,
-                    "rotation": 0,
+                    "rotation": rotations_by_order.get(index, 0),
                     "orientation": orientation,
                     "sync_group": "main",
                     "enabled": True,
@@ -190,7 +192,7 @@ def build_device_output_definitions(channel: Channel) -> list[dict[str, object]]
                 "source_y": 0,
                 "source_width": safe_canvas_width if channel.device_mode == DeviceMode.MIRROR else safe_width,
                 "source_height": safe_canvas_height if channel.device_mode == DeviceMode.MIRROR else safe_height,
-                "rotation": 0,
+                "rotation": rotations_by_order.get(index, 0),
                 "orientation": orientation,
                 "sync_group": "main" if channel.device_mode != DeviceMode.INDEPENDENT else None,
                 "enabled": True,
