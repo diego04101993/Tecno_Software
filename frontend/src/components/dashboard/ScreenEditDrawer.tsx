@@ -87,6 +87,7 @@ export function ScreenEditDrawer({
   const [rotationChanged, setRotationChanged] = useState(false);
   const [deviceGeometryChanged, setDeviceGeometryChanged] = useState(false);
   const [outputMappingChanged, setOutputMappingChanged] = useState(false);
+  const [outputMappingError, setOutputMappingError] = useState<string | null>(null);
   const [resolutionWidth, setResolutionWidth] = useState(1920);
   const [resolutionHeight, setResolutionHeight] = useState(1080);
   const [screenCount, setScreenCount] = useState(2);
@@ -111,6 +112,7 @@ export function ScreenEditDrawer({
     setRotationChanged(false);
     setDeviceGeometryChanged(false);
     setOutputMappingChanged(false);
+    setOutputMappingError(null);
     setResolutionWidth(channel.resolution_width);
     setResolutionHeight(channel.resolution_height);
     setScreenCount(channel.mode === "expanded" ? Math.max(2, channel.screen_count) : 1);
@@ -154,6 +156,11 @@ export function ScreenEditDrawer({
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!token) {
+      return;
+    }
+
+    if (mode !== "videowall" && outputMappingError) {
+      setError(outputMappingError);
       return;
     }
 
@@ -338,6 +345,7 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     value={resolutionWidth}
+                    name="resolution_width"
                     onChange={(event) => { setDeviceGeometryChanged(true); setResolutionWidth(Math.max(1, Number(event.target.value) || 1)); }}
                   />
                 </div>
@@ -349,6 +357,7 @@ export function ScreenEditDrawer({
                     type="number"
                     min={1}
                     value={resolutionHeight}
+                    name="resolution_height"
                     onChange={(event) => { setDeviceGeometryChanged(true); setResolutionHeight(Math.max(1, Number(event.target.value) || 1)); }}
                   />
                 </div>
@@ -419,15 +428,18 @@ export function ScreenEditDrawer({
 
           {mode !== "videowall" ? (
             <LedOutputMappingPanel
+              key={targetChannel.id}
               value={outputMapping}
               fallbackWidth={resolutionWidth}
               fallbackHeight={resolutionHeight}
               onChange={(value) => { setOutputMapping(value); setOutputMappingChanged(true); }}
+              onValidationChange={setOutputMappingError}
+              disabled={isSubmitting}
             />
           ) : null}
 
           <div className="flex flex-wrap gap-3">
-            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting} type="submit">
+            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting || (mode !== "videowall" && !!outputMappingError)} type="submit">
               {isSubmitting ? "Guardando..." : "Guardar cambios"}
             </button>
             <button

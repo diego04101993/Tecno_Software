@@ -117,6 +117,7 @@ export function ScreenCreateDrawer({
   const [hardwareIdentifier, setHardwareIdentifier] = useState("");
   const [notes, setNotes] = useState("");
   const [outputMapping, setOutputMapping] = useState<ChannelOutputMappingDraft>(buildOutputMappingDraft(null, 1920, 1080));
+  const [outputMappingError, setOutputMappingError] = useState<string | null>(null);
   const [videowallFlow, setVideowallFlow] = useState<VideowallFlow>("create");
   const [videowallDraft, setVideowallDraft] = useState(defaultVideowallDraft);
   const [videowalls, setVideowalls] = useState<Videowall[]>([]);
@@ -145,6 +146,7 @@ export function ScreenCreateDrawer({
     setHardwareIdentifier("");
     setNotes("");
     setOutputMapping(buildOutputMappingDraft(null, 1920, 1080));
+    setOutputMappingError(null);
     setVideowallFlow("create");
     setVideowallDraft(defaultVideowallDraft);
     setSelectedVideowallId("");
@@ -297,6 +299,11 @@ export function ScreenCreateDrawer({
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!token) {
+      return;
+    }
+
+    if (mode !== "videowall" && outputMappingError) {
+      setError(outputMappingError);
       return;
     }
 
@@ -611,6 +618,7 @@ export function ScreenCreateDrawer({
                     type="number"
                     min={1}
                     value={resolutionWidth}
+                    name="resolution_width"
                     onChange={(event) => setResolutionWidth(normalizePositiveInt(Number(event.target.value), resolutionWidth))}
                   />
                 </div>
@@ -622,6 +630,7 @@ export function ScreenCreateDrawer({
                     type="number"
                     min={1}
                     value={resolutionHeight}
+                    name="resolution_height"
                     onChange={(event) => setResolutionHeight(normalizePositiveInt(Number(event.target.value), resolutionHeight))}
                   />
                 </div>
@@ -1088,15 +1097,18 @@ export function ScreenCreateDrawer({
 
           {mode !== "videowall" ? (
             <LedOutputMappingPanel
+              key={branch.id}
               value={outputMapping}
               fallbackWidth={resolutionWidth}
               fallbackHeight={resolutionHeight}
               onChange={setOutputMapping}
+              onValidationChange={setOutputMappingError}
+              disabled={isSubmitting}
             />
           ) : null}
 
           <div className="flex flex-wrap gap-3">
-            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting} type="submit">
+            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting || (mode !== "videowall" && !!outputMappingError)} type="submit">
               {isSubmitting ? "Guardando..." : "Crear pantalla"}
             </button>
             <button

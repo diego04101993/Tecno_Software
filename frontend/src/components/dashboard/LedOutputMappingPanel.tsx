@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import { buildLedCustomMapping } from "../../lib/ledCustomMapping";
 
 import type {
   ChannelOutputMapping,
@@ -579,7 +581,108 @@ function getOverflowMessage(value: ChannelOutputMappingDraft) {
   return null;
 }
 
+type OutputMappingPanelProps = {
+  value: ChannelOutputMappingDraft;
+  fallbackWidth: number;
+  fallbackHeight: number;
+  disabled?: boolean;
+  onChange: (nextValue: ChannelOutputMappingDraft) => void;
+};
+
 export function LedOutputMappingPanel({
+  value, fallbackWidth, fallbackHeight, disabled = false, onChange, onValidationChange,
+}: OutputMappingPanelProps & { onValidationChange: (error: string | null) => void }) {
+  // Selection is deliberately session-only: the existing contract has no preset marker.
+  // Never infer that a persisted custom/sliced mapping opted into the new preset.
+  const [selection, setSelection] = useState<"normal" | "led" | "advanced" | null>(null);
+  const [dimensions, setDimensions] = useState({ width: "", height: "", x: "", y: "" });
+  const callbacks = useRef({ onChange, onValidationChange });
+  useEffect(() => { callbacks.current = { onChange, onValidationChange }; });
+
+  const preset = useMemo(() => {
+    try {
+      const mapping = selection === "led"
+        ? buildLedCustomMapping({
+            hdmiWidth: fallbackWidth, hdmiHeight: fallbackHeight,
+            width: dimensions.width.trim() ? Number(dimensions.width) : NaN,
+            height: dimensions.height.trim() ? Number(dimensions.height) : NaN,
+            x: dimensions.x.trim() ? Number(dimensions.x) : NaN,
+            y: dimensions.y.trim() ? Number(dimensions.y) : NaN,
+          })
+        : selection === "normal" ? buildOutputMappingDraft(null, fallbackWidth, fallbackHeight) : null;
+      return { mapping, error: null };
+    } catch (error) {
+      return { mapping: null, error: error instanceof Error ? error.message : "Configuración LED inválida." };
+    }
+  }, [selection, dimensions, fallbackWidth, fallbackHeight]);
+
+  useEffect(() => {
+    callbacks.current.onValidationChange(preset.error);
+    if (preset.mapping) callbacks.current.onChange(preset.mapping);
+  }, [preset]);
+
+  const field = (name: keyof typeof dimensions, label: string, min: number) => (
+    <label className="block text-sm font-medium text-slate-700">
+      {label}
+      <input
+        aria-label={label} name={`led_${name}`} type="number" min={min} step={1} required disabled={disabled}
+        className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2"
+        value={dimensions[name]}
+        onChange={(event) => setDimensions((current) => ({ ...current, [name]: event.target.value }))}
+      />
+    </label>
+  );
+
+  return (
+    <section className="space-y-4 rounded-[24px] border border-slate-200 bg-slate-50 p-5" aria-label="Tipo de salida">
+      <h4 className="font-semibold text-ink">Tipo de salida</h4>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <button type="button" disabled={disabled} aria-pressed={selection === "normal" || (selection === null && value.mapping_mode === "normal")}
+          className={profileCardClassName(selection === "normal" || (selection === null && value.mapping_mode === "normal"))}
+          onClick={() => setSelection("normal")}>Pantalla normal</button>
+        <button type="button" disabled={disabled} aria-pressed={selection === "led"}
+          className={profileCardClassName(selection === "led")}
+          onClick={() => {
+            setDimensions({ width: String(value.source_canvas_width), height: String(value.source_canvas_height),
+              x: String(value.viewport_x), y: String(value.viewport_y) });
+            setSelection("led");
+          }}>LED personalizada</button>
+      </div>
+      <p className="text-sm text-slate-600">Salida HDMI: {fallbackWidth} × {fallbackHeight}. Se ajusta en la resolución de la pantalla.</p>
+      {selection === "led" ? (
+        <div className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2">{field("width", "Ancho LED", 1)}{field("height", "Alto LED", 1)}</div>
+          <p className="text-sm font-medium">Canvas LED: {dimensions.width || "—"} × {dimensions.height || "—"}</p>
+          <details>
+            <summary className="cursor-pointer text-sm font-medium">Posición dentro del HDMI (avanzado): X={dimensions.x || "—"}, Y={dimensions.y || "—"}</summary>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">{field("x", "Posición X", 0)}{field("y", "Posición Y", 0)}</div>
+          </details>
+          <p className="text-sm text-slate-600">El canvas ocupa una región de la señal HDMI sin escalarla. La orientación y el giro del contenido se configuran por separado.</p>
+          <p className="text-sm text-slate-600">La reproducción requiere un Player compatible con este mapping. Guardarlo no cambia la señal HDMI del equipo.</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {value.mapping_mode !== "normal" && (
+            <div className="text-sm text-slate-600" data-testid="persisted-mapping-summary">
+              <p>Configuración existente ({value.mapping_mode}). Se conserva al guardar. Selecciona LED personalizada para convertirla al preset de un solo bloque sin escala.</p>
+              <p>Canvas de contenido: {value.source_canvas_width} × {value.source_canvas_height}. Región HDMI: {value.viewport_x}, {value.viewport_y}, {value.viewport_width} × {value.viewport_height}.</p>
+            </div>
+          )}
+          <details>
+            <summary className="cursor-pointer text-sm font-medium">Editor avanzado de mapping</summary>
+            <div className="mt-4">
+              <AdvancedOutputMappingPanel value={value} fallbackWidth={fallbackWidth} fallbackHeight={fallbackHeight} disabled={disabled}
+                onChange={(mapping) => { setSelection("advanced"); onChange(mapping); }} />
+            </div>
+          </details>
+        </div>
+      )}
+      {preset.error && <p role="alert" className="text-sm text-red-700">{preset.error}</p>}
+    </section>
+  );
+}
+
+function AdvancedOutputMappingPanel({
   value,
   fallbackWidth,
   fallbackHeight,

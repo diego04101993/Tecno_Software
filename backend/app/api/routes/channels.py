@@ -266,12 +266,6 @@ def update_channel(
             resolution_width=channel.resolution_width,
             resolution_height=channel.resolution_height,
         )
-    elif "resolution_width" in changes or "resolution_height" in changes:
-        channel.output_mapping_json = normalize_output_mapping(
-            channel.output_mapping_json,
-            resolution_width=channel.resolution_width,
-            resolution_height=channel.resolution_height,
-        )
     if "notes" in changes:
         channel.notes = changes["notes"].strip() if changes["notes"] else None
 
