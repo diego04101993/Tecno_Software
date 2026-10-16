@@ -518,16 +518,16 @@ export function PreviewContentSurface({
 
   if (content?.type === "html") {
     return (
-      <div className={`h-full overflow-hidden border border-slate-200 bg-white shadow-sm ${baseChrome}`}>
-        <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
+      <div className={`flex h-full min-h-0 flex-col overflow-hidden border border-slate-200 bg-white shadow-sm ${baseChrome}`}>
+        <div className="shrink-0 border-b border-slate-200 bg-slate-50 px-4 py-3">
           <p className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-slate-500">
             <FileCode2 className="h-3.5 w-3.5" />
-            HTML basico
+            HTML como texto
           </p>
         </div>
-        <div className="prose prose-sm max-w-none overflow-auto px-5 py-5 text-slate-700">
-          <div dangerouslySetInnerHTML={{ __html: content.html_content ?? "<p>Sin HTML disponible.</p>" }} />
-        </div>
+        <pre className="m-0 min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words px-5 py-5 font-mono text-sm text-slate-700">
+          {content.html_content ?? "Sin HTML disponible."}
+        </pre>
       </div>
     );
   }
