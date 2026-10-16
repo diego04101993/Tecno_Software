@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from email.utils import formatdate
 from hashlib import md5
 from mimetypes import guess_type
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Iterator
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 from fastapi.responses import Response, StreamingResponse
+
+from app.services.media_storage import MediaPathError, resolve_relative_media_path
 
 
 DEFAULT_CHUNK_SIZE = 64 * 1024
@@ -34,32 +36,11 @@ class MediaByteRange:
 
 
 def resolve_media_path(media_root: Path, requested_path: str) -> Path:
-    root = media_root.resolve()
-    decoded_path = unquote(requested_path or "").replace("\\", "/").strip()
-    pure_path = PurePosixPath(decoded_path)
-
-    if not decoded_path or decoded_path.startswith("/") or pure_path.is_absolute():
-        raise FileNotFoundError("Invalid media path")
-
-    parts = [part for part in pure_path.parts if part not in ("", ".")]
-    if not parts or any(part == ".." for part in parts):
-        raise FileNotFoundError("Invalid media path")
-
-    candidate = root.joinpath(*parts)
     try:
-        resolved_candidate = candidate.resolve(strict=True)
-    except FileNotFoundError as exc:
+        return resolve_relative_media_path(media_root, requested_path)
+    except MediaPathError as exc:
+        # Preserve GET/HEAD /media's existing public 404 contract.
         raise FileNotFoundError("Media file not found") from exc
-
-    try:
-        resolved_candidate.relative_to(root)
-    except ValueError as exc:
-        raise FileNotFoundError("Media path escapes root") from exc
-
-    if resolved_candidate.is_dir():
-        raise FileNotFoundError("Media path points to a directory")
-
-    return resolved_candidate
 
 
 def parse_range_header(range_header: str, total_size: int) -> MediaByteRange:

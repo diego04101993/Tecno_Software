@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,6 +25,7 @@ from app.schemas.domain import (
     DatasetRowRead,
 )
 from app.services.dataset_ingest import extract_tabular_snapshot
+from app.services.media_storage import MediaPathError, media_relative_path, normalize_upload_filename, write_media_upload
 from app.services.tenancy import (
     apply_client_filter,
     assert_client_exists,
@@ -258,11 +257,15 @@ def upload_dataset_import(
     dataset = get_dataset_in_scope(db, dataset_id, current_user)
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A file name is required")
+    try:
+        source_filename = normalize_upload_filename(file.filename)
+    except MediaPathError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
 
     dataset.status = DatasetStatus.PROCESSING
     import_record = DatasetImport(
         dataset_id=dataset.id,
-        source_filename=file.filename,
+        source_filename=source_filename,
         source_mime_type=file.content_type,
         storage_path="",
         import_status=DatasetImportStatus.PENDING,
@@ -270,15 +273,18 @@ def upload_dataset_import(
     db.add(import_record)
     db.flush()
 
-    target_dir = settings.MEDIA_ROOT / "datasets" / dataset.client_id / dataset.id / import_record.id
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / Path(file.filename).name
-    file_bytes = file.file.read()
-    target_path.write_bytes(file_bytes)
-    import_record.storage_path = str(target_path.relative_to(settings.MEDIA_ROOT))
+    try:
+        uploaded = write_media_upload(settings.MEDIA_ROOT, ("datasets", dataset.client_id, dataset.id, import_record.id),
+                                      source_filename, file.content_type, file.file)
+        file_bytes = uploaded.physical_path.read_bytes()
+        import_record.storage_path = media_relative_path(settings.MEDIA_ROOT, uploaded.physical_path)
+    except (MediaPathError, OSError) as exc:
+        db.rollback()
+        code = exc.code if isinstance(exc, MediaPathError) else "UPLOAD_WRITE_FAILED"
+        raise HTTPException(status_code=400, detail=code) from exc
 
     try:
-        snapshot = extract_tabular_snapshot(file.filename, file.content_type, file_bytes)
+        snapshot = extract_tabular_snapshot(source_filename, file.content_type, file_bytes)
     except ValueError as next_error:
         import_record.import_status = DatasetImportStatus.FAILED
         import_record.summary_json = {"error": str(next_error)}

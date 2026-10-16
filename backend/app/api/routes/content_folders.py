@@ -7,6 +7,8 @@ from app.api.deps import get_current_user, get_db
 from app.models.entities import ContentFolder, ContentItem, User
 from app.schemas.domain import ContentFolderCreate, ContentFolderDeleteImpactRead, ContentFolderRead, ContentFolderUpdate
 from app.services.content_cleanup import build_folder_delete_impact, cleanup_files, delete_folder_tree
+from app.services.media_storage import MediaPathError
+from app.services.media_references import media_reference_operation
 from app.services.tenancy import (
     apply_client_filter,
     assert_client_exists,
@@ -158,9 +160,14 @@ def delete_content_folder(
 
     folder = get_content_folder_in_scope(db, folder_id, current_user)
     if cascade:
-        delete_result = delete_folder_tree(folder, db)
-        db.commit()
-        cleanup_files(delete_result["file_paths"])
+        try:
+            with media_reference_operation(db):
+                delete_result = delete_folder_tree(folder, db)
+                db.commit()
+                cleanup_files(delete_result["file_paths"], db)
+        except MediaPathError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=exc.code) from exc
         return
 
     if db.scalar(select(ContentFolder.id).where(ContentFolder.parent_id == folder.id).limit(1)):

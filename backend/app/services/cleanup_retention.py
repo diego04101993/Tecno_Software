@@ -24,7 +24,9 @@ from app.models.entities import (
     TouchLocation,
     TouchMap,
 )
-from app.services.content_cleanup import cleanup_files, delete_content_items
+from app.services.content_cleanup import cleanup_files, delete_content_items, preflight_content_files
+from app.services.media_references import lock_media_paths, media_reference_operation
+from app.services.media_storage import MediaPathError
 
 
 logger = logging.getLogger(__name__)
@@ -286,6 +288,8 @@ def cleanup_unused_contents(
                 logger.info("Deleting unused content id=%s name=%s", content.id, content.name)
                 working_summary.pending_file_paths.extend(delete_content_items([content], db))
             working_summary.contents_deleted += 1
+        except MediaPathError:
+            raise  # Abort the whole pending transaction, never commit other deletions.
         except Exception as exc:
             _record_error(working_summary, f"Error deleting content {content.id}", exc)
 
@@ -339,6 +343,7 @@ def run_retention_cleanup(
     folder_days: int = DEFAULT_FOLDER_RETENTION_DAYS,
 ) -> dict[str, object]:
     summary = CleanupRetentionSummary()
+    committed = False
     logger.info(
         "Starting retention cleanup content_days=%s campaign_days=%s folder_days=%s",
         content_days,
@@ -346,31 +351,34 @@ def run_retention_cleanup(
         folder_days,
     )
     try:
-        cleanup_unused_campaigns(db, days=campaign_days, summary=summary)
-        db.commit()
-    except Exception as exc:
+        with media_reference_operation(db):
+            # Preflight even referenced old contents: campaign cleanup can remove their
+            # last references. A bad path must stop this run BEFORE its first commit.
+            file_paths = preflight_content_files(list(db.scalars(select(ContentItem).where(
+                ContentItem.created_at <= _build_cutoff(content_days)
+            ))))
+            lock_media_paths(db, file_paths)
+            cleanup_unused_campaigns(db, days=campaign_days, summary=summary)
+            cleanup_unused_contents(db, days=content_days, summary=summary)
+            cleanup_unused_folders(db, days=folder_days, summary=summary)
+            db.commit()
+            committed = True
+            if summary.pending_file_paths:
+                deleted_files = cleanup_files(summary.pending_file_paths, db)
+                summary.files_deleted += deleted_files
+                logger.info("Deleted %s physical media files for unused contents", deleted_files)
+                summary.pending_file_paths.clear()
+    except MediaPathError as exc:
         db.rollback()
-        _record_error(summary, "Error committing unused campaign cleanup", exc)
-
-    try:
-        cleanup_unused_contents(db, days=content_days, summary=summary)
-        db.commit()
-        if summary.pending_file_paths:
-            deleted_files = cleanup_files(summary.pending_file_paths)
-            summary.files_deleted += deleted_files
-            logger.info("Deleted %s physical media files for unused contents", deleted_files)
-            summary.pending_file_paths.clear()
+        summary.pending_file_paths.clear()
+        _record_error(summary, exc.code)
+        # No DB rows were committed for path errors found during preflight.
+        if not committed:
+            summary.contents_deleted = summary.campaigns_deleted = summary.folders_deleted = 0
     except Exception as exc:
         db.rollback()
         summary.pending_file_paths.clear()
-        _record_error(summary, "Error committing unused content cleanup", exc)
-
-    try:
-        cleanup_unused_folders(db, days=folder_days, summary=summary)
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        _record_error(summary, "Error committing unused folder cleanup", exc)
+        _record_error(summary, "Error committing cleanup", exc)
 
     logger.info("Retention cleanup finished summary=%s", summary.to_dict())
     return summary.to_dict()

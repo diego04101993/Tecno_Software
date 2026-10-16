@@ -1,9 +1,6 @@
-from pathlib import Path
-import shutil
-
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
@@ -11,6 +8,8 @@ from app.core.config import get_settings
 from app.models.entities import ContentItem, ContentType, User
 from app.schemas.domain import ContentCreate, ContentFolderMove, ContentRead
 from app.services.content_cleanup import cleanup_files, delete_content_items, resolve_content_duration_seconds
+from app.services.media_storage import MediaPathError, media_public_path, write_media_upload
+from app.services.media_references import media_reference_operation, save_content_reference
 from app.services.tenancy import (
     apply_client_filter,
     assert_client_exists,
@@ -78,8 +77,11 @@ def create_content(
         duration_seconds=resolve_content_duration_seconds(payload.type, payload.duration_seconds, payload.metadata_json),
         metadata_json=payload.metadata_json,
     )
-    db.add(content)
-    db.commit()
+    try:
+        save_content_reference(content, db)
+    except MediaPathError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
     db.refresh(content)
     return content
 
@@ -114,14 +116,12 @@ def upload_content(
     elif file.content_type and file.content_type.startswith("audio/"):
         content_type = ContentType.AUDIO
 
-    client_dir = settings.MEDIA_ROOT / scoped_client_id
-    client_dir.mkdir(parents=True, exist_ok=True)
-    destination = client_dir / file.filename
-    with destination.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    public_path = f"/media/{scoped_client_id}/{Path(file.filename).name}"
-    metadata: dict[str, str | int | bool | None] = {"filename": file.filename, "content_type": file.content_type}
+    try:
+        uploaded = write_media_upload(settings.MEDIA_ROOT, (scoped_client_id,), file.filename, file.content_type, file.file)
+        public_path = media_public_path(settings.MEDIA_ROOT, uploaded.physical_path)
+    except MediaPathError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    metadata: dict[str, str | int | bool | None] = {"filename": uploaded.filename, "content_type": file.content_type}
     if content_type == ContentType.AUDIO:
         resolved_normalization = normalization_status or "pending"
         metadata.update(
@@ -145,8 +145,15 @@ def upload_content(
         duration_seconds=resolved_duration_seconds,
         metadata_json=metadata,
     )
-    db.add(content)
-    db.commit()
+    try:
+        save_content_reference(content, db)
+    except MediaPathError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        # Keep the completed orphan; never remove a file after an ambiguous commit.
+        raise HTTPException(status_code=500, detail="UPLOAD_WRITE_FAILED") from exc
     db.refresh(content)
     return content
 
@@ -187,13 +194,16 @@ def delete_content(
     content = get_content_in_scope(db, content_id, current_user)
 
     try:
-        file_paths = delete_content_items([content], db)
-        db.commit()
+        with media_reference_operation(db):
+            file_paths = delete_content_items([content], db)
+            db.commit()
+            cleanup_files(file_paths, db)
+    except MediaPathError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="No se pudo eliminar el contenido por dependencias activas o restricciones de integridad",
         ) from exc
-
-    cleanup_files(file_paths)

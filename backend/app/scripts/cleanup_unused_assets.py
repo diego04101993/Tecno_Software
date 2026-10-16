@@ -7,7 +7,8 @@ from sqlalchemy import select
 
 from app.core.database import SessionLocal
 from app.models.entities import AudioPlaylistItem, Campaign, CampaignChannelAssignment, CampaignPlaylistItem, CampaignSequenceItem, ContentItem, Schedule
-from app.services.content_cleanup import cleanup_files, delete_content_items
+from app.services.content_cleanup import cleanup_files, delete_content_items, preflight_content_files
+from app.services.media_references import lock_media_paths, media_reference_operation
 
 
 def list_unused_campaigns(db, cutoff: datetime) -> list[Campaign]:
@@ -71,24 +72,28 @@ def main() -> None:
             print("\nDry-run complete. No records were deleted.")
             return
 
-        for campaign in unused_campaigns:
-            db.delete(campaign)
-        db.flush()
+        with media_reference_operation(db):
+            # Validate before deleting campaigns; this CLI is not executed by SECURITY-1A.
+            all_paths = preflight_content_files(list(db.scalars(select(ContentItem).where(ContentItem.created_at <= cutoff))))
+            lock_media_paths(db, all_paths)
+            for campaign in unused_campaigns:
+                db.delete(campaign)
+            db.flush()
 
-        unused_contents = list_unused_contents(db, cutoff)
-        print_report(
-            "Unused contents after campaign cleanup",
-            unused_contents,
-            lambda content: f'{content.name} ({content.id}) type={content.type.value} client={content.client_id} created_at={content.created_at.isoformat() if content.created_at else "n/a"}',
-        )
+            unused_contents = list_unused_contents(db, cutoff)
+            print_report(
+                "Unused contents after campaign cleanup",
+                unused_contents,
+                lambda content: f'{content.name} ({content.id}) type={content.type.value} client={content.client_id} created_at={content.created_at.isoformat() if content.created_at else "n/a"}',
+            )
 
-        file_paths = delete_content_items(unused_contents, db)
-        db.commit()
-        cleanup_files(file_paths)
+            file_paths = delete_content_items(unused_contents, db)
+            db.commit()
+            deleted_files = cleanup_files(file_paths, db)
 
-        print(
-            f"\nCleanup applied. Deleted {len(unused_campaigns)} campaign(s), {len(unused_contents)} content item(s) and {len(file_paths)} file(s)."
-        )
+            print(
+                f"\nCleanup applied. Deleted {len(unused_campaigns)} campaign(s), {len(unused_contents)} content item(s) and {deleted_files} file(s)."
+            )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.media_storage import MediaPathError, resolve_stored_media_path, validate_media_file
+from app.services.media_references import lock_media_paths, media_reference_operation, require_media_commit
 from app.models.entities import (
     AudioPlaylistItem,
     Campaign,
@@ -23,7 +26,7 @@ from app.models.entities import (
 
 settings = get_settings()
 STREAM_TOKENS = ("m3u8", "rtmp", "youtube.com/live", "youtu.be/live", "twitch.tv", ".mpd", "rtsp://", "udp://")
-MEDIA_ARTIFACT_DIR_NAMES = ("cache", ".cache", "thumb", "thumbs", "thumbnail", "thumbnails", "preview", "previews")
+logger = logging.getLogger(__name__)
 
 
 def _coerce_positive_int(value: Any) -> int | None:
@@ -108,88 +111,62 @@ def resolve_sequence_item_duration(
 
 
 def resolve_media_file_path(content: ContentItem) -> Path | None:
-    if not content.file_path or not content.file_path.startswith("/media/"):
-        return None
-    relative_path = content.file_path.removeprefix("/media/")
-    return settings.MEDIA_ROOT / relative_path
+    return resolve_stored_media_path(settings.MEDIA_ROOT, content.file_path)
 
 
-def _resolve_related_media_paths(file_path: Path) -> list[Path]:
-    resolved: list[Path] = []
-    seen_paths: set[Path] = set()
-
-    def remember(path: Path) -> None:
-        if path in seen_paths:
-            return
-        seen_paths.add(path)
-        resolved.append(path)
-
-    remember(file_path)
-
-    if not file_path.exists():
-        return resolved
-
-    parent = file_path.parent
-    stem = file_path.stem
-    suffix = file_path.suffix
-
-    for child in parent.iterdir():
-        if not child.is_file() or child == file_path:
-            continue
-        if child.stem == stem and child.suffix != suffix:
-            remember(child)
-
-    media_root = settings.MEDIA_ROOT.resolve()
-    for artifact_dir_name in MEDIA_ARTIFACT_DIR_NAMES:
-        artifact_dir = parent / artifact_dir_name
-        if artifact_dir.exists() and artifact_dir.is_dir():
-            for child in artifact_dir.iterdir():
-                if child.is_file() and (child.stem == stem or child.name.startswith(f"{stem}.")):
-                    remember(child)
-
-        client_artifact_dir = media_root / artifact_dir_name
-        if client_artifact_dir.exists() and client_artifact_dir.is_dir():
-            for child in client_artifact_dir.rglob("*"):
-                if child.is_file() and (child.stem == stem or child.name.startswith(f"{stem}.")):
-                    remember(child)
-
-    return resolved
+def preflight_content_files(contents: list[ContentItem]) -> list[Path]:
+    # Complete the entire validation before mutating even the first row.
+    return list(dict.fromkeys(path for content in contents if (path := resolve_media_file_path(content)) is not None))
 
 
-def _cleanup_empty_parent_directories(path: Path) -> None:
-    media_root = settings.MEDIA_ROOT.resolve()
-    current_dir = path.parent.resolve()
-    while current_dir != media_root and media_root in current_dir.parents:
+def _referenced_media_paths(db: Session) -> set[Path]:
+    referenced: set[Path] = set()
+    for stored_path in db.scalars(select(ContentItem.file_path).where(ContentItem.file_path.is_not(None))):
         try:
-            next(current_dir.iterdir())
-            break
-        except StopIteration:
-            try:
-                current_dir.rmdir()
-            except OSError:
-                break
-            current_dir = current_dir.parent.resolve()
-        except OSError:
-            break
+            path = resolve_stored_media_path(settings.MEDIA_ROOT, stored_path, must_exist=False)
+        except MediaPathError as exc:
+            # An incomplete global scan cannot authorize ANY unlink in this batch.
+            # Log only controlled codes, never stored paths, tenants or OS errors.
+            logger.warning("UNRESOLVED_SURVIVING_REFERENCE cause=%s", exc.code)
+            raise MediaPathError("UNRESOLVED_SURVIVING_REFERENCE") from exc
+        if path is not None:
+            referenced.add(path)
+    return referenced
 
 
-def cleanup_files(file_paths: list[Path]) -> int:
+def cleanup_files(file_paths: list[Path], db: Session) -> int:
+    # Reference mutations use an outer operation so the same locks remain held
+    # across a confirmed DB commit. Reject accidental calls before that commit.
+    with media_reference_operation(db):
+        return _cleanup_files_locked(file_paths, db)
+
+
+def _cleanup_files_locked(file_paths: list[Path], db: Session) -> int:
+    """Only exact, preflighted files; keep every file still referenced in the DB.
+
+    Called after a successful commit so DB failures cannot remove live media.
+    Revalidate the full batch before the first unlink, then recheck each target.
+    No name/stem heuristics, recursive deletion or removal of parent directories.
+    """
+    if not file_paths:
+        return 0
+    targets = list(dict.fromkeys(validate_media_file(settings.MEDIA_ROOT, path) for path in file_paths))
+    lock_media_paths(db, targets)
+    require_media_commit(db)
+    referenced = _referenced_media_paths(db)
     deleted_files = 0
-    cleaned_targets: set[Path] = set()
-
-    for file_path in file_paths:
-        for related_path in _resolve_related_media_paths(file_path):
-            if related_path in cleaned_targets:
-                continue
-            cleaned_targets.add(related_path)
-            try:
-                if related_path.exists() and related_path.is_file():
-                    related_path.unlink()
-                    deleted_files += 1
-                _cleanup_empty_parent_directories(related_path)
-            except OSError:
-                continue
-
+    for target in targets:
+        if target in referenced:
+            logger.info("FILE_STILL_REFERENCED")
+            continue
+        if validate_media_file(settings.MEDIA_ROOT, target) != target:
+            raise MediaPathError("PATH_OUTSIDE_MEDIA_ROOT")
+        lock_media_paths(db, [target])
+        try:
+            target.unlink()
+        except OSError as exc:
+            raise MediaPathError("MEDIA_DELETE_FAILED") from exc
+        deleted_files += 1
     return deleted_files
 
 
@@ -282,13 +259,15 @@ def build_folder_delete_impact(folder: ContentFolder, db: Session) -> dict[str, 
 
 
 def delete_content_items(contents: list[ContentItem], db: Session) -> list[Path]:
-    file_paths: list[Path] = []
-    seen_paths: set[Path] = set()
+    file_paths = preflight_content_files(contents)
+    lock_media_paths(db, file_paths)
+    # Revalidate after waiting; a concurrent deleter might have removed a file.
+    # Also reject stale file_path updates rather than deleting a reference to
+    # a different, unlocked target loaded before this operation acquired locks.
     for content in contents:
-        file_path = resolve_media_file_path(content)
-        if file_path and file_path not in seen_paths:
-            file_paths.append(file_path)
-            seen_paths.add(file_path)
+        db.refresh(content, attribute_names=["file_path"])
+    lock_media_paths(db, preflight_content_files(contents))
+    for content in contents:
         db.execute(delete(CampaignSequenceItem).where(CampaignSequenceItem.content_id == content.id))
         db.execute(delete(CampaignPlaylistItem).where(CampaignPlaylistItem.content_id == content.id))
         db.execute(delete(AudioPlaylistItem).where(AudioPlaylistItem.content_id == content.id))
