@@ -10,10 +10,14 @@ from urllib.parse import quote
 
 from fastapi.responses import Response, StreamingResponse
 
+from app.services.active_media_policy import ActiveMediaPolicy, classify_active_media
 from app.services.media_storage import MediaPathError, resolve_relative_media_path
 
 
 DEFAULT_CHUNK_SIZE = 64 * 1024
+# Response-only sandbox: preserve self-contained SVG images without allowing
+# scripts, event handlers, same-origin privileges or external subresources.
+SVG_CONTENT_SECURITY_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
 
 
 class MediaRangeError(ValueError):
@@ -100,7 +104,15 @@ def iter_file_chunks(file_path: Path, start: int, end: int, chunk_size: int = DE
 
 
 def build_media_headers(file_path: Path, *, stat_result: object, content_length: int, content_range: str | None = None) -> dict[str, str]:
-    mime_type = guess_type(str(file_path))[0] or "application/octet-stream"
+    policy = classify_active_media(file_path.name)
+    disposition = "inline"
+    if policy == ActiveMediaPolicy.HTML_INERT:
+        mime_type = "application/octet-stream"
+        disposition = "attachment"
+    elif policy == ActiveMediaPolicy.SVG_RESTRICTED:
+        mime_type = "image/svg+xml"
+    else:
+        mime_type = guess_type(str(file_path))[0] or "application/octet-stream"
     etag_base = f"{stat_result.st_mtime}-{stat_result.st_size}"
     etag = f'"{md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
     filename = file_path.name
@@ -110,10 +122,15 @@ def build_media_headers(file_path: Path, *, stat_result: object, content_length:
         "accept-ranges": "bytes",
         "content-length": str(content_length),
         "content-type": mime_type,
-        "content-disposition": f'inline; filename="{filename}"; filename*=UTF-8\'\'{encoded_filename}',
+        "content-disposition": f'{disposition}; filename="{filename}"; filename*=UTF-8\'\'{encoded_filename}',
         "last-modified": formatdate(stat_result.st_mtime, usegmt=True),
         "etag": etag,
     }
+    if policy != ActiveMediaPolicy.NORMAL_MEDIA:
+        headers["x-content-type-options"] = "nosniff"
+    if policy == ActiveMediaPolicy.SVG_RESTRICTED:
+        headers["content-security-policy"] = SVG_CONTENT_SECURITY_POLICY
+        # SVGZ encoding remains unchanged; ranges still address original bytes.
     if content_range:
         headers["content-range"] = content_range
     return headers

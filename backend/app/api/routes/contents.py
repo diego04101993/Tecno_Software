@@ -7,8 +7,9 @@ from app.api.deps import get_current_user, get_db
 from app.core.config import get_settings
 from app.models.entities import ContentItem, ContentType, User
 from app.schemas.domain import ContentCreate, ContentFolderMove, ContentRead
+from app.services.active_media_policy import ActiveMediaPolicy, classify_active_media
 from app.services.content_cleanup import cleanup_files, delete_content_items, resolve_content_duration_seconds
-from app.services.media_storage import MediaPathError, media_public_path, write_media_upload
+from app.services.media_storage import MediaPathError, media_public_path, normalize_upload_filename, write_media_upload
 from app.services.media_references import media_reference_operation, save_content_reference
 from app.services.tenancy import (
     apply_client_filter,
@@ -109,6 +110,15 @@ def upload_content(
         target_folder = get_content_folder_in_scope(db, folder_id, current_user)
         if target_folder.client_id != scoped_client_id:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La carpeta no pertenece al cliente seleccionado")
+
+    # Use the same normalized name as storage, including trimmed whitespace.
+    try:
+        filename = normalize_upload_filename(file.filename)
+    except MediaPathError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    declared_mime = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if classify_active_media(filename) == ActiveMediaPolicy.HTML_INERT or declared_mime in {"text/html", "application/xhtml+xml"}:
+        raise HTTPException(status_code=415, detail="ACTIVE_HTML_UPLOAD_NOT_ALLOWED")
 
     content_type = ContentType.IMAGE
     if file.content_type and file.content_type.startswith("video/"):
