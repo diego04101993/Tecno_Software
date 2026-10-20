@@ -103,6 +103,30 @@ def iter_file_chunks(file_path: Path, start: int, end: int, chunk_size: int = DE
             yield chunk
 
 
+def build_content_disposition(disposition: str, filename: str) -> str:
+    """Serialize a presentation name only; never change the physical filename."""
+    if disposition not in ("inline", "attachment"):
+        raise ValueError("Content disposition must be inline or attachment")
+
+    presentation = "".join(
+        "_" if ord(char) < 32 or ord(char) == 127 or char == "\\" else char
+        for char in filename
+    )
+    fallback = "".join(
+        char if char.isascii() and (char.isalnum() or char in " ._-") else "_"
+        for char in presentation
+    )
+    stem, separator, extension = fallback.rpartition(".")
+    if not separator:
+        stem = fallback
+    if not any(char.isalnum() for char in stem):
+        safe_extension = f".{extension}" if separator and extension.isalnum() else ""
+        fallback = f"download{safe_extension}"
+
+    encoded_filename = quote(presentation, safe="")
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded_filename}'
+
+
 def build_media_headers(file_path: Path, *, stat_result: object, content_length: int, content_range: str | None = None) -> dict[str, str]:
     policy = classify_active_media(file_path.name)
     disposition = "inline"
@@ -115,14 +139,11 @@ def build_media_headers(file_path: Path, *, stat_result: object, content_length:
         mime_type = guess_type(str(file_path))[0] or "application/octet-stream"
     etag_base = f"{stat_result.st_mtime}-{stat_result.st_size}"
     etag = f'"{md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
-    filename = file_path.name
-    encoded_filename = quote(filename)
-
     headers = {
         "accept-ranges": "bytes",
         "content-length": str(content_length),
         "content-type": mime_type,
-        "content-disposition": f'{disposition}; filename="{filename}"; filename*=UTF-8\'\'{encoded_filename}',
+        "content-disposition": build_content_disposition(disposition, file_path.name),
         "last-modified": formatdate(stat_result.st_mtime, usegmt=True),
         "etag": etag,
     }
