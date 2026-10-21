@@ -5,7 +5,12 @@ import { isStreamLikeContent, resolvePreviewMediaUrl, type PreviewRenderableEntr
 
 const VIDEO_METADATA_TIMEOUT_MS = 10_000;
 
-function resolveUrlPreviewFrame(url: string | null) {
+const GENERIC_URL_SANDBOX = "allow-scripts allow-forms allow-presentation";
+const YOUTUBE_URL_SANDBOX = "allow-same-origin allow-scripts allow-presentation";
+
+type UrlPreviewFrame = { url: string; kind: "generic" | "trusted-youtube" };
+
+function resolveUrlPreviewFrame(url: string | null): UrlPreviewFrame | null {
   if (!url) {
     return null;
   }
@@ -17,23 +22,33 @@ function resolveUrlPreviewFrame(url: string | null) {
 
   try {
     const parsed = new URL(trimmed);
-    const hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+    const hostname = parsed.hostname;
+    const inputParts = trimmed.match(/^https?:\/\/([^/?#]*)([^?#]*)/i);
+    // Do not trust paths repaired by URL parsing, controls, or even empty userinfo.
+    const canTrustYouTube = !parsed.username && !parsed.password && !parsed.port
+      && !inputParts?.[1].includes("@") && inputParts?.[2] === parsed.pathname
+      && !/[\u0000-\u001f\u007f]/.test(trimmed);
+    let videoId: string | null = null;
 
-    if (hostname === "youtube.com" || hostname === "m.youtube.com") {
-      const videoId = parsed.searchParams.get("v");
-      if (videoId) {
-        return `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
+    if (canTrustYouTube && ["youtube.com", "www.youtube.com", "m.youtube.com"].includes(hostname)) {
+      if (parsed.pathname === "/watch") {
+        const ids = parsed.searchParams.getAll("v");
+        const rawId = parsed.search.match(/(?:^\?|&)v=([^&]*)/)?.[1];
+        // A single literal ID: no ambiguous duplicates or percent-decoded IDs.
+        if (ids.length === 1 && rawId === ids[0]) videoId = ids[0];
+      } else {
+        videoId = parsed.pathname.match(/^\/embed\/([^/]+)$/)?.[1] ?? null;
       }
+    } else if (canTrustYouTube && hostname === "youtu.be") {
+      videoId = parsed.pathname.match(/^\/([^/]+)$/)?.[1] ?? null;
     }
 
-    if (hostname === "youtu.be") {
-      const videoId = parsed.pathname.replace(/\//g, "");
-      if (videoId) {
-        return `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
-      }
+    // The length check also excludes a final newline (which JS '$' can match before).
+    if (videoId !== null && videoId.length === 11 && /^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+      return { url: `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`, kind: "trusted-youtube" };
     }
 
-    return parsed.toString();
+    return { url: parsed.toString(), kind: "generic" };
   } catch {
     return null;
   }
@@ -461,7 +476,7 @@ export function PreviewContentSurface({
   if (content?.type === "url") {
     const sourceUrl = content.source_url ?? "";
     const streamLike = isStreamLikeContent(content);
-    const frameUrl = streamLike ? null : resolveUrlPreviewFrame(sourceUrl);
+    const frame = streamLike ? null : resolveUrlPreviewFrame(sourceUrl);
 
     return (
       <div className={`h-full overflow-hidden border border-slate-200 bg-white shadow-sm ${baseChrome}`}>
@@ -474,13 +489,13 @@ export function PreviewContentSurface({
           </div>
         </div>
         <div className="flex h-[calc(100%-57px)] flex-col bg-gradient-to-br from-slate-100 via-white to-cyan-50">
-          {frameUrl ? (
+          {frame ? (
             <div className="relative min-h-0 flex-1 overflow-hidden">
               <iframe
                 className="h-full w-full bg-white"
                 referrerPolicy="strict-origin-when-cross-origin"
-                sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-presentation"
-                src={frameUrl}
+                sandbox={frame.kind === "trusted-youtube" ? YOUTUBE_URL_SANDBOX : GENERIC_URL_SANDBOX}
+                src={frame.url}
                 title={title ?? content.name}
               />
               <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent px-5 py-4 text-white">
