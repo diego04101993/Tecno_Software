@@ -8,7 +8,7 @@
     header {
         X-Content-Type-Options "nosniff"
         Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy-Report-Only "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; style-src-attr 'none'; img-src 'self' http: https: data: blob:; font-src https://fonts.gstatic.com; connect-src 'self' https://api.tecnocontrolcloud.com; media-src 'self' http: https: data: blob:; frame-src http: https:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none';"
+        Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; style-src-attr 'none'; img-src 'self' http: https: data: blob:; font-src https://fonts.gstatic.com; connect-src 'self' https://api.tecnocontrolcloud.com; media-src 'self' http: https: data: blob:; frame-src http: https:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none';"
     }
     root * /srv
     encode zstd gzip

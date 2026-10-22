@@ -109,10 +109,10 @@ function inspectConfiguration(source, svgSource = mediaSource) {
     assert.equal(Object.hasOwn(headers, key), false, `Duplicate header: ${name}`);
     headers[key] = value;
   }
-  assert.deepEqual(Object.keys(headers).sort(), ["content-security-policy-report-only", "referrer-policy", "x-content-type-options"], "Exactly the three approved headers; no enforcement or reporting endpoint");
+  assert.deepEqual(Object.keys(headers).sort(), ["content-security-policy", "referrer-policy", "x-content-type-options"], "Exactly the three approved headers; enforcement only, no Report-Only or reporting endpoint");
   assert.equal(headers["x-content-type-options"], "nosniff");
   assert.equal(headers["referrer-policy"], "strict-origin-when-cross-origin");
-  const directives = parsePolicy(headers["content-security-policy-report-only"]);
+  const directives = parsePolicy(headers["content-security-policy"]);
   assert.deepEqual(directives, expectedDirectives, "The complete audited policy must remain exact");
 
   const svgMatch = svgSource.match(/^SVG_CONTENT_SECURITY_POLICY = "([^"\r\n]*)"\r?$/m);
@@ -126,7 +126,7 @@ test("production Caddyfile scopes exactly three approved headers to dashboard; A
 });
 
 for (const [name, expected] of Object.entries(expectedDirectives)) {
-  test(`production Report-Only directive: ${name}`, () => {
+  test(`production enforced directive: ${name}`, () => {
     assert.deepEqual(inspectConfiguration(caddySource).directives[name], expected);
   });
 }
@@ -145,22 +145,34 @@ function replaceOnce(source, from, to) {
 }
 
 const mutations = [
-  ["A: remove nosniff", (source) => replaceOnce(source, '        X-Content-Type-Options "nosniff"', "")],
-  ["B: change Referrer-Policy", (source) => replaceOnce(source, 'Referrer-Policy "strict-origin-when-cross-origin"', 'Referrer-Policy "no-referrer"')],
-  ["C: accidentally enable CSP enforcement", (source) => replaceOnce(source, "Content-Security-Policy-Report-Only", "Content-Security-Policy")],
+  ["A: CSP remains Report-Only", (source) => replaceOnce(source, 'Content-Security-Policy "', 'Content-Security-Policy-Report-Only "')],
+  ["B: enforcement and Report-Only coexist", (source) => {
+    const header = source.match(/^        Content-Security-Policy "[^"\r\n]*"/m)?.[0];
+    assert.ok(header, "CSP header mutation anchor");
+    return replaceOnce(source, header, header + "\n" + header.replace("Content-Security-Policy", "Content-Security-Policy-Report-Only"));
+  }],
+  ["C: allow inline scripts", (source) => replaceOnce(source, "script-src 'self';", "script-src 'self' 'unsafe-inline';")],
   ["D: allow unsafe-eval", (source) => replaceOnce(source, "script-src 'self';", "script-src 'self' 'unsafe-eval';")],
-  ["E: allow inline scripts", (source) => replaceOnce(source, "script-src 'self';", "script-src 'self' 'unsafe-inline';")],
+  ["E: broaden connect-src with wildcard", (source) => replaceOnce(source, "connect-src 'self' https://api.tecnocontrolcloud.com;", "connect-src *;")],
   ["F: remove API from connect-src", (source) => replaceOnce(source, "connect-src 'self' https://api.tecnocontrolcloud.com;", "connect-src 'self';")],
-  ["G: break generic embeds with YouTube-only frame-src", (source) => replaceOnce(source, "frame-src http: https:;", "frame-src https://www.youtube.com;")],
-  ["H: move headers to API site", (source) => {
+  ["G: remove Google Fonts stylesheet origin", (source) => replaceOnce(source, "style-src 'self' https://fonts.googleapis.com;", "style-src 'self';")],
+  ["H: remove Google Fonts asset origin", (source) => replaceOnce(source, "font-src https://fonts.gstatic.com;", "font-src 'none';")],
+  ["I: break generic embeds with YouTube-only frame-src", (source) => replaceOnce(source, "frame-src http: https:;", "frame-src https://www.youtube.com;")],
+  ["J: remove frame-ancestors", (source) => replaceOnce(source, "frame-ancestors 'none';", "")],
+  ["K: relax object-src", (source) => replaceOnce(source, "object-src 'none';", "object-src 'self';")],
+  ["L: relax base-uri", (source) => replaceOnce(source, "base-uri 'none';", "base-uri 'self';")],
+  ["M: move headers to API site", (source) => {
     const header = source.match(/^    header \{\r?\n[\s\S]*?^    \}/m)?.[0];
     assert.ok(header, "Header block mutation anchor");
     return replaceOnce(replaceOnce(source, header, ""), "{$API_DOMAIN} {", "{$API_DOMAIN} {\n" + header);
   }],
+  ["N: change Referrer-Policy", (source) => replaceOnce(source, 'Referrer-Policy "strict-origin-when-cross-origin"', 'Referrer-Policy "no-referrer"')],
+  ["O: remove nosniff", (source) => replaceOnce(source, '        X-Content-Type-Options "nosniff"', "")],
   ["add an unauthorized reporting endpoint", (source) => replaceOnce(source, "manifest-src 'none';", "manifest-src 'none'; report-uri /csp-report;")],
-  ["broaden connect-src with wildcard", (source) => replaceOnce(source, "connect-src 'self' https://api.tecnocontrolcloud.com;", "connect-src *;")],
   ["duplicate a CSP directive", (source) => replaceOnce(source, "script-src 'self';", "script-src 'self'; script-src https:;")],
-  ["also attach dashboard CSP to API", (source) => replaceOnce(source, "reverse_proxy backend:8000", 'header Content-Security-Policy-Report-Only "default-src *"\n    reverse_proxy backend:8000')],
+  ["duplicate an enforced CSP header", (source) => replaceOnce(source, 'Content-Security-Policy "', 'Content-Security-Policy "default-src *"\n        Content-Security-Policy "')],
+  ["also attach dashboard CSP to API", (source) => replaceOnce(source, "reverse_proxy backend:8000", 'header Content-Security-Policy "default-src *"\n    reverse_proxy backend:8000')],
+  ["relax inline style attributes", (source) => replaceOnce(source, "style-src-attr 'none';", "style-src-attr 'unsafe-inline';")],
 ];
 
 for (const [name, mutate] of mutations) {
@@ -171,7 +183,7 @@ for (const [name, mutate] of mutations) {
   });
 }
 
-test("mutation rejected: I: modify independent SVG CSP as if it were the dashboard policy", () => {
+test("mutation rejected: modify independent SVG CSP as if it were the dashboard policy", () => {
   const changed = replaceOnce(mediaSource, svgPolicy, "default-src 'self'");
   assert.throws(() => inspectConfiguration(caddySource, changed), /SVG/);
 });
