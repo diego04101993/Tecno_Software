@@ -25,7 +25,7 @@ buildSync({
     export { buildLedCustomMapping } from './src/lib/ledCustomMapping';
   `, resolveDir: frontend, loader: "tsx" },
   outfile: bundle, bundle: true, platform: "node", format: "cjs", jsx: "automatic",
-  external: ["react", "react/jsx-runtime"], define: { "import.meta.env": "{}" },
+  external: ["react", "react/jsx-runtime"], define: { "import.meta.env": JSON.stringify({ DEV: true, PROD: false }) },
 });
 const { ScreenEditDrawer, ScreenCreateDrawer, buildLedCustomMapping, buildOutputMappingDraft } = testRequire(bundle);
 const expected = JSON.parse(readFileSync(join(frontend, "../backend/tests/fixtures/led_custom_516x860.json"), "utf8"));

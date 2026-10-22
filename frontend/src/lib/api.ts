@@ -25,7 +25,11 @@ function inferApiBaseUrl() {
 const API_URL =
   normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL) ??
   normalizeApiBaseUrl(import.meta.env.VITE_API_URL) ??
-  inferApiBaseUrl();
+  (import.meta.env.DEV ? inferApiBaseUrl() : "");
+
+if (import.meta.env.PROD && !API_URL) {
+  throw new Error("Missing API configuration in production build");
+}
 
 const API_ORIGIN = API_URL.replace(/\/api\/?$/, "");
 

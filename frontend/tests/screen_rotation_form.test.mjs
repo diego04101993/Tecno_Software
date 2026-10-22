@@ -22,7 +22,7 @@ const bundle = join(scratch, "drawer.cjs");
 buildSync({
   entryPoints: [join(frontend, "src/components/dashboard/ScreenEditDrawer.tsx")],
   outfile: bundle, bundle: true, platform: "node", format: "cjs", jsx: "automatic",
-  external: ["react", "react/jsx-runtime"], define: { "import.meta.env": "{}" },
+  external: ["react", "react/jsx-runtime"], define: { "import.meta.env": JSON.stringify({ DEV: true, PROD: false }) },
 });
 const { ScreenEditDrawer } = testRequire(bundle);
 const originalFetch = globalThis.fetch;

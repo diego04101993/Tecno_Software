@@ -1,18 +1,23 @@
-FROM node:20-alpine AS build
+FROM node:24.22.1-alpine AS build
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN corepack enable \
+    && corepack prepare pnpm@10.17.1 --activate \
+    && test "$(pnpm --version)" = "10.17.1"
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
 ARG VITE_API_BASE_URL
+ARG VITE_API_URL
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+ENV VITE_API_URL=${VITE_API_URL}
 
-RUN npm run build
+RUN pnpm run build
 
-FROM caddy:2-alpine
+FROM caddy:2.11.4-alpine
 
 COPY Caddyfile.production /etc/caddy/Caddyfile
 COPY --from=build /app/dist /srv

@@ -9,6 +9,9 @@ backend/.venv/
 backend/.deps/
 backend/dev.db
 .env
+.env.*
+!.env.example
+!.env.production.example
 backend/.env
 frontend/.env
 node_modules/
