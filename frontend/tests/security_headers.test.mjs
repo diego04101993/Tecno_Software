@@ -27,6 +27,26 @@ const expectedDirectives = {
   "worker-src": ["'none'"],
   "manifest-src": ["'none'"],
 };
+const sensitiveQueryKeys = [
+  "token", "access_token", "player_token", "issued_player_token",
+  "authorization", "password", "channel_code", "activation_code",
+];
+const expectedGlobalOptions = `{
+    log {
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+${sensitiveQueryKeys.map((key) => `                    replace ${key} [REDACTED]`).join("\n")}
+                }
+            }
+        }
+    }
+    servers {
+        trusted_proxies static private_ranges
+    }
+}
+`;
 
 // Parse block structure, preserving quoted values, {$ENV} and {path} placeholders.
 // This deliberately supports the versioned file's grammar, not all Caddy syntax.
@@ -91,7 +111,7 @@ function inspectConfiguration(source, svgSource = mediaSource) {
   const app = findSite("{$APP_DOMAIN}");
   const api = findSite("{$API_DOMAIN}");
   const global = sites.filter((site) => site.words.length === 0);
-  assert.deepEqual(global, parseCaddy("{\nservers {\ntrusted_proxies static private_ranges\n}\n}\n"), "Global options must not acquire shared headers");
+  assert.deepEqual(global, parseCaddy(expectedGlobalOptions), "Global options allow only the approved log redaction and trusted proxies; no shared headers");
   assert.deepEqual(api.children, parseCaddy("reverse_proxy backend:8000\n"), "API proxy scope must remain unchanged");
 
   const headerBlocks = app.children.filter((node) => node.words[0] === "header");
@@ -121,7 +141,7 @@ function inspectConfiguration(source, svgSource = mediaSource) {
   return { headers, directives };
 }
 
-test("production Caddyfile scopes exactly three approved headers to dashboard; API and global options unchanged", () => {
+test("production Caddyfile scopes exactly three approved headers to dashboard; API unchanged and global log redaction exact", () => {
   inspectConfiguration(caddySource);
 });
 
@@ -180,6 +200,27 @@ for (const [name, mutate] of mutations) {
     const changed = mutate(caddySource);
     assert.notEqual(changed, caddySource, "Mutation must change the fixture");
     assert.throws(() => inspectConfiguration(changed), { name: "AssertionError" });
+  });
+}
+
+// Keep the logging allowance exact: it must not bypass any header/CSP checks.
+const logMutations = [
+  ...sensitiveQueryKeys.map((key) => [`remove ${key} redaction`, (source) => replaceOnce(source, `replace ${key} [REDACTED]`, "")]),
+  ["remove global log filter", (source) => {
+    const block = source.match(/^    log \{\r?\n[\s\S]*?^    \}/m)?.[0];
+    assert.ok(block, "Global log block mutation anchor");
+    return replaceOnce(source, block, "");
+  }],
+  ["filter a different log field", (source) => replaceOnce(source, "request>uri query", "request>url query")],
+  ["expose a token through its replacement", (source) => replaceOnce(source, "replace token [REDACTED]", "replace token {query.token}")],
+  ["add shared headers beside approved logging", (source) => replaceOnce(source, "    servers {", '    header Content-Security-Policy "default-src *"\n    servers {')],
+];
+
+for (const [name, mutate] of logMutations) {
+  test(`logging mutation rejected: ${name}`, () => {
+    const changed = mutate(caddySource);
+    assert.notEqual(changed, caddySource, "Mutation must change the fixture");
+    assert.throws(() => inspectConfiguration(changed), /Global options/);
   });
 }
 

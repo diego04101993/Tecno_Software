@@ -7,9 +7,11 @@ from app.api.routes import media
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_db
+from app.core.security_logging import install_security_log_redaction
 from app.services.seed import seed_initial_data
 
 
+install_security_log_redaction()
 settings = get_settings()
 
 

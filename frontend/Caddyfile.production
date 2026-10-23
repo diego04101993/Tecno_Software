@@ -1,4 +1,21 @@
 {
+    log {
+        format filter {
+            wrap json
+            fields {
+                request>uri query {
+                    replace token [REDACTED]
+                    replace access_token [REDACTED]
+                    replace player_token [REDACTED]
+                    replace issued_player_token [REDACTED]
+                    replace authorization [REDACTED]
+                    replace password [REDACTED]
+                    replace channel_code [REDACTED]
+                    replace activation_code [REDACTED]
+                }
+            }
+        }
+    }
     servers {
         trusted_proxies static private_ranges
     }

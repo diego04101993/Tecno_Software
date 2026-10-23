@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.core.security import decode_access_token
 from app.core.database import SessionLocal
 from app.models.entities import Channel, User, UserRole
 from app.services.presence import is_player_online
@@ -17,6 +19,7 @@ router = APIRouter()
 GLOBAL_SOCKET_ROLES = {UserRole.SUPER_ADMIN.value, UserRole.STAFF_ADMIN.value, UserRole.STAFF_OPERATOR.value}
 CLIENT_SOCKET_ROLES = GLOBAL_SOCKET_ROLES | {UserRole.CLIENT.value, UserRole.CLIENT_ADMIN.value, UserRole.CLIENT_OPERATOR.value}
 BRANCH_SOCKET_ROLES = {UserRole.BRANCH_MANAGER.value, UserRole.OPERATOR.value}
+WS_REVALIDATION_SECONDS = 30.0
 
 
 @router.get("/presence")
@@ -37,53 +40,78 @@ def presence(
     }
 
 
-@router.websocket("/ws/clients/{client_id}")
-async def client_socket(websocket: WebSocket, client_id: str, token: str = Query(...)) -> None:
-    payload = decode_access_token(token)
-    payload_client_id = payload.get("client_id")
-    payload_role = payload.get("role")
-    if payload_role not in CLIENT_SOCKET_ROLES:
-        await websocket.close(code=4403)
-        return
-    if payload_role not in GLOBAL_SOCKET_ROLES and payload_client_id != client_id:
-        await websocket.close(code=4403)
-        return
+def _authorize_socket(token: str, room_id: str, *, channel_room: bool) -> int | None:
+    # A fresh session on each authorization prevents an ORM identity map from
+    # retaining a user/role that was changed after the handshake.
+    with SessionLocal() as db:
+        try:
+            user = get_current_user(authorization=f"Bearer {token}", db=db)
+        except HTTPException as exc:
+            if exc.status_code in {401, 403}:
+                return 4401 if exc.status_code == 401 else 4403
+            raise
+        role = user.role.value
+        if not channel_room:
+            if role not in CLIENT_SOCKET_ROLES:
+                return 4403
+            if role not in GLOBAL_SOCKET_ROLES and user.client_id != room_id:
+                return 4403
+        else:
+            channel = db.get(Channel, room_id)
+            if not channel:
+                return 4404
+            if role not in CLIENT_SOCKET_ROLES | BRANCH_SOCKET_ROLES:
+                return 4403
+            if role not in GLOBAL_SOCKET_ROLES and user.client_id != channel.client_id:
+                return 4403
+            if role in BRANCH_SOCKET_ROLES and user.branch_id != channel.branch_id:
+                return 4403
+    return None
 
-    await manager.connect_client(client_id, websocket)
+
+async def _serve_socket(websocket: WebSocket, token: str, room_id: str, *, channel_room: bool) -> None:
+    def authorize() -> int | None:
+        return _authorize_socket(token, room_id, channel_room=channel_room)
+
+    code = authorize()
+    if code is not None:
+        await websocket.close(code=code)
+        return
+    connect = manager.connect_channel if channel_room else manager.connect_client
+    room = manager.channel_rooms if channel_room else manager.client_rooms
+    await connect(room_id, websocket, authorize)
     try:
         while True:
-            message = await websocket.receive_json()
-            await websocket.send_json({"type": "ack", "message": message})
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=WS_REVALIDATION_SECONDS)
+            except asyncio.TimeoutError:
+                if not await manager.authorize(websocket):
+                    return
+                continue
+            except json.JSONDecodeError:
+                await websocket.close(code=1007)
+                return
+            if not await manager.authorize(websocket):
+                return
+            if channel_room:
+                if not isinstance(message, dict):
+                    await websocket.close(code=1003)
+                    return
+                if message.get("type") == "heartbeat":
+                    await manager.broadcast_to_channel(room_id, message)
+            else:
+                await websocket.send_json({"type": "ack", "message": message})
     except WebSocketDisconnect:
-        manager.disconnect(manager.client_rooms, client_id, websocket)
+        pass
+    finally:
+        manager.disconnect(room, room_id, websocket)
+
+
+@router.websocket("/ws/clients/{client_id}")
+async def client_socket(websocket: WebSocket, client_id: str, token: str = Query(...)) -> None:
+    await _serve_socket(websocket, token, client_id, channel_room=False)
 
 
 @router.websocket("/ws/channels/{channel_id}")
 async def channel_socket(websocket: WebSocket, channel_id: str, token: str = Query(...)) -> None:
-    payload = decode_access_token(token)
-    db = SessionLocal()
-    try:
-        channel = db.get(Channel, channel_id)
-        if not channel:
-            await websocket.close(code=4404)
-            return
-        payload_client_id = payload.get("client_id")
-        payload_role = payload.get("role")
-        payload_branch_id = payload.get("branch_id")
-        if payload_role not in GLOBAL_SOCKET_ROLES and payload_client_id != channel.client_id:
-            await websocket.close(code=4403)
-            return
-        if payload_role in BRANCH_SOCKET_ROLES and payload_branch_id != channel.branch_id:
-            await websocket.close(code=4403)
-            return
-    finally:
-        db.close()
-
-    await manager.connect_channel(channel_id, websocket)
-    try:
-        while True:
-            message = await websocket.receive_json()
-            if message.get("type") == "heartbeat":
-                await manager.broadcast_to_channel(channel_id, message)
-    except WebSocketDisconnect:
-        manager.disconnect(manager.channel_rooms, channel_id, websocket)
+    await _serve_socket(websocket, token, channel_id, channel_room=True)

@@ -100,6 +100,8 @@ def activate_player(
     activation_status = "activation_new"
 
     player_device = db.scalar(select(PlayerDevice).where(PlayerDevice.channel_id == channel.id))
+    if player_device is not None and not player_device.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Player is disabled")
     if not player_device:
         token = _generate_player_token()
         token_hash = _hash_player_token(token)

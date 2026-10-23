@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, ValidationError, field_validator
 
 from app.models.entities import (
     AudioNormalizationStatus,
@@ -953,10 +953,37 @@ class TouchMapRead(TimestampedModel):
 
 
 class PlayerActivationRequest(BaseModel):
-    channel_code: str
-    hardware_id: str
-    device_name: str
-    app_version: str
+    channel_code: str = Field(min_length=1, max_length=32)
+    # Also stored in Channel.hardware_identifier (String(120)).
+    hardware_id: str = Field(min_length=1, max_length=120)
+    device_name: str = Field(min_length=1, max_length=160)
+    app_version: str = Field(min_length=1, max_length=64)
+
+    @field_validator("channel_code", "hardware_id", "device_name", "app_version", mode="before")
+    @classmethod
+    def require_utf8_activation_fields(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                # Reject before length checks and SQL. Do not echo an invalid
+                # string in FastAPI's JSON validation response: that also fails
+                # UTF-8 encoding. Only the error input is omitted; no value is
+                # repaired or accepted silently.
+                raise ValidationError.from_exception_data(cls.__name__, [{
+                    "type": "value_error",
+                    "loc": (),
+                    "input": None,
+                    "ctx": {"error": ValueError("Activation fields must be valid UTF-8")},
+                }]) from None
+        return value
+
+    @field_validator("channel_code", "hardware_id", "device_name", "app_version")
+    @classmethod
+    def reject_blank_activation_fields(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Activation fields must not be blank")
+        return value
 
 
 class PlayerActivationResponse(BaseModel):
