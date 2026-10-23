@@ -16,9 +16,6 @@
             }
         }
     }
-    servers {
-        trusted_proxies static private_ranges
-    }
 }
 
 {$APP_DOMAIN} {
@@ -34,5 +31,9 @@
 }
 
 {$API_DOMAIN} {
-    reverse_proxy backend:8000
+    reverse_proxy backend:8000 {
+        header_up X-Forwarded-For {remote_host}
+        header_up -X-Real-IP
+        header_up -Forwarded
+    }
 }

@@ -37,6 +37,7 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       MEDIA_ROOT: /app/storage/uploads
       AUTO_SEED: ${AUTO_SEED:-false}
+      FORWARDED_ALLOW_IPS: "172.30.250.2"
     volumes:
       - backend_uploads:/app/storage/uploads
     expose:
@@ -54,7 +55,9 @@ services:
       retries: 10
       start_period: 20s
     networks:
-      - app_net
+      app_net:
+      proxy_net:
+        ipv4_address: 172.30.250.3
 
   frontend:
     build:
@@ -77,8 +80,9 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - edge
-      - app_net
+      edge:
+      proxy_net:
+        ipv4_address: 172.30.250.2
 
 volumes:
   postgres_data:
@@ -89,3 +93,10 @@ volumes:
 networks:
   edge:
   app_net:
+  proxy_net:
+    name: tecnocontrol_proxy_net
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24

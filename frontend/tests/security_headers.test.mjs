@@ -42,9 +42,12 @@ ${sensitiveQueryKeys.map((key) => `                    replace ${key} [REDACTED]
             }
         }
     }
-    servers {
-        trusted_proxies static private_ranges
-    }
+}
+`;
+const expectedApiProxy = `reverse_proxy backend:8000 {
+    header_up X-Forwarded-For {remote_host}
+    header_up -X-Real-IP
+    header_up -Forwarded
 }
 `;
 
@@ -111,8 +114,8 @@ function inspectConfiguration(source, svgSource = mediaSource) {
   const app = findSite("{$APP_DOMAIN}");
   const api = findSite("{$API_DOMAIN}");
   const global = sites.filter((site) => site.words.length === 0);
-  assert.deepEqual(global, parseCaddy(expectedGlobalOptions), "Global options allow only the approved log redaction and trusted proxies; no shared headers");
-  assert.deepEqual(api.children, parseCaddy("reverse_proxy backend:8000\n"), "API proxy scope must remain unchanged");
+  assert.deepEqual(global, parseCaddy(expectedGlobalOptions), "Global options allow only the approved log redaction; no trusted upstream proxies or shared headers");
+  assert.deepEqual(api.children, parseCaddy(expectedApiProxy), "API proxy must preserve its destination and enforce the exact TCP-peer trust boundary");
 
   const headerBlocks = app.children.filter((node) => node.words[0] === "header");
   assert.equal(headerBlocks.length, 1, "Dashboard needs one unconditional header block");
@@ -141,7 +144,7 @@ function inspectConfiguration(source, svgSource = mediaSource) {
   return { headers, directives };
 }
 
-test("production Caddyfile scopes exactly three approved headers to dashboard; API unchanged and global log redaction exact", () => {
+test("production Caddyfile preserves dashboard headers and log redaction with the exact API proxy trust boundary", () => {
   inspectConfiguration(caddySource);
 });
 
@@ -213,7 +216,7 @@ const logMutations = [
   }],
   ["filter a different log field", (source) => replaceOnce(source, "request>uri query", "request>url query")],
   ["expose a token through its replacement", (source) => replaceOnce(source, "replace token [REDACTED]", "replace token {query.token}")],
-  ["add shared headers beside approved logging", (source) => replaceOnce(source, "    servers {", '    header Content-Security-Policy "default-src *"\n    servers {')],
+  ["add shared headers beside approved logging", (source) => replaceOnce(source, "    log {", '    header Content-Security-Policy "default-src *"\n    log {')],
 ];
 
 for (const [name, mutate] of logMutations) {
@@ -221,6 +224,26 @@ for (const [name, mutate] of logMutations) {
     const changed = mutate(caddySource);
     assert.notEqual(changed, caddySource, "Mutation must change the fixture");
     assert.throws(() => inspectConfiguration(changed), /Global options/);
+  });
+}
+
+const proxyMutations = [
+  ["restore private_ranges trust", (source) => replaceOnce(source, "    log {", "    servers {\n        trusted_proxies static private_ranges\n    }\n    log {")],
+  ["trust every upstream", (source) => replaceOnce(source, "    log {", "    servers {\n        trusted_proxies static 0.0.0.0/0\n    }\n    log {")],
+  ["remove canonical XFF", (source) => replaceOnce(source, "        header_up X-Forwarded-For {remote_host}", "")],
+  ["use client-supplied XFF", (source) => replaceOnce(source, "{remote_host}", "{http.request.header.X-Forwarded-For}")],
+  ["append instead of replace XFF", (source) => replaceOnce(source, "header_up X-Forwarded-For", "header_up +X-Forwarded-For")],
+  ["retain X-Real-IP", (source) => replaceOnce(source, "        header_up -X-Real-IP", "")],
+  ["retain Forwarded", (source) => replaceOnce(source, "        header_up -Forwarded", "")],
+  ["change backend destination", (source) => replaceOnce(source, "backend:8000", "other:8000")],
+  ["override forwarded protocol", (source) => replaceOnce(source, "header_up -Forwarded", "header_up -Forwarded\n        header_up X-Forwarded-Proto http")],
+];
+
+for (const [name, mutate] of proxyMutations) {
+  test(`proxy mutation rejected: ${name}`, () => {
+    const changed = mutate(caddySource);
+    assert.notEqual(changed, caddySource);
+    assert.throws(() => inspectConfiguration(changed), { name: "AssertionError" });
   });
 }
 
