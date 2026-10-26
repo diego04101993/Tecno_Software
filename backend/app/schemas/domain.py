@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, EmailStr, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, ModelWrapValidatorHandler, ValidationError, field_validator, model_validator
 
 from app.models.entities import (
     AudioNormalizationStatus,
@@ -958,6 +958,24 @@ class PlayerActivationRequest(BaseModel):
     hardware_id: str = Field(min_length=1, max_length=120)
     device_name: str = Field(min_length=1, max_length=160)
     app_version: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def omit_activation_error_inputs(
+        cls, value: Any, handler: ModelWrapValidatorHandler["PlayerActivationRequest"]
+    ) -> "PlayerActivationRequest":
+        try:
+            return handler(value)
+        except ValidationError as exc:
+            # A missing-field error includes the entire original body, even if
+            # another field's UTF-8 error already sets input=None. Omit input
+            # from EVERY activation error, including nested invalid types, so
+            # FastAPI can serialize all errors without echoing request values.
+            # Preserve locations/types/context; never repair or accept bad input.
+            errors = exc.errors(include_input=False, include_url=False)
+            for error in errors:
+                error["input"] = None
+            raise ValidationError.from_exception_data(cls.__name__, errors) from None
 
     @field_validator("channel_code", "hardware_id", "device_name", "app_version", mode="before")
     @classmethod

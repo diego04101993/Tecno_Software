@@ -28,6 +28,7 @@ from app.schemas.domain import (
     PlayerTimeResponse,
 )
 from app.services.player_runtime import build_player_runtime_from_snapshot, build_server_time_payload
+from app.services.auth_rate_limit import failure_budget
 
 
 router = APIRouter()
@@ -93,8 +94,14 @@ def get_player_time() -> dict[str, object]:
 @router.post("/activate", response_model=PlayerActivationResponse)
 def activate_player(
     payload: PlayerActivationRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> PlayerActivationResponse:
+    with failure_budget(request, "activation", payload.channel_code.strip().upper()):
+        return _activate_player(payload, db)
+
+
+def _activate_player(payload: PlayerActivationRequest, db: Session) -> PlayerActivationResponse:
     channel = _resolve_channel_by_code(db, payload.channel_code)
     current_time = datetime.now(UTC)
     activation_status = "activation_new"

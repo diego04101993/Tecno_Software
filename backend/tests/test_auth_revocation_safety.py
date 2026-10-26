@@ -26,6 +26,7 @@ from app.core.security import create_access_token, decode_access_token, hash_pas
 from app.models.base import Base
 from app.models.entities import Branch, Channel, Client, PlayerDevice, User, UserRole
 from app.services.realtime import ConnectionManager
+from app.services.auth_rate_limit import AuthRateLimiter, AuthRateLimitMiddleware
 
 
 def b64(value: bytes) -> str:
@@ -75,6 +76,16 @@ class AuthRevocationSafetyTests(TestCase):
             self.code = channel.channel_code
         self.token = self.user_token()
         app = FastAPI()  # No app.main, startup, seeds or init_db.
+        app.state.auth_rate_limiter = AuthRateLimiter()
+        app.state.fixture_client_ip = "198.51.100.10"
+        app.add_middleware(AuthRateLimitMiddleware)
+
+        @app.middleware("http")
+        async def fixture_client_ip(request, call_next):
+            # Starlette 0.38 TestClient supplies the non-IP hostname "testclient".
+            request.scope["client"] = (app.state.fixture_client_ip, 12345)
+            return await call_next(request)
+
         for router, prefix in ((auth.router, "auth"), (player.router, "player"), (realtime.router, "realtime")):
             app.include_router(router, prefix="/api/" + prefix)
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -6,6 +6,7 @@ from app.api.deps import get_current_user, get_db
 from app.core.security import create_access_token, verify_password
 from app.models.entities import User
 from app.schemas.auth import LoginRequest, TokenResponse, UserSession
+from app.services.auth_rate_limit import failure_budget
 from app.services.user_admin import assert_user_session_allowed, build_user_session, stamp_last_login
 
 
@@ -13,7 +14,12 @@ router = APIRouter()
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)) -> TokenResponse:
+    with failure_budget(request, "login", payload.email.lower()):
+        return _login(payload, db)
+
+
+def _login(payload: LoginRequest, db: Session) -> TokenResponse:
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")

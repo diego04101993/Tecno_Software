@@ -55,6 +55,13 @@ class MediaPathSafetyTests(TestCase):
         self.db.commit()
         self.user = SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id, branch_id=None)
         app = FastAPI()  # No app.main, startup, seed, network or production settings.
+
+        @app.middleware("http")
+        async def fixture_client_ip(request, call_next):
+            # A numeric test peer is required by the strict R2B IP validation.
+            request.scope["client"] = ("198.51.100.10", 12345)
+            return await call_next(request)
+
         app.include_router(contents.router, prefix="/api/contents")
         app.include_router(content_folders.router, prefix="/api")
         app.include_router(media.router)
