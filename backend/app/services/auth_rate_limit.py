@@ -248,11 +248,11 @@ def failure_budget(request: Request, route: str, identifier: str):
 
 
 class AuthRateLimitMiddleware:
-    """ASGI volume guard before body parsing; unrelated methods/routes pass through."""
+    """Login-only ASGI volume guard before body parsing; other routes pass through."""
     def __init__(self, app, api_prefix="/api"):
         self.app = app
         prefix = api_prefix.rstrip("/")
-        self.paths = {f"{prefix}/auth/login": "login", f"{prefix}/player/activate": "activation"}
+        self.paths = {f"{prefix}/auth/login": "login"}
 
     async def __call__(self, scope, receive, send):
         route = self.paths.get(scope.get("path", "").rstrip("/"))

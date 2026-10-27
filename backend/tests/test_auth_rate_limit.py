@@ -6,6 +6,7 @@ application startup, external HTTP, production credentials or media are used.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from copy import deepcopy
 from itertools import combinations
 import json
@@ -350,7 +351,7 @@ class BudgetTests(unittest.TestCase):
 class MiddlewareTests(unittest.TestCase):
     def test_prebody_guard_slash_variants_and_unrelated_routes(self):
         async def run():
-            for path, capacity in (("/api/auth/login", 60), ("/api/player/activate", 100)):
+            for path, capacity in (("/api/auth/login", 60),):
                 limiter = limits.AuthRateLimiter(clock=Clock())
                 reached = []
                 async def downstream(scope, receive, send):
@@ -375,6 +376,28 @@ class MiddlewareTests(unittest.TestCase):
                                       ("POST", "/api/player/heartbeat")):
                     await middleware(dict(scope, method=method, path=other, client=None), forbidden_receive, send)
                 self.assertEqual(len(reached), capacity + 4)
+        asyncio.run(run())
+
+    def test_activation_bypasses_volume_for_configured_prefixes_and_slashes(self):
+        async def run():
+            for prefix in ("/api", "/qa/v2/", ""):
+                limiter = limits.AuthRateLimiter(clock=Clock())
+                reached = []
+                async def downstream(scope, receive, send):
+                    reached.append(scope["path"])
+                async def forbidden(*_):
+                    self.fail("Pass-through must not read a body or emit a rejection")
+                middleware = limits.AuthRateLimitMiddleware(downstream, api_prefix=prefix)
+                base = prefix.rstrip("/")
+                self.assertEqual(middleware.paths, {base + "/auth/login": "login"})
+                with patch.object(limits, "get_limiter", side_effect=AssertionError("Activation must not access limiter")), \
+                     patch.object(limits, "client_ip", side_effect=AssertionError("Activation must not resolve limiter IP")):
+                    for i in range(200):
+                        path = base + "/player/activate" + ("", "/", "//")[i % 3]
+                        scope = dict(request_for(limiter, ip=None).scope, path=path)
+                        await middleware(scope, forbidden, forbidden)
+                self.assertEqual(len(reached), 200)
+                self.assertEqual(limiter.entry_count, 0)
         asyncio.run(run())
 
     def test_invalid_peer_fails_closed_despite_spoofed_headers(self):
@@ -438,20 +461,45 @@ class RouteTests(unittest.TestCase):
             self.assert_429(self.login(), 12)
         self.assertEqual(self.limiter._buckets[self.limiter._key("login:volume:ip", "198.51.100.10")].debt, 6)
 
-    def test_activation_five_failures_sixth_rejected_before_lookup(self):
-        for _ in range(5):
-            self.assertEqual(self.case.activate(channel_code="MISSING").status_code, 404)
-        with patch.object(player, "_activate_player", side_effect=AssertionError("lookup must not run")):
-            self.assert_429(self.case.activate(channel_code="MISSING"), 12)
+    @contextmanager
+    def activation_without_limiter_activity(self):
+        before = deepcopy(self.limiter._buckets)
+        cleanup, next_log, now = self.limiter._last_cleanup, self.limiter._next_log, self.clock.now
+        with ExitStack() as stack:
+            guards = []
+            for target, names in ((limits, ("get_limiter", "client_ip")),
+                                  (self.limiter, ("take_volume", "reserve", "_admit", "_cleanup", "log_rejection"))):
+                for name in names:
+                    guards.append(stack.enter_context(patch.object(
+                        target, name, side_effect=AssertionError("Activation touched limiter: " + name))))
+            log = stack.enter_context(patch.object(limits.logger, "warning"))
+            yield
+            for guard in guards:
+                guard.assert_not_called()
+            log.assert_not_called()
+        self.assertEqual(self.limiter._buckets, before)
+        self.assertEqual(self.limiter._last_cleanup, cleanup)
+        self.assertEqual(self.limiter._next_log, next_log)
+        self.assertEqual(self.clock.now, now, "Limiter clock must stay frozen throughout activation stress")
+        self.assertFalse(any(ns.startswith("activation:") for ns, _ in self.limiter._buckets))
+
+    def test_activation_200_repeated_404_without_limiter_state(self):
+        with self.activation_without_limiter_activity():
+            statuses = [self.case.activate(channel_code="MISSING").status_code for _ in range(200)]
+        self.assertEqual(statuses, [404] * 200)
+        self.assertEqual(statuses.count(429), 0)
+        self.assertEqual(self.limiter.entry_count, 0)
 
     def test_identifier_distributed_http(self):
-        for route in ("login", "activation"):
-            for i in range(10):
+        for i in range(10):
+            self.case.app.state.fixture_client_ip = f"198.51.100.{i}"
+            self.assertEqual(self.login().status_code, 401)
+        self.case.app.state.fixture_client_ip = "203.0.113.100"
+        self.assert_429(self.login())
+        with self.activation_without_limiter_activity():
+            for i in range(20):
                 self.case.app.state.fixture_client_ip = f"198.51.100.{i}"
-                response = self.login() if route == "login" else self.case.activate(channel_code="MISSING")
-                self.assertEqual(response.status_code, 401 if route == "login" else 404)
-            self.case.app.state.fixture_client_ip = "203.0.113.100"
-            self.assert_429(self.login() if route == "login" else self.case.activate(channel_code="MISSING"))
+                self.assertEqual(self.case.activate(channel_code="MISSING").status_code, 404)
 
     def test_normalization_matches_lookup_without_alias_rewriting(self):
         for email in ("missing@example.com", "MISSING@example.com", "Missing@example.com", "missing@EXAMPLE.COM", "MISSING@EXAMPLE.COM"):
@@ -461,7 +509,7 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.login("mis.sing@example.com").status_code, 401)
         for code in ("missing", " MISSING ", "Missing", "\tmissing\n", "MISSING"):
             self.assertEqual(self.case.activate(channel_code=code).status_code, 404)
-        self.assert_429(self.case.activate(channel_code=" MISSING "))
+        self.assertEqual(self.case.activate(channel_code=" MISSING ").status_code, 404)
 
     def test_pre_threshold_auth_responses_and_disabled_debt(self):
         self.assertEqual(self.login().status_code, 401)
@@ -476,9 +524,11 @@ class RouteTests(unittest.TestCase):
             device = db.query(PlayerDevice).filter_by(channel_id=self.case.chid).one()
             device.is_active = False
             db.commit()
-        for _ in range(5):
-            self.assertEqual(self.case.activate().status_code, 403)
-        self.assert_429(self.case.activate())
+        with self.activation_without_limiter_activity():
+            for _ in range(200):
+                response = self.case.activate()
+                self.assertEqual(response.status_code, 403, response.text)
+                self.assertEqual(response.json(), {"detail": "Player is disabled"})
 
     def test_25_valid_players_same_nat_and_repeat_token(self):
         codes = []
@@ -499,7 +549,63 @@ class RouteTests(unittest.TestCase):
             repeated = self.case.activate(channel_code=codes[0], hardware_id="isolated-nat-0")
             self.assertEqual(repeated.status_code, 200)
             self.assertEqual(repeated.json()["player_token"], tokens[0])
-        self.assertTrue(all(b.debt == 0 and b.pending == 0 for (ns, _), b in self.limiter._buckets.items() if ":failure:" in ns))
+        self.assertEqual(self.limiter.entry_count, 0)
+
+    def test_activation_200_valid_requests_reuse_token_without_limiter_state(self):
+        tokens, statuses = [], []
+        with self.activation_without_limiter_activity():
+            for i in range(200):
+                response = self.case.activate()
+                statuses.append(response.status_code)
+                self.assertEqual(response.status_code, 200, response.text)
+                data = response.json()
+                self.assertEqual(set(data), {"player_token", "channel_id", "client_id", "branch_id", "activation_status"})
+                self.assertEqual(data["activation_status"], "activation_new" if i == 0 else "activation_existing")
+                self.assertEqual((data["channel_id"], data["client_id"], data["branch_id"]),
+                                 (self.case.chid, self.case.cid, self.case.bid))
+                tokens.append(data["player_token"])
+        self.assertEqual(statuses.count(429), 0)
+        self.assertEqual(len(set(tokens)), 1)
+        self.assertEqual(self.limiter.entry_count, 0)
+        with self.case.session() as db:
+            device = db.query(PlayerDevice).filter_by(channel_id=self.case.chid).one()
+            self.assertEqual(device.player_token_hash, player._hash_player_token(tokens[0]))
+            self.assertEqual(device.metadata_json["activation_count"], 200, "Historical business counter stays intact")
+
+    def test_saturated_login_and_full_storage_do_not_affect_activation(self):
+        # Saturate each independent login admission path, including shared storage.
+        for saturation in ("failure", "volume", "storage"):
+            with self.subTest(saturation=saturation):
+                self.limiter = limits.AuthRateLimiter(clock=self.clock, max_entries=1 if saturation == "storage" else 20_000)
+                self.case.app.state.auth_rate_limiter = self.limiter
+                if saturation == "failure":
+                    for _ in range(5):
+                        self.assertEqual(self.login().status_code, 401)
+                elif saturation == "volume":
+                    for _ in range(60):
+                        self.assertEqual(self.http.post("/api/auth/login", json={}).status_code, 422)
+                self.assert_429(self.login())
+                with self.activation_without_limiter_activity():
+                    self.assertEqual(self.case.activate().status_code, 200)
+                    self.assertEqual(self.case.activate(channel_code="MISSING").status_code, 404)
+                    self.assertEqual(self.http.post("/api/player/activate", json={}).status_code, 422)
+                self.assert_429(self.login())
+
+    def test_activation_custom_prefix_and_trailing_slash_real_routes(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        for prefix in ("/api", "/qa/v2"):
+            app = FastAPI()
+            app.state.auth_rate_limiter = self.limiter
+            app.add_middleware(limits.AuthRateLimitMiddleware, api_prefix=prefix + "/")
+            app.include_router(player.router, prefix=prefix + "/player")
+            app.dependency_overrides.update(self.case.app.dependency_overrides)
+            # TestClient's non-IP peer also proves activation does not invoke the IP guard.
+            with TestClient(app) as http, self.activation_without_limiter_activity():
+                for suffix in ("", "/"):
+                    response = http.post(prefix + "/player/activate" + suffix, json=self.activation_payload())
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual([r.status_code for r in response.history], [307] if suffix else [])
 
     def test_successes_count_volume_but_preserve_previous_failures(self):
         for _ in range(4):
@@ -510,10 +616,8 @@ class RouteTests(unittest.TestCase):
         key = self.limiter._key("login:volume:ip", "198.51.100.10")
         self.assertEqual(self.limiter._buckets[key].debt, 10)
 
-    def test_bad_json_schema_and_unicode_volume_only(self):
-        cases = (("/api/auth/login", "{", 60), ("/api/auth/login", "{}", 60),
-                 ("/api/player/activate", "{", 100), ("/api/player/activate", "{}", 100),
-                 ("/api/player/activate", json.dumps({"channel_code": self.case.code, "hardware_id": "qa", "device_name": "bad\ud800", "app_version": "fixture"}), 100))
+    def test_login_bad_json_schema_volume_only(self):
+        cases = (("/api/auth/login", "{", 60), ("/api/auth/login", "{}", 60))
         for path, content, capacity in cases:
             self.limiter = limits.AuthRateLimiter(clock=self.clock)
             self.case.app.state.auth_rate_limiter = self.limiter
@@ -526,6 +630,23 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(self.limiter.entry_count, 1)
             self.clock.advance(0.51)
             self.assertEqual(self.http.post(path, content=content, headers={"Content-Type": "application/json"}).status_code, 422)
+
+    def test_activation_200_repeated_422_per_invalid_payload_without_limiter(self):
+        invalid = self.activation_payload()
+        invalid["device_name"] = "bad\ud800"
+        del invalid["app_version"]
+        for content in ("{", "{}", json.dumps(invalid)):
+            with self.subTest(content=content), self.activation_without_limiter_activity(), \
+                 patch.object(player, "_activate_player", side_effect=AssertionError("No schema bypass")):
+                statuses = []
+                for _ in range(200):
+                    response = self.http.post("/api/player/activate", content=content,
+                                              headers={"Content-Type": "application/json"})
+                    statuses.append(response.status_code)
+                    self.assertEqual(response.status_code, 422, response.text)
+                    json.dumps(response.json(), ensure_ascii=False).encode("utf-8", errors="strict")
+                self.assertEqual(statuses.count(429), 0)
+            self.assertEqual(self.limiter.entry_count, 0)
 
     def assert_activation_errors_serializable(self, payload, expected_errors):
         original = deepcopy(payload)
@@ -562,8 +683,7 @@ class RouteTests(unittest.TestCase):
         finally:
             event.remove(self.case.engine, "before_cursor_execute", record_sql)
         self.assertEqual(payload, original, "Reject the original value; do not repair or mutate it")
-        self.assertEqual(self.limiter.entry_count, 1, "Only the existing volume budget may run")
-        self.assertTrue(all(ns == "activation:volume:ip" for ns, _ in self.limiter._buckets))
+        self.assertEqual(self.limiter.entry_count, 0, "Invalid activation must not consume any limiter state")
 
     def activation_payload(self):
         return {"channel_code": self.case.code, "hardware_id": "sensitive-fixture-hardware",
@@ -645,7 +765,7 @@ class RouteTests(unittest.TestCase):
                     value = f"203.0.113.{i}" if header != "Forwarded" else f"for=203.0.113.{i}"
                     response = (self.login(headers={header: value}) if route == "login" else
                                 self.http.post("/api/player/activate", json={"channel_code": "MISSING", "hardware_id": "qa", "device_name": "QA", "app_version": "fixture"}, headers={header: value}))
-                    if i < 5:
+                    if i < 5 or route == "activation":
                         self.assertEqual(response.status_code, 401 if route == "login" else 404)
                     else:
                         self.assert_429(response)
@@ -694,8 +814,8 @@ class RouteTests(unittest.TestCase):
                 futures = [pool.submit(invoke) for _ in range(20)]
                 try:
                     self.assertTrue(all_attempted.wait(timeout=12))
-                    self.assertEqual(len(admitted), 5)
-                    self.assertEqual(rejected, [429] * 15)
+                    self.assertEqual(len(admitted), 5 if route is auth.login else 20)
+                    self.assertEqual(rejected, [429] * 15 if route is auth.login else [])
                 finally:
                     release.set()
                 for future in futures:

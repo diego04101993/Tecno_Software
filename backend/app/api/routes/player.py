@@ -28,7 +28,6 @@ from app.schemas.domain import (
     PlayerTimeResponse,
 )
 from app.services.player_runtime import build_player_runtime_from_snapshot, build_server_time_payload
-from app.services.auth_rate_limit import failure_budget
 
 
 router = APIRouter()
@@ -97,8 +96,7 @@ def activate_player(
     request: Request,
     db: Session = Depends(get_db),
 ) -> PlayerActivationResponse:
-    with failure_budget(request, "activation", payload.channel_code.strip().upper()):
-        return _activate_player(payload, db)
+    return _activate_player(payload, db)
 
 
 def _activate_player(payload: PlayerActivationRequest, db: Session) -> PlayerActivationResponse:
