@@ -26,10 +26,11 @@ from app.models.entities import (
     ScheduleRecurrence,
     UserRole,
 )
-from app.schemas.common import TimestampedModel
+from app.core.credential_policy import validate_new_password
+from app.schemas.common import SensitiveRequest, TimestampedModel
 
 
-class UserCreate(BaseModel):
+class UserCreate(SensitiveRequest):
     email: EmailStr
     full_name: str
     password: str
@@ -38,13 +39,20 @@ class UserCreate(BaseModel):
     branch_id: str | None = None
     status: Literal["active", "suspended"] = "active"
 
+    _password_policy = field_validator("password")(validate_new_password)
 
-class UserUpdate(BaseModel):
+
+class UserUpdate(SensitiveRequest):
     email: EmailStr | None = None
     full_name: str | None = None
     password: str | None = None
     role: UserRole | None = None
     branch_id: str | None = None
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_change(cls, value: str | None) -> str | None:
+        return None if value is None else validate_new_password(value)
 
 
 class UserStatusUpdate(BaseModel):

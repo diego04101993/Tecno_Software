@@ -42,7 +42,7 @@ const initialForm: ClientFormState = {
   self_managed: true,
   admin_full_name: "",
   admin_email: "",
-  temporary_password: "ChangeMe123!",
+  temporary_password: "",
 };
 
 export function ClientsPage() {
@@ -112,6 +112,12 @@ export function ClientsPage() {
       return;
     }
 
+    const passwordLength = Array.from(form.temporary_password).length;
+    if (form.self_managed &&
+        (passwordLength < 15 || passwordLength > 128 || !form.temporary_password.trim())) {
+      setError("La contrasena debe tener entre 15 y 128 caracteres y no ser solo espacios.");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     setNotice(null);
@@ -479,10 +485,13 @@ export function ClientsPage() {
                   <div className="md:col-span-2">
                     <label className="mb-2 block text-sm font-semibold text-slate-700">Contrasena temporal</label>
                     <input
+                      type="password"
+                      autoComplete="new-password"
                       value={form.temporary_password}
                       onChange={(event) => setForm({ ...form, temporary_password: event.target.value })}
                       required={form.self_managed}
                     />
+                    <p className="mt-1 text-xs text-slate-600">15–128 caracteres. Se permiten frases y espacios.</p>
                   </div>
                 </>
               ) : null}

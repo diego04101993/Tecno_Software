@@ -3,10 +3,10 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field
 
 from app.models.entities import UserRole
-from app.schemas.common import TimestampedModel
+from app.schemas.common import SensitiveRequest, TimestampedModel
 
 
-class LoginRequest(BaseModel):
+class LoginRequest(SensitiveRequest):
     email: EmailStr
     password: str
 

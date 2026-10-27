@@ -36,7 +36,7 @@ CHILD = """
 import json, os, sys, unittest
 from pathlib import Path
 backend = Path.cwd()
-os.environ.update(DATABASE_URL='sqlite://', TEST_DATABASE_URL='', AUTO_SEED='false',
+os.environ.update(APP_ENV='test', DATABASE_URL='sqlite://', TEST_DATABASE_URL='', AUTO_SEED='false',
     MEDIA_ROOT=str(backend/'temporary-media'), PUBLIC_BASE_URL='http://testserver',
     SECRET_KEY='isolated-mutation-fixture-not-a-deployment-secret')
 sys.path[:0] = [str(backend), str(backend/'tests')]

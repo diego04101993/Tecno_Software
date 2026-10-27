@@ -3,11 +3,17 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.core.credential_policy import validate_new_password
 from app.core.security import hash_password
 from app.models.entities import Branch, Campaign, CampaignPlaylistItem, Channel, ChannelConnectionStatus, ChannelMode, Client, ContentItem, ContentType, KioskActionType, KioskButton, KioskScreen, Layout, LayoutTemplate, Orientation, Schedule, ScheduleRecurrence, User, UserRole, Videowall, VideowallNode
 
 
 def seed_initial_data(db: Session) -> None:
+    settings = get_settings()
+    if settings.APP_ENV not in {"development", "test"} or not settings.AUTO_SEED:
+        raise RuntimeError("Seed requires explicit development/test and AUTO_SEED=true.")
+    password = validate_new_password(settings.SEED_PASSWORD)
     existing_admin = db.scalar(select(User).where(User.email == "superadmin@tecnocontrol.com"))
     existing_client = db.scalar(select(Client).where(Client.slug == "demo-retail"))
     if existing_admin:
@@ -17,7 +23,7 @@ def seed_initial_data(db: Session) -> None:
         super_admin = User(
             email="superadmin@tecnocontrol.com",
             full_name="Tecno Control",
-            password_hash=hash_password("ChangeMe123!"),
+            password_hash=hash_password(password),
             role=UserRole.SUPER_ADMIN,
             status="active",
             is_active=True,
@@ -38,7 +44,7 @@ def seed_initial_data(db: Session) -> None:
     super_admin = User(
         email="superadmin@tecnocontrol.com",
         full_name="Tecno Control",
-        password_hash=hash_password("ChangeMe123!"),
+        password_hash=hash_password(password),
         role=UserRole.SUPER_ADMIN,
         status="active",
         is_active=True,
@@ -46,7 +52,7 @@ def seed_initial_data(db: Session) -> None:
     client_admin = User(
         email="demo@demo-retail.com",
         full_name="Demo Retail Admin",
-        password_hash=hash_password("ChangeMe123!"),
+        password_hash=hash_password(password),
         role=UserRole.CLIENT_ADMIN,
         client_id=client.id,
         status="active",

@@ -7,13 +7,22 @@ from urllib.parse import unquote_plus
 
 REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = {
-    "token", "access_token", "player_token", "issued_player_token",
+    "token", "access_token", "player_token", "issued_player_token", "secret_key", "seed_password",
     "authorization", "password", "password_hash", "channel_code", "activation_code",
 }
 _QUERY_VALUE = re.compile(r"([?&])([^=&#\s]+)=([^&#\s\"'<>]*)")
+# Unquoted logfmt/header values end at a new field, an existing punctuation
+# separator, or a line break, not at an ordinary space. Values containing
+# field syntax or separators must be quoted to distinguish them from metadata.
+_FIELD_START = r"(?:[\w.-]+|[\"'][\w.-]+[\"'])[^\S\r\n]*[:=]"
+_UNQUOTED_VALUE = (
+    r"[^\s,;&}\]]+(?:[^\S\r\n]+(?!" + _FIELD_START + r")[^\s,;&}\]]+)*"
+)
 _NAMED_VALUE = re.compile(
     r"(?i)(?<![\w])(" + "|".join(sorted(_SENSITIVE_KEYS, key=len, reverse=True))
-    + r")(\b[\"']?\s*[:=]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|Bearer[ \t]+[^\s,;&}\]]+|[^\s,;&}\]]+)"
+    # Only a quoted value can start on another line (e.g. pretty-printed JSON).
+    + r")(\b[\"']?[^\S\r\n]*[:=](?:\s*(?=[\"'])|[^\S\r\n]*))"
+    + r"(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|" + _UNQUOTED_VALUE + r")"
 )
 _BEARER = re.compile(r"(?i)\bBearer[ \t]+(?!\[REDACTED\])[^\s\"',;<>]+")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")

@@ -13,6 +13,7 @@ def main() -> int:
         # Override inherited configuration BEFORE importing any application module.
         os.environ["DATABASE_URL"] = "sqlite://"
         os.environ["TEST_DATABASE_URL"] = ""
+        os.environ["APP_ENV"] = "test"
         os.environ["AUTO_SEED"] = "false"
         os.environ["MEDIA_ROOT"] = media_root
         os.environ["PUBLIC_BASE_URL"] = "http://testserver"

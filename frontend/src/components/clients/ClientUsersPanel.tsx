@@ -22,7 +22,7 @@ type UserFormState = {
 const defaultForm: UserFormState = {
   full_name: "",
   email: "",
-  password: "ChangeMe123!",
+  password: "",
   role: "client_admin",
   status: "active",
 };
@@ -99,6 +99,12 @@ export function ClientUsersPanel({ clientId, token, clientStatus = "active" }: C
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const passwordLength = Array.from(form.password).length;
+    if ((!editingUserId || form.password !== "") &&
+        (passwordLength < 15 || passwordLength > 128 || !form.password.trim())) {
+      setError("La contrasena debe tener entre 15 y 128 caracteres y no ser solo espacios.");
+      return;
+    }
     setSaving(true);
     setError(null);
 
@@ -210,10 +216,13 @@ export function ClientUsersPanel({ clientId, token, clientStatus = "active" }: C
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">{editingUserId ? "Nueva clave (opcional)" : "Contrasena temporal"}</label>
               <input
+                type="password"
+                autoComplete="new-password"
                 value={form.password}
                 onChange={(event) => setForm({ ...form, password: event.target.value })}
                 required={!editingUserId}
               />
+              <p className="mt-1 text-xs text-slate-600">15–128 caracteres. Se permiten frases y espacios.</p>
             </div>
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Rol</label>

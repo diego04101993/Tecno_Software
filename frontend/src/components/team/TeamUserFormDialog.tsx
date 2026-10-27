@@ -29,7 +29,7 @@ type FormState = {
 const defaultForm: FormState = {
   full_name: "",
   email: "",
-  password: "ChangeMe123!",
+  password: "",
   role: "staff_admin",
   status: "active",
 };
@@ -50,11 +50,13 @@ export function TeamUserFormDialog({
   onSubmit,
 }: TeamUserFormDialogProps) {
   const [form, setForm] = useState<FormState>(defaultForm);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       return;
     }
+    setPasswordError(null);
     if (initialUser) {
       setForm({
         full_name: initialUser.full_name,
@@ -67,6 +69,17 @@ export function TeamUserFormDialog({
     }
     setForm(defaultForm);
   }, [initialUser, open]);
+
+  function handleSubmit() {
+    const passwordLength = Array.from(form.password).length;
+    if ((mode === "create" || form.password !== "") &&
+        (passwordLength < 15 || passwordLength > 128 || !form.password.trim())) {
+      setPasswordError("La contrasena debe tener entre 15 y 128 caracteres y no ser solo espacios.");
+      return;
+    }
+    setPasswordError(null);
+    onSubmit(form);
+  }
 
   if (!open) {
     return null;
@@ -101,7 +114,8 @@ export function TeamUserFormDialog({
           <div className="grid gap-4 md:grid-cols-3">
             <div className="md:col-span-2">
               <label className="mb-2 block text-sm font-semibold text-slate-700">{mode === "create" ? "Contrasena temporal" : "Nueva clave (opcional)"}</label>
-              <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+              <input type="password" autoComplete="new-password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+              <p className="mt-1 text-xs text-slate-600">15–128 caracteres. Se permiten frases y espacios.</p>
             </div>
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Estado</label>
@@ -122,6 +136,7 @@ export function TeamUserFormDialog({
             </select>
           </div>
 
+          {passwordError ? <div role="alert" className="text-sm text-rose-700">{passwordError}</div> : null}
           {errorMessage ? <div className="rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-700">{errorMessage}</div> : null}
 
           <div className="flex justify-end gap-3">
@@ -136,7 +151,7 @@ export function TeamUserFormDialog({
               className="rounded-full bg-ink px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60"
               disabled={isSaving}
               type="button"
-              onClick={() => onSubmit(form)}
+              onClick={handleSubmit}
             >
               {isSaving ? "Guardando..." : mode === "create" ? "Crear usuario" : "Guardar cambios"}
             </button>
