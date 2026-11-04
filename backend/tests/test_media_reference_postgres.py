@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.api.routes import contents
 from app.core.config import get_settings
 from app.models.base import Base
-from app.models.entities import Client, ContentItem, ContentType, UserRole
+from app.models.entities import Client, ContentItem, ContentType, User, UserRole
 from app.schemas.domain import ContentCreate
 from app.services import content_cleanup
 from app.services.media_references import lock_media_paths, media_lock_key, media_reference_operation, save_content_reference
@@ -64,21 +64,24 @@ class PostgreSQLMediaReferenceTests(TestCase):
             db.flush()
             item = ContentItem(client_id=first.id, name="Original", type=ContentType.VIDEO, file_path=self.url)
             db.add(item)
+            db.add_all([User(client_id=client.id, role=UserRole.CLIENT_ADMIN,
+                             email=client.slug + "@example.com", full_name="QA", password_hash="synthetic")
+                        for client in (first, second)])
             db.commit()
             self.item_id, self.client_id, self.other_id = item.id, first.id, second.id
 
-    def user(self, client_id):
-        return SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=client_id, branch_id=None)
+    def user(self, client_id, db):
+        return db.scalar(select(User).where(User.client_id == client_id))
 
     def delete_original(self):
         with Session(self.engine, autoflush=False) as db:
-            contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id))
+            contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id, db))
 
     def create_reference(self):
         with Session(self.engine, autoflush=False) as db:
             try:
                 item = contents.create_content(ContentCreate(name="New", type=ContentType.VIDEO, file_path=self.url),
-                                               db=db, current_user=self.user(self.other_id))
+                                               db=db, current_user=self.user(self.other_id, db))
                 return item.id
             except HTTPException as exc:
                 return exc.status_code, exc.detail
@@ -138,8 +141,8 @@ class PostgreSQLMediaReferenceTests(TestCase):
         def writer():
             with Session(self.engine, autoflush=False) as db, media_reference_operation(db):
                 lock_media_paths(db, [self.path])
-                item_id = contents.create_content(ContentCreate(name="Other tenant", type=ContentType.VIDEO,
-                    file_path=self.url), db=db, current_user=self.user(self.other_id)).id
+                item_id = contents.create_content(ContentCreate(name="Same tenant concurrent reference", type=ContentType.VIDEO,
+                    file_path=self.url), db=db, current_user=self.user(self.client_id, db)).id
                 committed.set()
                 if not proceed.wait(8):
                     raise AssertionError("Timed out waiting for competing deleter")
@@ -159,7 +162,7 @@ class PostgreSQLMediaReferenceTests(TestCase):
         self.assertEqual(self.path.read_bytes(), b"complete fixture")
         with Session(self.engine) as db:
             self.assertIsNone(db.get(ContentItem, self.item_id))
-            self.assertEqual(db.get(ContentItem, new_id).client_id, self.other_id)
+            self.assertEqual(db.get(ContentItem, new_id).client_id, self.client_id)
         self.assert_lock_released()
 
     def test_delete_wins_concurrent_file_path_update_is_rejected(self):
@@ -208,7 +211,7 @@ class PostgreSQLMediaReferenceTests(TestCase):
         with Session(self.engine, autoflush=False) as db, patch.object(db, "commit", side_effect=SQLAlchemyError("fixture")), \
                 patch.object(Path, "unlink") as unlink:
             with self.assertRaises(SQLAlchemyError):
-                contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id))
+                contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id, db))
             unlink.assert_not_called()
         with Session(self.engine) as db:
             self.assertIsNotNone(db.get(ContentItem, self.item_id))
@@ -230,7 +233,7 @@ class PostgreSQLMediaReferenceTests(TestCase):
         with self.engine.connect().execution_options(isolation_level="REPEATABLE READ") as connection:
             with Session(connection, autoflush=False) as db:
                 with self.assertRaises(HTTPException) as caught:
-                    contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id))
+                    contents.delete_content(self.item_id, db=db, current_user=self.user(self.client_id, db))
                 self.assertEqual(caught.exception.detail, "MEDIA_LOCK_REQUIRES_READ_COMMITTED")
         with Session(self.engine) as db:
             self.assertIsNotNone(db.get(ContentItem, self.item_id))

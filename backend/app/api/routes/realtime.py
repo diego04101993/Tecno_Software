@@ -13,6 +13,9 @@ from app.services.realtime import manager
 from app.services.tenancy import is_branch_scoped, require_branch_assignment, require_client_scope
 
 
+from app.services.tenant_responses import read_snapshot, playback_label_for_read
+from app.services.tenant_queries import readable_query
+
 router = APIRouter()
 
 
@@ -23,13 +26,14 @@ WS_REVALIDATION_SECONDS = 30.0
 
 
 @router.get("/presence")
+@read_snapshot()
 def presence(
     client_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
     scoped_client_id = require_client_scope(current_user, client_id or current_user.client_id)
-    query = select(Channel).where(Channel.client_id == scoped_client_id)
+    query = readable_query(select(Channel), Channel, db=db).where(Channel.client_id == scoped_client_id)
     if is_branch_scoped(current_user):
         query = query.where(Channel.branch_id == require_branch_assignment(current_user))
     channels = list(db.scalars(query))
@@ -57,7 +61,7 @@ def _authorize_socket(token: str, room_id: str, *, channel_room: bool) -> int | 
             if role not in GLOBAL_SOCKET_ROLES and user.client_id != room_id:
                 return 4403
         else:
-            channel = db.get(Channel, room_id)
+            channel = db.scalar(readable_query(select(Channel), Channel, db=db).where(Channel.id == room_id))
             if not channel:
                 return 4404
             if role not in CLIENT_SOCKET_ROLES | BRANCH_SOCKET_ROLES:
@@ -98,13 +102,25 @@ async def _serve_socket(websocket: WebSocket, token: str, room_id: str, *, chann
                     await websocket.close(code=1003)
                     return
                 if message.get("type") == "heartbeat":
-                    await manager.broadcast_to_channel(room_id, message)
+                    # Incoming messages are signals, not trusted tenant payloads.
+                    # Rebuild the broadcast under the authorized room's context.
+                    with SessionLocal() as db:
+                        payload = _channel_payload(room_id, db=db)
+                    await manager.broadcast_to_channel(room_id, payload)
             else:
-                await websocket.send_json({"type": "ack", "message": message})
+                await websocket.send_json({"type": "ack"})
     except WebSocketDisconnect:
         pass
     finally:
         manager.disconnect(room, room_id, websocket)
+
+
+@read_snapshot()
+def _channel_payload(room_id: str, db: Session) -> dict:
+    channel = db.scalar(readable_query(select(Channel), Channel, db=db).where(Channel.id == room_id))
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    return manager.heartbeat_payload(channel_id=channel.id, playback=playback_label_for_read(channel, db))
 
 
 @router.websocket("/ws/clients/{client_id}")

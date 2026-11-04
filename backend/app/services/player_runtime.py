@@ -22,6 +22,7 @@ from app.models.entities import (
     Campaign,
     CampaignChannelAssignment,
     CampaignSequenceItem,
+    CampaignPlaylistItem,
     CampaignSequenceItemType,
     Channel,
     ChannelMode,
@@ -36,7 +37,10 @@ from app.models.entities import (
     Videowall,
     VideowallNode,
 )
-from app.services.campaign_sequence import normalize_playback_mode, resolve_effective_sequence_items, sequence_item_zone_key
+from app.services.media_references import content_file_owned
+from app.services.tenant_queries import readable_query
+from app.services.campaign_sequence import normalize_playback_mode, sequence_item_zone_key
+from app.services.tenancy import require_active_channel_tenant, safe_tenant_resource
 from app.services.device_outputs import serialize_runtime_device, serialize_runtime_output
 from app.services.layout_bindings import build_layout_data_preview
 from app.services.layout_editor import build_layout_preview_state, get_current_draft_revision, get_current_published_revision
@@ -105,6 +109,9 @@ def serialize_branch(branch: Branch) -> dict[str, object]:
 
 def serialize_channel(channel: Channel) -> dict[str, object]:
     presence = build_presence_snapshot(channel.last_heartbeat_at)
+    from sqlalchemy.orm import object_session
+    from app.services.tenant_responses import playback_label_for_read
+    db = object_session(channel)
     return {
         "id": channel.id,
         "client_id": channel.client_id,
@@ -122,7 +129,7 @@ def serialize_channel(channel: Channel) -> dict[str, object]:
         "status": presence["status"],
         "is_online": presence["is_online"],
         "heartbeat_age_seconds": presence["heartbeat_age_seconds"],
-        "current_playback": channel.current_playback,
+        "current_playback": playback_label_for_read(channel, db) if db is not None else None,
         "hardware_identifier": channel.hardware_identifier,
         "expanded_outputs": channel.expanded_outputs,
         "output_mapping_json": normalize_output_mapping(
@@ -205,7 +212,7 @@ def _is_schedule_active(schedule: Schedule, current_time: datetime) -> bool:
 def _resolve_active_schedule(channel: Channel, db: Session) -> Schedule | None:
     candidate_schedules = list(
         db.scalars(
-            select(Schedule)
+            readable_query(select(Schedule), Schedule, db=db, profile="RUNTIME")
             .where(
                 Schedule.client_id == channel.client_id,
                 or_(
@@ -216,7 +223,7 @@ def _resolve_active_schedule(channel: Channel, db: Session) -> Schedule | None:
             .order_by(Schedule.priority.desc(), Schedule.created_at.desc())
         )
     )
-    active_schedules = [schedule for schedule in candidate_schedules if _is_schedule_active(schedule, now_utc())]
+    active_schedules = [schedule for schedule in candidate_schedules if _is_schedule_active(schedule, now_utc()) and _safe_schedule(schedule, channel, db)]
     if not active_schedules:
         return None
 
@@ -235,7 +242,7 @@ def _resolve_active_assignments(channel: Channel, db: Session) -> list[CampaignC
     current_time = now_utc()
     assignments = list(
         db.scalars(
-            select(CampaignChannelAssignment)
+            readable_query(select(CampaignChannelAssignment), CampaignChannelAssignment, db=db, profile="RUNTIME")
             .where(CampaignChannelAssignment.channel_id == channel.id)
             .order_by(CampaignChannelAssignment.priority.desc(), CampaignChannelAssignment.created_at.desc())
         )
@@ -250,6 +257,55 @@ def _resolve_active_assignments(channel: Channel, db: Session) -> list[CampaignC
     return resolved
 
 
+def _safe_layout_id(db: Session, layout_id: str | None, client_id: str) -> str | None:
+    layout = safe_tenant_resource(db, Layout, layout_id, client_id)
+    return layout.id if layout else None
+
+
+def _runtime_content(db: Session, content_id: str, client_id: str):
+    content = safe_tenant_resource(db, ContentItem, content_id, client_id)
+    return content if content and content_file_owned(db, content) else None
+
+
+def _runtime_output_allowed(db: Session, channel_id: str, client_id: str) -> bool:
+    channel = safe_tenant_resource(db, Channel, channel_id, client_id)
+    try:
+        require_active_channel_tenant(channel, db)
+    except HTTPException:
+        return False
+    return channel is not None
+
+
+def _runtime_sequence_items(campaign_id: str, db: Session) -> list[CampaignSequenceItem]:
+    # Legacy fallback is transient: runtime must never repair historical rows.
+    items = list(db.scalars(select(CampaignSequenceItem).where(
+        CampaignSequenceItem.campaign_id == campaign_id).order_by(
+        CampaignSequenceItem.sort_order, CampaignSequenceItem.created_at)))
+    if not items:
+        items = [CampaignSequenceItem(
+            id=item.id, campaign_id=item.campaign_id, content_id=item.content_id,
+            item_type=CampaignSequenceItemType.CONTENT, sort_order=item.sort_order,
+            duration_seconds=item.duration_seconds, options_json={"zone_key": item.zone_key},
+            is_enabled=True, created_at=item.created_at, updated_at=item.updated_at,
+        ) for item in db.scalars(select(CampaignPlaylistItem).where(
+            CampaignPlaylistItem.campaign_id == campaign_id).order_by(
+            CampaignPlaylistItem.sort_order, CampaignPlaylistItem.created_at))]
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None or not campaign.is_active:
+        return []
+    return [item for item in items if item.is_enabled
+            and (not item.content_id or _runtime_content(db, item.content_id, campaign.client_id))
+            and (not item.layout_id or safe_tenant_resource(db, Layout, item.layout_id, campaign.client_id))]
+
+
+def _safe_schedule(schedule: Schedule, channel: Channel, db: Session) -> bool:
+    return (schedule.client_id == channel.client_id
+            and bool(safe_tenant_resource(db, Campaign, schedule.campaign_id, channel.client_id))
+            and (not schedule.branch_id or bool(safe_tenant_resource(db, Branch, schedule.branch_id, channel.client_id)))
+            and (not schedule.channel_id or bool(safe_tenant_resource(db, Channel, schedule.channel_id, channel.client_id)))
+            and (not schedule.layout_id or bool(safe_tenant_resource(db, Layout, schedule.layout_id, channel.client_id))))
+
+
 def _resolve_runtime_campaigns(
     channel: Channel,
     db: Session,
@@ -262,17 +318,17 @@ def _resolve_runtime_campaigns(
     primary_campaign: Campaign | None = None
 
     if active_schedule:
-        schedule_campaign = db.get(Campaign, active_schedule.campaign_id)
+        schedule_campaign = safe_tenant_resource(db, Campaign, active_schedule.campaign_id, channel.client_id)
         if schedule_campaign:
             primary_campaign = schedule_campaign
             seen_campaign_ids.add(schedule_campaign.id)
-            playlist_count = len(resolve_effective_sequence_items(schedule_campaign.id, db))
+            playlist_count = len(_runtime_sequence_items(schedule_campaign.id, db))
             campaigns_payload.append(
                 {
                     "campaign_id": schedule_campaign.id,
                     "name": schedule_campaign.name,
                     "description": schedule_campaign.description,
-                    "layout_id": schedule_campaign.layout_id,
+                    "layout_id": _safe_layout_id(db, schedule_campaign.layout_id, channel.client_id),
                     "source": "schedule",
                     "priority": active_schedule.priority,
                     "playlist_items_count": playlist_count,
@@ -281,19 +337,19 @@ def _resolve_runtime_campaigns(
             )
 
     for assignment in active_assignments:
-        campaign = db.get(Campaign, assignment.campaign_id)
+        campaign = safe_tenant_resource(db, Campaign, assignment.campaign_id, channel.client_id)
         if not campaign or campaign.id in seen_campaign_ids:
             continue
         if primary_campaign is None:
             primary_campaign = campaign
         seen_campaign_ids.add(campaign.id)
-        playlist_count = len(resolve_effective_sequence_items(campaign.id, db))
+        playlist_count = len(_runtime_sequence_items(campaign.id, db))
         campaigns_payload.append(
             {
                 "campaign_id": campaign.id,
                 "name": campaign.name,
                 "description": campaign.description,
-                "layout_id": campaign.layout_id,
+                "layout_id": _safe_layout_id(db, campaign.layout_id, campaign.client_id),
                 "source": "assignment",
                 "priority": assignment.priority,
                 "playlist_items_count": playlist_count,
@@ -342,9 +398,9 @@ def _build_sequence_runtime(
     if not campaign:
         return [], [], []
 
-    sequence_items = resolve_effective_sequence_items(campaign.id, db)
-    contents = {item.content_id: db.get(ContentItem, item.content_id) for item in sequence_items if item.content_id}
-    layouts = {item.layout_id: db.get(Layout, item.layout_id) for item in sequence_items if item.layout_id}
+    sequence_items = _runtime_sequence_items(campaign.id, db)
+    contents = {item.content_id: _runtime_content(db, item.content_id, campaign.client_id) for item in sequence_items if item.content_id}
+    layouts = {item.layout_id: safe_tenant_resource(db, Layout, item.layout_id, campaign.client_id) for item in sequence_items if item.layout_id}
     serialized_contents: list[dict[str, object]] = []
     seen_content_ids: set[str] = set()
 
@@ -408,10 +464,10 @@ def _resolve_layout_runtime(layout: Layout | None, db: Session) -> tuple[dict[st
             "is_default": layout.is_default,
         }, None, None
 
-    preview_state = selected_revision.preview_state_json or build_layout_preview_state(layout, selected_revision.editor_state_json, db)
+    preview_state = build_layout_preview_state(layout, selected_revision.editor_state_json, db)
     bindings = list(
         db.scalars(
-            select(LayoutDataBinding)
+            readable_query(select(LayoutDataBinding), LayoutDataBinding, db=db, profile="RUNTIME")
             .where(LayoutDataBinding.layout_id == layout.id, LayoutDataBinding.is_active.is_(True))
             .order_by(LayoutDataBinding.sort_order.asc(), LayoutDataBinding.created_at.asc())
         )
@@ -442,11 +498,12 @@ def _resolve_layout_runtime(layout: Layout | None, db: Session) -> tuple[dict[st
 
 
 def _resolve_videowall_runtime(channel: Channel, db: Session) -> dict[str, object]:
-    node = db.scalar(select(VideowallNode).where(VideowallNode.channel_id == channel.id))
+    node = db.scalar(readable_query(select(VideowallNode), VideowallNode, db=db, profile="RUNTIME").where(VideowallNode.channel_id == channel.id))
     if not node:
         hardware_videowall = db.scalar(
-            select(Videowall)
+            readable_query(select(Videowall), Videowall, db=db, profile="RUNTIME")
             .where(
+                Videowall.client_id == channel.client_id,
                 Videowall.primary_channel_id == channel.id,
                 Videowall.render_mode == "hardware-single-input",
             )
@@ -471,7 +528,7 @@ def _resolve_videowall_runtime(channel: Channel, db: Session) -> dict[str, objec
             "node": None,
         }
 
-    videowall = db.get(Videowall, node.videowall_id)
+    videowall = safe_tenant_resource(db, Videowall, node.videowall_id, channel.client_id)
     if not videowall:
         return {"enabled": False}
 
@@ -528,7 +585,7 @@ def _resolve_videowall_runtime(channel: Channel, db: Session) -> dict[str, objec
 
 
 def _build_audio_playlist_payload(playlist: AudioPlaylist | None, db: Session, base_url: str) -> dict[str, object] | None:
-    if not playlist:
+    if not playlist or not playlist.is_active:
         return None
 
     items = list(
@@ -538,7 +595,7 @@ def _build_audio_playlist_payload(playlist: AudioPlaylist | None, db: Session, b
             .order_by(AudioPlaylistItem.sort_order.asc())
         )
     )
-    contents = {item.content_id: db.get(ContentItem, item.content_id) for item in items}
+    contents = {item.content_id: _runtime_content(db, item.content_id, playlist.client_id) for item in items}
 
     return {
         "id": playlist.id,
@@ -554,25 +611,42 @@ def _build_audio_playlist_payload(playlist: AudioPlaylist | None, db: Session, b
                 "is_enabled": item.is_enabled,
                 "content": serialize_content(contents[item.content_id], base_url) if contents.get(item.content_id) else None,
             }
-            for item in items
+            for item in items if contents.get(item.content_id)
         ],
     }
 
 
+def _audio_assignment_allowed(assignment: AudioAssignment, channel: Channel, db: Session) -> bool:
+    if assignment.client_id != channel.client_id:
+        return False
+    if assignment.channel_id is not None and assignment.channel_id != channel.id:
+        return False
+    if assignment.branch_id is not None:
+        if (assignment.branch_id != channel.branch_id
+                or not safe_tenant_resource(db, Branch, assignment.branch_id, channel.client_id)):
+            return False
+    playlist_ids = [value for value in (assignment.music_playlist_id, assignment.spot_playlist_id) if value]
+    return bool(playlist_ids) and all(safe_tenant_resource(db, AudioPlaylist, value, channel.client_id)
+                                     for value in playlist_ids)
+
+
 def _resolve_audio_runtime(channel: Channel, db: Session, base_url: str) -> dict[str, object] | None:
-    channel_assignment = db.scalar(select(AudioAssignment).where(AudioAssignment.channel_id == channel.id))
-    branch_assignment = db.scalar(
-        select(AudioAssignment).where(
+    channel_assignment = next((item for item in db.scalars(readable_query(select(AudioAssignment), AudioAssignment, db=db, profile="RUNTIME").where(
+        AudioAssignment.channel_id == channel.id, AudioAssignment.client_id == channel.client_id))
+        if _audio_assignment_allowed(item, channel, db)), None)
+    branch_assignment = next((item for item in db.scalars(
+        readable_query(select(AudioAssignment), AudioAssignment, db=db, profile="RUNTIME").where(
+            AudioAssignment.client_id == channel.client_id,
             AudioAssignment.branch_id == channel.branch_id,
             AudioAssignment.channel_id.is_(None),
-        )
-    )
+        ).order_by(AudioAssignment.created_at.desc(), AudioAssignment.id)
+    ) if _audio_assignment_allowed(item, channel, db)), None)
     assignment = channel_assignment or branch_assignment
     if not assignment:
         return None
 
-    music_playlist = db.get(AudioPlaylist, assignment.music_playlist_id) if assignment.music_playlist_id else None
-    spot_playlist = db.get(AudioPlaylist, assignment.spot_playlist_id) if assignment.spot_playlist_id else None
+    music_playlist = safe_tenant_resource(db, AudioPlaylist, assignment.music_playlist_id, channel.client_id)
+    spot_playlist = safe_tenant_resource(db, AudioPlaylist, assignment.spot_playlist_id, channel.client_id)
 
     return {
         "assignment_scope": "channel" if channel_assignment else "branch",
@@ -595,21 +669,25 @@ def _resolve_audio_runtime(channel: Channel, db: Session, base_url: str) -> dict
 
 def _resolve_touch_runtime(channel: Channel, db: Session) -> dict[str, object] | None:
     assignment = db.scalar(
-        select(TouchExperienceAssignment)
+        readable_query(select(TouchExperienceAssignment), TouchExperienceAssignment, db=db)
         .where(
+            TouchExperienceAssignment.client_id == channel.client_id,
             TouchExperienceAssignment.channel_id == channel.id,
             TouchExperienceAssignment.is_active.is_(True),
+            TouchExperienceAssignment.experience_id.in_(select(TouchExperience.id).where(TouchExperience.is_active.is_(True))),
         )
         .order_by(TouchExperienceAssignment.sort_order.asc(), TouchExperienceAssignment.created_at.asc())
     )
     assignment_scope = "channel"
     if not assignment:
         assignment = db.scalar(
-            select(TouchExperienceAssignment)
+            readable_query(select(TouchExperienceAssignment), TouchExperienceAssignment, db=db)
             .where(
+                TouchExperienceAssignment.client_id == channel.client_id,
                 TouchExperienceAssignment.branch_id == channel.branch_id,
                 TouchExperienceAssignment.channel_id.is_(None),
                 TouchExperienceAssignment.is_active.is_(True),
+                TouchExperienceAssignment.experience_id.in_(select(TouchExperience.id).where(TouchExperience.is_active.is_(True))),
             )
             .order_by(TouchExperienceAssignment.sort_order.asc(), TouchExperienceAssignment.created_at.asc())
         )
@@ -618,7 +696,7 @@ def _resolve_touch_runtime(channel: Channel, db: Session) -> dict[str, object] |
     if not assignment:
         return None
 
-    experience = db.get(TouchExperience, assignment.experience_id)
+    experience = safe_tenant_resource(db, TouchExperience, assignment.experience_id, channel.client_id)
     if not experience:
         return None
 
@@ -668,9 +746,9 @@ def build_campaign_sequence_preview_payload(
 ) -> dict[str, object]:
     generated_at = now_utc()
     playback_mode = normalize_playback_mode(campaign.playback_mode)
-    sequence_models = resolve_effective_sequence_items(campaign.id, db)
+    sequence_models = _runtime_sequence_items(campaign.id, db)
     sequence_payload, playlist_payload, contents_payload = _build_sequence_runtime(campaign, db, base_url)
-    campaign_layout = db.get(Layout, campaign.layout_id) if campaign.layout_id else None
+    campaign_layout = safe_tenant_resource(db, Layout, campaign.layout_id, campaign.client_id)
     campaign_layout_payload = _serialize_runtime_layout_item(campaign_layout)
     sequence_model_by_id = {item.id: item for item in sequence_models}
 
@@ -701,7 +779,7 @@ def build_campaign_sequence_preview_payload(
             "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
             "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
             "client_id": campaign.client_id,
-            "layout_id": campaign.layout_id,
+            "layout_id": _safe_layout_id(db, campaign.layout_id, campaign.client_id),
             "name": campaign.name,
             "description": campaign.description,
             "default_duration_seconds": campaign.default_duration_seconds,
@@ -746,19 +824,27 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
     generated_at = now_utc()
     play_at_timestamp = int((generated_at + timedelta(milliseconds=SYNC_LEAD_MS)).timestamp() * 1000)
 
+    require_active_channel_tenant(channel, db)
+    from app.services.media_references import read_payload_media_owned, MediaReadContext
+    if not read_payload_media_owned(db, channel.client_id,
+                                    [channel.expanded_outputs, channel.output_mapping_json], context=MediaReadContext.STRUCTURED):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Player operation unavailable")
     client = db.get(Client, channel.client_id)
     branch = db.get(Branch, channel.branch_id)
     schedule_current, campaigns_payload, primary_campaign = _resolve_runtime_campaigns(channel, db)
     sequence_payload, playlist_payload, contents_payload = _build_sequence_runtime(primary_campaign, db, base_url)
 
     resolved_layout_id = (schedule_current.layout_id if schedule_current else None) or (primary_campaign.layout_id if primary_campaign else None)
-    layout = db.get(Layout, resolved_layout_id) if resolved_layout_id else None
+    layout = safe_tenant_resource(db, Layout, resolved_layout_id, channel.client_id)
     layout_payload, layout_revision_payload, dataset_runtime_data = _resolve_layout_runtime(layout, db)
 
     videowall_payload = _resolve_videowall_runtime(channel, db)
     audio_payload = _resolve_audio_runtime(channel, db, base_url)
     touch_payload = _resolve_touch_runtime(channel, db)
     output_mapping_payload = _resolve_output_mapping(channel)
+    outputs = [output for output in channel.device_outputs if output.enabled
+               and output.root_channel_id == channel.id
+               and _runtime_output_allowed(db, output.channel_id, channel.client_id)]
 
     effective_mode = channel.mode.value
     if channel.mode == ChannelMode.TOUCH:
@@ -788,6 +874,9 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
                 channel, db, base_url, primary_campaign, generated_at,
                 unknown_runtime_media=bool(audio_payload or touch_payload),
             )
+            if any(not _runtime_content(db, asset["content_id"], channel.client_id)
+                   for asset in media_retention["assets"]):
+                media_retention = incomplete_retention(channel.id, generated_at, "unsafe_media_ownership")
         except RetentionIncomplete as error:
             media_retention = incomplete_retention(channel.id, generated_at, error.reason)
         except Exception:
@@ -802,7 +891,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
         "server_time": generated_at.isoformat(),
         "play_at_timestamp": play_at_timestamp,
         "channel": serialize_channel(channel),
-        "device": serialize_runtime_device(channel),
+        "device": serialize_runtime_device(channel, eligible_outputs=outputs),
         "branch": serialize_branch(branch) if branch else None,
         "client": serialize_client(client) if client else None,
         "mode": effective_mode,
@@ -816,7 +905,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
         "layout_runtime_snapshot": layout_revision_payload,
         "dataset_runtime_data": dataset_runtime_data,
         "videowall": videowall_payload,
-        "outputs": [serialize_runtime_output(output) for output in channel.device_outputs if output.enabled],
+        "outputs": [serialize_runtime_output(output) for output in outputs],
         "output_mapping": output_mapping_payload,
         "audio": audio_payload,
         "touch": touch_payload,
@@ -829,24 +918,18 @@ def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: 
     """Read selection and retention under one PostgreSQL MVCC snapshot."""
     expected_client_id, expected_branch_id = channel.client_id, channel.branch_id
 
-    def fallback() -> dict[str, object]:
-        try:
-            db.refresh(channel)
-        except Exception as error:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from error
-        if channel.client_id != expected_client_id or channel.branch_id != expected_branch_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
-        return build_player_runtime_config(channel, db, base_url)
-
     bind = db.get_bind()
     if bind.dialect.name != "postgresql":
         return build_player_runtime_config(channel, db, base_url)
     try:
-        with bind.connect().execution_options(isolation_level="REPEATABLE READ") as connection:
+        with getattr(bind, "engine", bind).connect().execution_options(isolation_level="REPEATABLE READ") as connection:
+            from sqlalchemy import text
+            connection.execute(text("SET TRANSACTION READ ONLY"))
             with Session(bind=connection, autoflush=False) as snapshot_db:
+                snapshot_db.info["a9_snapshot"] = True
                 snapshot_channel = snapshot_db.get(Channel, channel.id)
                 if snapshot_channel is None:
-                    return fallback()
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
                 if snapshot_channel.client_id != expected_client_id or snapshot_channel.branch_id != expected_branch_id:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
                 return build_player_runtime_config(snapshot_channel, snapshot_db, base_url, snapshot_coherent=True)
@@ -854,4 +937,5 @@ def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: 
         raise
     except Exception:
         logger.exception("Could not create coherent runtime snapshot for channel %s", channel.id)
-        return fallback()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Runtime snapshot unavailable")

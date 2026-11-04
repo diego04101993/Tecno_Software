@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +19,13 @@ from app.services.tenancy import (
     require_client_scope,
 )
 
+
+from app.services.tenant_mutations import delete_guard, write_guard, MutationIntent
+from app.services.tenant_ownership import RowRef
+
+
+from app.services.tenant_responses import read_snapshot
+from app.services.tenant_queries import readable_query
 
 router = APIRouter()
 
@@ -46,13 +55,14 @@ def _ensure_folder_name_available(
 
 
 @router.get("/content-folders", response_model=list[ContentFolderRead])
+@read_snapshot(response_model=list[ContentFolderRead])
 def list_content_folders(
     client_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[ContentFolder]:
     query = apply_client_filter(
-        select(ContentFolder).order_by(ContentFolder.sort_order.asc(), ContentFolder.created_at.asc()),
+        readable_query(select(ContentFolder), ContentFolder, db=db).order_by(ContentFolder.sort_order.asc(), ContentFolder.created_at.asc()),
         ContentFolder,
         current_user,
     )
@@ -63,6 +73,7 @@ def list_content_folders(
 
 
 @router.get("/content-folders/{folder_id}/delete-impact", response_model=ContentFolderDeleteImpactRead)
+@read_snapshot(response_model=ContentFolderDeleteImpactRead)
 def get_content_folder_delete_impact(
     folder_id: str,
     db: Session = Depends(get_db),
@@ -97,21 +108,26 @@ def create_content_folder(
 
     _ensure_folder_name_available(db, client_id=client_id, parent_id=parent_id, name=name)
 
-    folder = ContentFolder(
+    values = dict(
         client_id=client_id,
         parent_id=parent_id,
         name=name,
         sort_order=payload.sort_order,
         is_active=True,
     )
-    db.add(folder)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ya existe una carpeta con ese nombre en este nivel") from exc
-    db.refresh(folder)
-    return folder
+    ref = RowRef("ContentFolder", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=client_id, operation="create_content_folder", intents=(intent,)):
+        _ensure_folder_name_available(db, client_id=client_id, parent_id=parent_id, name=name)
+        folder = ContentFolder(id=ref.identity, **values)
+        db.add(folder)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ya existe una carpeta con ese nombre en este nivel") from exc
+        db.refresh(folder)
+        return folder
 
 
 @router.patch("/content-folders/{folder_id}", response_model=ContentFolderRead)
@@ -137,15 +153,19 @@ def rename_content_folder(
         exclude_folder_id=folder.id,
     )
 
-    folder.name = name
-    db.add(folder)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ya existe una carpeta con ese nombre en este nivel") from exc
-    db.refresh(folder)
-    return folder
+    intent = MutationIntent("UPDATE", RowRef("ContentFolder", folder.id), (("name", name),))
+    with write_guard(db, actor=current_user, client_id=folder.client_id, operation="rename_content_folder", intents=(intent,)):
+        _ensure_folder_name_available(db, client_id=folder.client_id, parent_id=folder.parent_id,
+                                      name=name, exclude_folder_id=folder.id)
+        folder.name = name
+        db.add(folder)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ya existe una carpeta con ese nombre en este nivel") from exc
+        db.refresh(folder)
+        return folder
 
 
 @router.delete("/content-folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -159,21 +179,22 @@ def delete_content_folder(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete content folders")
 
     folder = get_content_folder_in_scope(db, folder_id, current_user)
-    if cascade:
-        try:
-            with media_reference_operation(db):
-                delete_result = delete_folder_tree(folder, db)
-                db.commit()
-                cleanup_files(delete_result["file_paths"], db)
-        except MediaPathError as exc:
-            db.rollback()
-            raise HTTPException(status_code=409, detail=exc.code) from exc
-        return
+    with delete_guard(db, (folder,), actor=current_user, operation="delete_content_folder"):
+        if cascade:
+            try:
+                with media_reference_operation(db):
+                    delete_result = delete_folder_tree(folder, db)
+                    db.commit()
+                    cleanup_files(delete_result["file_paths"], db)
+            except MediaPathError as exc:
+                db.rollback()
+                raise HTTPException(status_code=409, detail=exc.code) from exc
+            return
 
-    if db.scalar(select(ContentFolder.id).where(ContentFolder.parent_id == folder.id).limit(1)):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La carpeta todavía tiene subcarpetas")
-    if db.scalar(select(ContentItem.id).where(ContentItem.folder_id == folder.id).limit(1)):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La carpeta todavía tiene contenidos")
+        if db.scalar(select(ContentFolder.id).where(ContentFolder.parent_id == folder.id).limit(1)):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La carpeta todavía tiene subcarpetas")
+        if db.scalar(select(ContentItem.id).where(ContentItem.folder_id == folder.id).limit(1)):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La carpeta todavía tiene contenidos")
 
-    db.delete(folder)
-    db.commit()
+        db.delete(folder)
+        db.commit()

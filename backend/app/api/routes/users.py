@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -23,7 +25,12 @@ from app.services.user_admin import (
     ensure_client_user_role,
     ensure_team_user_role,
 )
+from app.services.tenant_mutations import MutationIntent, write_guard
+from app.services.tenant_ownership import RowRef
 
+
+from app.services.tenant_responses import read_snapshot
+from app.services.tenant_queries import readable_query
 
 router = APIRouter()
 
@@ -47,6 +54,7 @@ def _validate_branch(role: UserRole, branch_id: str | None, client_id: str, db: 
 
 
 @router.get("/", response_model=list[UserRead])
+@read_snapshot(response_model=list[UserRead])
 def list_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -54,7 +62,7 @@ def list_users(
     if is_branch_scoped(current_user) or current_user.role in {UserRole.CLIENT_OPERATOR, UserRole.STAFF_OPERATOR}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to view users")
 
-    query = select(User).order_by(User.created_at.desc())
+    query = readable_query(select(User), User, db=db).order_by(User.created_at.desc())
     if can_access_all_clients(current_user):
         if not is_super_admin(current_user):
             query = query.where(User.client_id.is_not(None))
@@ -77,7 +85,7 @@ def create_user(
         if not can_manage_internal_team(current_user):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only super admin can create internal team users")
         ensure_team_user_role(payload.role)
-        user = User(
+        values = dict(
             email=email,
             full_name=payload.full_name.strip(),
             password_hash=hash_password(payload.password),
@@ -87,10 +95,15 @@ def create_user(
             status=payload.status,
             is_active=payload.status == ACTIVE_USER_STATUS,
         )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return build_user_read(user)
+        ref = RowRef("User", str(uuid4()))
+        intent = MutationIntent("CREATE", ref, tuple(values.items()))
+        with write_guard(db, actor=current_user, client_id=None, operation="create_user", intents=(intent,)):
+            _assert_unique_user_email(db, email)
+            user = User(id=ref.identity, **values)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            return build_user_read(user)
 
     if not can_manage_client_users(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to create client users")
@@ -100,7 +113,7 @@ def create_user(
     if not can_manage_clients_directory(current_user) and payload.role not in {UserRole.CLIENT, UserRole.CLIENT_ADMIN, UserRole.CLIENT_OPERATOR}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only global admins can create branch-scoped users")
 
-    user = User(
+    values = dict(
         email=email,
         full_name=payload.full_name.strip(),
         password_hash=hash_password(payload.password),
@@ -110,7 +123,12 @@ def create_user(
         status=payload.status,
         is_active=payload.status == ACTIVE_USER_STATUS,
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return build_user_read(user)
+    ref = RowRef("User", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=client_id, operation="create_user", intents=(intent,)):
+        _assert_unique_user_email(db, email)
+        user = User(id=ref.identity, **values)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return build_user_read(user)

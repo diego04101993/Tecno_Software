@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 from app.models.entities import Channel, ChannelMode, DeviceMode, DeviceOutput, DeviceOutputOrientation, Orientation
 
 
@@ -201,8 +203,38 @@ def build_device_output_definitions(channel: Channel) -> list[dict[str, object]]
     return definitions
 
 
-def sync_channel_device_outputs(channel: Channel) -> None:
-    definitions = build_device_output_definitions(channel)
+def plan_device_outputs(channel, *, rebuild: bool, rotation: int | None = None):
+    """Pure copied definitions and stable identities; no ORM setter or SQL.
+
+    The caller supplies a plain proposed channel snapshot, validates the entire
+    batch, and only then passes these definitions to the existing synchronizer.
+    """
+    existing = {output.display_order: output for output in channel.device_outputs or []}
+    if not rebuild and rotation is None:
+        return None
+    if rebuild or not existing:
+        definitions = build_device_output_definitions(channel)
+        for definition in definitions:
+            previous = existing.get(definition["display_order"])
+            definition["id"] = previous.id if previous else str(uuid4())
+            if previous:
+                if previous.display_uid and definition["display_uid"] is None:
+                    definition["display_uid"] = previous.display_uid
+                if channel.device_mode == DeviceMode.INDEPENDENT and previous.channel_id and previous.channel_id != channel.id:
+                    definition["channel_id"] = previous.channel_id
+    else:
+        definitions = [dict(vars(output)) for output in channel.device_outputs]
+    if rotation is not None:
+        primary = next((definition for definition in definitions if definition["display_order"] == 0), None)
+        if primary is None:
+            from app.services.tenant_relations import conflict
+            raise conflict()
+        primary["rotation"] = rotation
+    return definitions
+
+
+def sync_channel_device_outputs(channel: Channel, *, definitions=None) -> None:
+    definitions = build_device_output_definitions(channel) if definitions is None else definitions
     existing_by_order = {output.display_order: output for output in list(channel.device_outputs or [])}
     next_outputs: list[DeviceOutput] = []
 
@@ -210,7 +242,7 @@ def sync_channel_device_outputs(channel: Channel) -> None:
         display_order = int(definition["display_order"])
         output = existing_by_order.pop(display_order, None)
         if output is None:
-            output = DeviceOutput(root_channel_id=channel.id)
+            output = DeviceOutput(root_channel_id=channel.id, **({"id": definition["id"]} if "id" in definition else {}))
         for field, value in definition.items():
             if field == "display_uid" and value is None and output.display_uid:
                 continue
@@ -227,8 +259,10 @@ def sync_channel_device_outputs(channel: Channel) -> None:
     channel.device_outputs = next_outputs
 
 
-def serialize_runtime_device(channel: Channel) -> dict[str, object]:
+def serialize_runtime_device(channel: Channel, *, eligible_outputs=None) -> dict[str, object]:
     expected_outputs = len([output for output in channel.device_outputs if output.enabled]) or channel.screen_count or 1
+    if eligible_outputs is not None and any(output.enabled for output in channel.device_outputs):
+        expected_outputs = len(eligible_outputs)
     return {
         "mode": channel.device_mode.value,
         "canvas_width": channel.canvas_width,

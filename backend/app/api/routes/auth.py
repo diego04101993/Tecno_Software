@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -7,8 +9,12 @@ from app.core.security import create_access_token, verify_password
 from app.models.entities import User
 from app.schemas.auth import LoginRequest, TokenResponse, UserSession
 from app.services.auth_rate_limit import failure_budget
-from app.services.user_admin import assert_user_session_allowed, build_user_session, stamp_last_login
+from app.services.user_admin import assert_user_session_allowed, build_user_session
+from app.services.tenant_mutations import MutationIntent, write_guard
+from app.services.tenant_ownership import RowRef
 
+
+from app.services.tenant_responses import read_snapshot
 
 router = APIRouter()
 
@@ -25,10 +31,14 @@ def _login(payload: LoginRequest, db: Session) -> TokenResponse:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     assert_user_session_allowed(user, db)
-    stamp_last_login(user)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    login_time = datetime.now(UTC)
+    intent = MutationIntent("UPDATE", RowRef("User", user.id), (("last_login_at", login_time),))
+    with write_guard(db, actor=user, client_id=user.client_id, operation="login", intents=(intent,)):
+        assert_user_session_allowed(user, db)
+        user.last_login_at = login_time
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     token = create_access_token(
         subject=user.id,
@@ -42,5 +52,9 @@ def _login(payload: LoginRequest, db: Session) -> TokenResponse:
 
 
 @router.get("/me", response_model=UserSession)
-def me(current_user: User = Depends(get_current_user)) -> UserSession:
-    return build_user_session(current_user)
+@read_snapshot(response_model=UserSession)
+def me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> UserSession:
+    from app.services.tenant_responses import safe_model_read
+    result = build_user_session(current_user)
+    safe = safe_model_read(current_user, UserSession, db)
+    return result.model_copy(deep=True, update={"branch_id": safe.branch_id})

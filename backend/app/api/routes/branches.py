@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +20,10 @@ from app.services.tenancy import (
 )
 
 
+from app.services.tenant_mutations import delete_guard, require_delete_coverage, write_guard, MutationIntent
+from app.services.tenant_ownership import RowRef
+
+
 router = APIRouter()
 
 
@@ -29,6 +35,7 @@ def raise_branch_conflict(exc: IntegrityError) -> None:
 
 
 def cleanup_branch_delete_dependencies(db: Session, branch: Branch) -> None:
+    require_delete_coverage(db, (branch,))
     channels = list(
         db.scalars(
             select(Channel)
@@ -48,6 +55,10 @@ def cleanup_branch_delete_dependencies(db: Session, branch: Branch) -> None:
             if videowall_id
         }
     )
+
+    # Requeries may consume only the immutable batch approved under FK locks.
+    # Check the whole manual execution set before the first bulk DELETE.
+    require_delete_coverage(db, (*channels, *(RowRef("Videowall", value) for value in videowall_ids)))
 
     db.execute(delete(Schedule).where(Schedule.branch_id == branch.id))
     db.execute(delete(AudioAssignment).where(AudioAssignment.branch_id == branch.id))
@@ -89,21 +100,25 @@ def create_branch(
 
     client_id = require_client_scope(current_user, payload.client_id)
     assert_client_exists(db, client_id)
-    branch = Branch(
+    values = dict(
         client_id=client_id,
         name=payload.name,
         code=payload.code,
         address=payload.address,
         timezone=payload.timezone,
     )
-    db.add(branch)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise_branch_conflict(exc)
-    db.refresh(branch)
-    return branch
+    ref = RowRef("Branch", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=client_id, operation="create_branch", intents=(intent,)):
+        branch = Branch(id=ref.identity, **values)
+        db.add(branch)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise_branch_conflict(exc)
+        db.refresh(branch)
+        return branch
 
 
 @router.patch("/{branch_id}", response_model=BranchRead)
@@ -119,23 +134,32 @@ def update_branch(
     branch = get_branch_in_scope(db, branch_id, current_user)
     changes = payload.model_dump(exclude_unset=True)
 
-    if "name" in changes:
-        branch.name = changes["name"].strip()
-    if "code" in changes:
-        branch.code = changes["code"].strip()
-    if "address" in changes:
-        branch.address = changes["address"].strip() if changes["address"] else None
-    if "timezone" in changes:
-        branch.timezone = changes["timezone"].strip() or branch.timezone
-
-    db.add(branch)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise_branch_conflict(exc)
-    db.refresh(branch)
-    return branch
+    proposed = dict(changes)
+    for field in ("name", "code"):
+        if field in proposed:
+            proposed[field] = proposed[field].strip()
+    if "address" in proposed:
+        proposed["address"] = proposed["address"].strip() if proposed["address"] else None
+    if "timezone" in proposed:
+        proposed["timezone"] = proposed["timezone"].strip() or branch.timezone
+    intent = MutationIntent("UPDATE", RowRef("Branch", branch.id), tuple(proposed.items()))
+    with write_guard(db, actor=current_user, client_id=branch.client_id, operation="update_branch", intents=(intent,)):
+        if "name" in proposed:
+            branch.name = proposed["name"]
+        if "code" in proposed:
+            branch.code = proposed["code"]
+        if "address" in proposed:
+            branch.address = proposed["address"]
+        if "timezone" in proposed:
+            branch.timezone = proposed["timezone"]
+        db.add(branch)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise_branch_conflict(exc)
+        db.refresh(branch)
+        return branch
 
 
 @router.delete("/{branch_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -148,6 +172,7 @@ def delete_branch(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete branches")
 
     branch = get_branch_in_scope(db, branch_id, current_user)
-    cleanup_branch_delete_dependencies(db, branch)
-    db.delete(branch)
-    db.commit()
+    with delete_guard(db, (branch,), actor=current_user, branch_id=branch.id, operation="delete_branch"):
+        cleanup_branch_delete_dependencies(db, branch)
+        db.delete(branch)
+        db.commit()

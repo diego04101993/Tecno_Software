@@ -19,7 +19,7 @@ if os.environ.get("DATABASE_URL") != "sqlite://" or os.environ.get("AUTO_SEED") 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event, func, select
@@ -194,9 +194,8 @@ class CredentialRouteTests(unittest.TestCase):
         def db_dependency():
             with self.session() as db:
                 yield db
-        def admin_dependency():
-            with self.session() as db:
-                yield db.get(User, self.uid)
+        def admin_dependency(db: Session = Depends(get_db)):
+            yield db.get(User, self.uid)
         app.dependency_overrides[get_db] = db_dependency
         app.dependency_overrides[get_current_user] = admin_dependency
         self.http = TestClient(app, raise_server_exceptions=False)

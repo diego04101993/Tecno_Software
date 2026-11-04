@@ -11,7 +11,7 @@ from unittest.mock import patch
 if os.environ.get("DATABASE_URL") != "sqlite://" or os.environ.get("AUTO_SEED") != "false":
     raise RuntimeError("Use tests/run_screen_rotation_suite.py (isolated memory DB and temporary MEDIA_ROOT)")
 
-from fastapi import FastAPI, UploadFile
+from fastapi import Depends, FastAPI, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
@@ -21,7 +21,7 @@ from app.api.deps import get_current_user, get_db
 from app.api.routes import contents, content_folders, data_sources, media, player
 from app.core.config import get_settings
 from app.models.base import Base
-from app.models.entities import Branch, Campaign, Channel, Client, ContentFolder, ContentItem, ContentType, DataSource, DataSourceType, Dataset, DatasetImport, UserRole
+from app.models.entities import Branch, Campaign, Channel, Client, ContentFolder, ContentItem, ContentType, DataSource, DataSourceType, Dataset, DatasetImport, User, UserRole
 from app.services.content_cleanup import cleanup_files, delete_content_items
 from app.services.player_runtime import serialize_content
 
@@ -53,7 +53,13 @@ class MediaPathSafetyTests(TestCase):
         self.other = Client(name="Temporary B", slug="sec-b")
         self.db.add_all([self.tenant, self.other])
         self.db.commit()
-        self.user = SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id, branch_id=None)
+        self.user = User(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id,
+                         email="media-qa-a@example.com", full_name="QA A", password_hash="synthetic")
+        other_user = User(role=UserRole.CLIENT_ADMIN, client_id=self.other.id,
+                          email="media-qa-b@example.com", full_name="QA B", password_hash="synthetic")
+        self.db.add_all([self.user, other_user])
+        self.db.commit()
+        fixture_user_ids = {self.tenant.id: self.user.id, self.other.id: other_user.id}
         app = FastAPI()  # No app.main, startup, seed, network or production settings.
 
         @app.middleware("http")
@@ -73,7 +79,10 @@ class MediaPathSafetyTests(TestCase):
                 yield db
 
         app.dependency_overrides[get_db] = isolated_db
-        app.dependency_overrides[get_current_user] = lambda: self.user
+        def fixture_user(db: Session = Depends(get_db)):
+            return db.get(User, fixture_user_ids[self.user.client_id])
+
+        app.dependency_overrides[get_current_user] = fixture_user
         self.http = TestClient(app)
         self.addCleanup(self.http.close)
 
@@ -214,7 +223,7 @@ class MediaPathSafetyTests(TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(self.db.scalar(select(func.count()).select_from(ContentItem)), 0)
 
-    def test_shared_leading_and_nonleading_media_path_survives_until_last_reference(self):
+    def test_cross_tenant_historical_reference_cannot_delete_owner_file(self):
         path, url = self.make_file("shared clip.mp4")
         first = self.add_content(url)
         second = self.add_content(url.removeprefix("/"), tenant=self.other)
@@ -223,7 +232,7 @@ class MediaPathSafetyTests(TestCase):
         self.assert_content_exists(second.id)
         self.user.client_id = self.other.id
         self.assertEqual(self.http.delete(f"/api/contents/{second.id}").status_code, 204)
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())  # Phase A: foreign namespace is never owned by the corrupt row.
 
     def test_delete_does_not_guess_related_files_by_stem(self):
         path, url = self.make_file()
@@ -425,7 +434,7 @@ class MediaPathSafetyTests(TestCase):
         self.assertEqual(sentinel.read_bytes(), b"keep")
         self.assert_content_exists(item_id)
 
-    def test_admin_cleanup_preserves_shared_file_then_removes_last_reference(self):
+    def test_admin_cleanup_preserves_foreign_file_after_corrupt_reference_removed(self):
         from app.services.cleanup_retention import run_retention_cleanup
         path, url = self.make_file()
         first = self.add_content(url)
@@ -440,9 +449,9 @@ class MediaPathSafetyTests(TestCase):
         self.db.commit()
         result = run_retention_cleanup(self.db)
         self.assertEqual(result["contents_deleted"], 1)
-        self.assertEqual(result["files_deleted"], 1)
+        self.assertEqual(result["files_deleted"], 0)
         self.assertEqual(result["errors"], [])
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())  # Phase A: no cross-tenant physical deletion.
 
     def test_dataset_upload_uses_same_safe_storage_without_changing_import(self):
         source = DataSource(client_id=self.tenant.id, name="Fixture", source_type=DataSourceType.FILE_UPLOAD)
@@ -588,18 +597,20 @@ class MediaPathSafetyTests(TestCase):
 
     def test_create_reference_checks_file_and_commits_under_lock(self):
         path, url = self.make_file()
+        self.add_content(url)  # Typed ownership; a directory name is not proof.
         response = self.http.post("/api/contents/", json={"name": "Reference", "type": "video", "file_path": url})
         self.assertEqual(response.status_code, 201, response.text)
         path.unlink()  # Fixture only: simulate a stale declarative reference.
         failed = self.http.post("/api/contents/", json={"name": "Missing", "type": "video", "file_path": url})
         self.assertEqual(failed.status_code, 409)
-        self.assertEqual(self.db.scalar(select(func.count()).select_from(ContentItem)), 1)
+        self.assertEqual(self.db.scalar(select(func.count()).select_from(ContentItem)), 2)
 
     def test_file_path_update_uses_same_protocol_and_preserves_old_on_failure(self):
         from app.services.media_references import save_content_reference
         from app.services.media_storage import MediaPathError
         old, url = self.make_file()
         new, new_url = self.make_file("second.mp4")
+        self.add_content(new_url)  # Existing authoritative reference for the destination.
         item = self.add_content(url)
         item.file_path = new_url
         save_content_reference(item, self.db)

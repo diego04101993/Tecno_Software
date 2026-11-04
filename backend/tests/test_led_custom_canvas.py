@@ -3,7 +3,6 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -22,6 +21,7 @@ EXPECTED = json.loads((Path(__file__).parent / "fixtures/led_custom_516x860.json
 class LedCustomCanvasTests(TestCase):
     # Reuse only the guarded in-memory fixture, not its test methods.
     setUp = rotation_fixture.ScreenRotationTests.setUp
+    set_qa_user = rotation_fixture.ScreenRotationTests.set_qa_user
     tearDown = rotation_fixture.ScreenRotationTests.tearDown
     create = rotation_fixture.ScreenRotationTests.create
     update = rotation_fixture.ScreenRotationTests.update
@@ -137,7 +137,7 @@ class LedCustomCanvasTests(TestCase):
             (UserRole.OPERATOR, self.tenant.id, self.branch.id, own["id"], self.branch.id),
         ):
             with self.subTest(role=role):
-                self.user = SimpleNamespace(role=role, client_id=client_id, branch_id=branch_id)
+                self.set_qa_user(role=role, client_id=client_id, branch_id=branch_id)
                 response = self.http.patch(f"/api/channels/{target_id}", json={"output_mapping_json": EXPECTED})
                 self.assertEqual(response.status_code, 403, response.text)
                 response = self.http.post("/api/channels/", json={"branch_id": target_branch, "name": "Forbidden", "output_mapping_json": EXPECTED})

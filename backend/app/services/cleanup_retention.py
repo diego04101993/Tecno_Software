@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -25,8 +26,10 @@ from app.models.entities import (
     TouchMap,
 )
 from app.services.content_cleanup import cleanup_files, delete_content_items, preflight_content_files
-from app.services.media_references import lock_media_paths, media_reference_operation
+from app.services.media_references import lock_media_paths, media_reference_operation, approve_media_cleanup
 from app.services.media_storage import MediaPathError
+from app.services.tenant_mutations import delete_guard
+from app.services.tenant_relations import conflict
 
 
 logger = logging.getLogger(__name__)
@@ -203,10 +206,10 @@ def _content_is_referenced_in_kiosk(content: ContentItem, db: Session) -> bool:
     return False
 
 
-def _content_has_live_references(content: ContentItem, db: Session) -> bool:
-    if db.scalar(select(CampaignSequenceItem.id).where(CampaignSequenceItem.content_id == content.id).limit(1)):
+def _content_has_live_references(content: ContentItem, db: Session, removing_campaign_ids=()) -> bool:
+    if db.scalar(select(CampaignSequenceItem.id).where(CampaignSequenceItem.content_id == content.id, CampaignSequenceItem.campaign_id.not_in(removing_campaign_ids)).limit(1)):
         return True
-    if db.scalar(select(CampaignPlaylistItem.id).where(CampaignPlaylistItem.content_id == content.id).limit(1)):
+    if db.scalar(select(CampaignPlaylistItem.id).where(CampaignPlaylistItem.content_id == content.id, CampaignPlaylistItem.campaign_id.not_in(removing_campaign_ids)).limit(1)):
         return True
     if db.scalar(select(AudioPlaylistItem.id).where(AudioPlaylistItem.content_id == content.id).limit(1)):
         return True
@@ -229,156 +232,139 @@ def _campaign_has_live_references(campaign: Campaign, db: Session) -> bool:
     return False
 
 
-def cleanup_unused_campaigns(
-    db: Session,
-    *,
-    days: int = DEFAULT_CAMPAIGN_RETENTION_DAYS,
-    summary: CleanupRetentionSummary | None = None,
-) -> CleanupRetentionSummary:
+def _campaign_candidates(db, cutoff):
+    with db.no_autoflush:
+        return [row for row in db.scalars(select(Campaign).where(Campaign.created_at <= cutoff)
+                                          .order_by(Campaign.created_at, Campaign.id))
+                if not _campaign_has_live_references(row, db)]
+
+
+def _content_candidates(db, cutoff, removing_campaign_ids=()):
+    with db.no_autoflush:
+        return [row for row in db.scalars(select(ContentItem).where(ContentItem.created_at <= cutoff)
+                                          .order_by(ContentItem.created_at, ContentItem.id))
+                if not _content_has_live_references(row, db, removing_campaign_ids)]
+
+
+def _folder_candidates(db, cutoff, removing_content_ids=()):
+    # Simulate the existing leaf-first loop without clearing FKs or flushing.
+    with db.no_autoflush:
+        candidates = list(db.scalars(select(ContentFolder).where(ContentFolder.created_at <= cutoff)
+                                     .order_by(ContentFolder.created_at, ContentFolder.id)))
+        selected, selected_ids = [], set()
+        while True:
+            leaves = [row for row in candidates if row.id not in selected_ids
+                      and not db.scalar(select(ContentItem.id).where(ContentItem.folder_id == row.id,
+                          ContentItem.id.not_in(removing_content_ids)).limit(1))
+                      and not db.scalar(select(ContentFolder.id).where(ContentFolder.parent_id == row.id,
+                          ContentFolder.id.not_in(selected_ids)).limit(1))]
+            if not leaves:
+                return selected
+            selected.extend(leaves)
+            selected_ids.update(row.id for row in leaves)
+
+
+def _ids(rows):
+    return tuple(row.id for row in rows)
+
+
+def cleanup_unused_campaigns(db: Session, *, days=DEFAULT_CAMPAIGN_RETENTION_DAYS, summary=None):
     working_summary = summary or CleanupRetentionSummary()
     cutoff = _build_cutoff(days)
-    logger.info("Starting cleanup_unused_campaigns cutoff=%s", cutoff.isoformat())
-
-    candidates = list(
-        db.scalars(
-            select(Campaign)
-            .where(Campaign.created_at <= cutoff)
-            .order_by(Campaign.created_at.asc())
-        )
-    )
-
-    for campaign in candidates:
-        try:
-            if _campaign_has_live_references(campaign, db):
-                continue
-            with db.begin_nested():
-                logger.info("Deleting unused campaign id=%s name=%s", campaign.id, campaign.name)
-                db.delete(campaign)
-                db.flush()
-            working_summary.campaigns_deleted += 1
-        except Exception as exc:
-            _record_error(working_summary, f"Error deleting campaign {campaign.id}", exc)
-
+    candidates = _campaign_candidates(db, cutoff)
+    expected = _ids(candidates)
+    with delete_guard(db, candidates):
+        if expected != _ids(_campaign_candidates(db, cutoff)):
+            raise conflict()
+        for campaign in candidates:
+            db.delete(campaign)
+        db.flush()
+        working_summary.campaigns_deleted += len(candidates)
     return working_summary
 
 
-def cleanup_unused_contents(
-    db: Session,
-    *,
-    days: int = DEFAULT_CONTENT_RETENTION_DAYS,
-    summary: CleanupRetentionSummary | None = None,
-) -> CleanupRetentionSummary:
+def cleanup_unused_contents(db: Session, *, days=DEFAULT_CONTENT_RETENTION_DAYS, summary=None):
     working_summary = summary or CleanupRetentionSummary()
     cutoff = _build_cutoff(days)
-    logger.info("Starting cleanup_unused_contents cutoff=%s", cutoff.isoformat())
-
-    candidates = list(
-        db.scalars(
-            select(ContentItem)
-            .where(ContentItem.created_at <= cutoff)
-            .order_by(ContentItem.created_at.asc())
-        )
-    )
-
-    for content in candidates:
-        try:
-            if _content_has_live_references(content, db):
-                continue
-            with db.begin_nested():
-                logger.info("Deleting unused content id=%s name=%s", content.id, content.name)
-                working_summary.pending_file_paths.extend(delete_content_items([content], db))
-            working_summary.contents_deleted += 1
-        except MediaPathError:
-            raise  # Abort the whole pending transaction, never commit other deletions.
-        except Exception as exc:
-            _record_error(working_summary, f"Error deleting content {content.id}", exc)
-
+    candidates = _content_candidates(db, cutoff)
+    expected = _ids(candidates)
+    with delete_guard(db, candidates):
+        if expected != _ids(_content_candidates(db, cutoff)):
+            raise conflict()
+        working_summary.pending_file_paths.extend(delete_content_items(candidates, db))
+        working_summary.contents_deleted += len(candidates)
     return working_summary
 
 
-def cleanup_unused_folders(
-    db: Session,
-    *,
-    days: int = DEFAULT_FOLDER_RETENTION_DAYS,
-    summary: CleanupRetentionSummary | None = None,
-) -> CleanupRetentionSummary:
+def cleanup_unused_folders(db: Session, *, days=DEFAULT_FOLDER_RETENTION_DAYS, summary=None):
     working_summary = summary or CleanupRetentionSummary()
     cutoff = _build_cutoff(days)
-    logger.info("Starting cleanup_unused_folders cutoff=%s", cutoff.isoformat())
-
-    while True:
-        deleted_this_pass = 0
-        candidates = list(
-            db.scalars(
-                select(ContentFolder)
-                .where(ContentFolder.created_at <= cutoff)
-                .order_by(ContentFolder.created_at.asc())
-            )
-        )
+    candidates = _folder_candidates(db, cutoff)
+    expected = _ids(candidates)
+    with delete_guard(db, candidates):
+        if expected != _ids(_folder_candidates(db, cutoff)):
+            raise conflict()
         for folder in candidates:
-            try:
-                has_contents = db.scalar(select(ContentItem.id).where(ContentItem.folder_id == folder.id).limit(1))
-                has_children = db.scalar(select(ContentFolder.id).where(ContentFolder.parent_id == folder.id).limit(1))
-                if has_contents or has_children:
-                    continue
-                with db.begin_nested():
-                    logger.info("Deleting unused folder id=%s name=%s", folder.id, folder.name)
-                    db.delete(folder)
-                    db.flush()
-                working_summary.folders_deleted += 1
-                deleted_this_pass += 1
-            except Exception as exc:
-                _record_error(working_summary, f"Error deleting folder {folder.id}", exc)
-        if deleted_this_pass == 0:
-            break
-
+            db.delete(folder)
+            db.flush()
+        working_summary.folders_deleted += len(candidates)
     return working_summary
 
 
 def run_retention_cleanup(
-    db: Session,
-    *,
-    content_days: int = DEFAULT_CONTENT_RETENTION_DAYS,
-    campaign_days: int = DEFAULT_CAMPAIGN_RETENTION_DAYS,
-    folder_days: int = DEFAULT_FOLDER_RETENTION_DAYS,
+    db: Session, *, content_days=DEFAULT_CONTENT_RETENTION_DAYS,
+    campaign_days=DEFAULT_CAMPAIGN_RETENTION_DAYS, folder_days=DEFAULT_FOLDER_RETENTION_DAYS,
+    actor=None,
 ) -> dict[str, object]:
     summary = CleanupRetentionSummary()
     committed = False
-    logger.info(
-        "Starting retention cleanup content_days=%s campaign_days=%s folder_days=%s",
-        content_days,
-        campaign_days,
-        folder_days,
-    )
+    campaign_cutoff, content_cutoff, folder_cutoff = (
+        _build_cutoff(campaign_days), _build_cutoff(content_days), _build_cutoff(folder_days))
     try:
-        with media_reference_operation(db):
-            # Preflight even referenced old contents: campaign cleanup can remove their
-            # last references. A bad path must stop this run BEFORE its first commit.
+        campaigns = _campaign_candidates(db, campaign_cutoff)
+        contents = _content_candidates(db, content_cutoff, _ids(campaigns))
+        folders = _folder_candidates(db, folder_cutoff, _ids(contents))
+        expected = (_ids(campaigns), _ids(contents), _ids(folders))
+        with delete_guard(db, (*campaigns, *contents, *folders), actor=actor), media_reference_operation(db):
+            # Recheck eligibility in the fresh locked snapshot before any DML.
+            current_campaigns = _campaign_candidates(db, campaign_cutoff)
+            current_contents = _content_candidates(db, content_cutoff, _ids(current_campaigns))
+            current_folders = _folder_candidates(db, folder_cutoff, _ids(current_contents))
+            if expected != (_ids(current_campaigns), _ids(current_contents), _ids(current_folders)):
+                raise conflict()
+            # Preserve the existing path preflight, including referenced old files.
             file_paths = preflight_content_files(list(db.scalars(select(ContentItem).where(
-                ContentItem.created_at <= _build_cutoff(content_days)
-            ))))
+                ContentItem.created_at <= content_cutoff))))
             lock_media_paths(db, file_paths)
-            cleanup_unused_campaigns(db, days=campaign_days, summary=summary)
-            cleanup_unused_contents(db, days=content_days, summary=summary)
-            cleanup_unused_folders(db, days=folder_days, summary=summary)
+            approve_media_cleanup(db, contents)
+            for campaign in campaigns:
+                db.delete(campaign)
+            db.flush()
+            summary.campaigns_deleted = len(campaigns)
+            summary.pending_file_paths.extend(delete_content_items(contents, db))
+            summary.contents_deleted = len(contents)
+            for folder in folders:
+                db.delete(folder)
+                db.flush()
+            summary.folders_deleted = len(folders)
             db.commit()
             committed = True
-            if summary.pending_file_paths:
-                deleted_files = cleanup_files(summary.pending_file_paths, db)
-                summary.files_deleted += deleted_files
-                logger.info("Deleted %s physical media files for unused contents", deleted_files)
-                summary.pending_file_paths.clear()
+            summary.files_deleted = cleanup_files(summary.pending_file_paths, db)
+            summary.pending_file_paths.clear()
+    except HTTPException:
+        db.rollback()
+        raise  # Integrity rejection is atomic, uniform and never logged with row details.
     except MediaPathError as exc:
         db.rollback()
         summary.pending_file_paths.clear()
         _record_error(summary, exc.code)
-        # No DB rows were committed for path errors found during preflight.
         if not committed:
             summary.contents_deleted = summary.campaigns_deleted = summary.folders_deleted = 0
-    except Exception as exc:
+    except Exception:
         db.rollback()
         summary.pending_file_paths.clear()
-        _record_error(summary, "Error committing cleanup", exc)
-
+        if not committed:
+            summary.contents_deleted = summary.campaigns_deleted = summary.folders_deleted = 0
+        _record_error(summary, "Error committing cleanup")
     logger.info("Retention cleanup finished summary=%s", summary.to_dict())
     return summary.to_dict()

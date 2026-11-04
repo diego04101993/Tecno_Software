@@ -14,4 +14,4 @@ def run_cleanup(
     db: Session = Depends(get_db),
     _: User = Depends(require_super_admin),
 ) -> dict[str, object]:
-    return run_retention_cleanup(db)
+    return run_retention_cleanup(db, actor=_)

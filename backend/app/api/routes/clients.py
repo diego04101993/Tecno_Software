@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -34,6 +36,13 @@ from app.services.user_admin import (
     ensure_client_user_role,
 )
 
+
+from app.services.tenant_mutations import delete_guard, write_guard, MutationIntent
+from app.services.tenant_ownership import RowRef
+
+
+from app.services.tenant_responses import read_snapshot
+from app.services.tenant_queries import readable_query
 
 router = APIRouter()
 
@@ -91,6 +100,7 @@ def _assert_unique_user_email(db: Session, email: str, *, exclude_user_id: str |
 
 
 @router.get("/", response_model=list[ClientRead])
+@read_snapshot(response_model=list[ClientRead])
 def list_clients(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -98,7 +108,7 @@ def list_clients(
     if not can_access_all_clients(current_user):
         client = db.get(Client, current_user.client_id)
         return [client] if client else []
-    return list(db.scalars(select(Client).order_by(Client.created_at.desc())))
+    return list(db.scalars(readable_query(select(Client), Client, db=db).order_by(Client.created_at.desc())))
 
 
 @router.post("/", response_model=ClientRead, status_code=status.HTTP_201_CREATED)
@@ -110,20 +120,26 @@ def create_client(
     _require_client_directory_access(current_user)
     _assert_unique_client_slug(db, payload.slug)
 
-    client = Client(
+    values = dict(
         name=payload.name.strip(),
         slug=payload.slug.strip(),
         contact_email=payload.contact_email,
         brand_name=payload.brand_name.strip() if payload.brand_name else None,
         status="active",
     )
-    db.add(client)
-    db.commit()
-    db.refresh(client)
-    return client
+    ref = RowRef("Client", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=None, operation="create_client", intents=(intent,)):
+        _assert_unique_client_slug(db, payload.slug.strip())
+        client = Client(id=ref.identity, **values)
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        return client
 
 
 @router.get("/{client_id}/users", response_model=list[UserRead])
+@read_snapshot(response_model=list[UserRead])
 def list_client_users(
     client_id: str,
     db: Session = Depends(get_db),
@@ -133,7 +149,7 @@ def list_client_users(
     _get_client_or_404(scoped_client_id, db, current_user)
     users = list(
         db.scalars(
-            select(User)
+            readable_query(select(User), User, db=db)
             .where(User.client_id == scoped_client_id)
             .order_by(User.created_at.desc())
         )
@@ -160,7 +176,7 @@ def create_client_user(
     _assert_unique_user_email(db, email)
     branch_id = _validate_branch_for_user(role, payload.branch_id, scoped_client_id, db)
 
-    user = User(
+    values = dict(
         email=email,
         full_name=payload.full_name.strip(),
         password_hash=hash_password(payload.password),
@@ -170,10 +186,16 @@ def create_client_user(
         status=payload.status,
         is_active=payload.status == ACTIVE_USER_STATUS,
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return build_user_read(user)
+    ref = RowRef("User", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=scoped_client_id,
+                     operation="create_client_user", intents=(intent,)):
+        _assert_unique_user_email(db, email)
+        user = User(id=ref.identity, **values)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return build_user_read(user)
 
 
 @router.patch("/{client_id}/users/{user_id}", response_model=UserRead)
@@ -196,21 +218,33 @@ def update_client_user(
     if not can_manage_clients_directory(current_user) and next_role not in {UserRole.CLIENT, UserRole.CLIENT_ADMIN, UserRole.CLIENT_OPERATOR}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only global admins can assign branch-scoped roles")
 
+    proposed = {"role": next_role, "branch_id": _validate_branch_for_user(
+        next_role, payload.branch_id if payload.branch_id is not None else user.branch_id, scoped_client_id, db)}
     if payload.email is not None:
         email = payload.email.lower()
         _assert_unique_user_email(db, email, exclude_user_id=user.id)
-        user.email = email
+        proposed["email"] = email
     if payload.full_name is not None:
-        user.full_name = payload.full_name.strip()
+        proposed["full_name"] = payload.full_name.strip()
     if payload.password:
-        user.password_hash = hash_password(payload.password)
+        proposed["password_hash"] = hash_password(payload.password)
 
-    user.role = next_role
-    user.branch_id = _validate_branch_for_user(next_role, payload.branch_id if payload.branch_id is not None else user.branch_id, scoped_client_id, db)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return build_user_read(user)
+    intent = MutationIntent("UPDATE", RowRef("User", user.id), tuple(proposed.items()))
+    with write_guard(db, actor=current_user, client_id=scoped_client_id,
+                     operation="update_client_user", intents=(intent,)):
+        if "email" in proposed:
+            _assert_unique_user_email(db, proposed["email"], exclude_user_id=user.id)
+            user.email = proposed["email"]
+        if "full_name" in proposed:
+            user.full_name = proposed["full_name"]
+        if "password_hash" in proposed:
+            user.password_hash = proposed["password_hash"]
+        user.role = proposed["role"]
+        user.branch_id = proposed["branch_id"]
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return build_user_read(user)
 
 
 @router.patch("/{client_id}/users/{user_id}/status", response_model=UserRead)
@@ -228,11 +262,15 @@ def update_client_user_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     ensure_client_scoped_user(user, client_id=scoped_client_id)
 
-    apply_user_status(user, payload.status)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return build_user_read(user)
+    proposed = {"status": payload.status, "is_active": payload.status == ACTIVE_USER_STATUS}
+    intent = MutationIntent("UPDATE", RowRef("User", user.id), tuple(proposed.items()))
+    with write_guard(db, actor=current_user, client_id=scoped_client_id,
+                     operation="update_client_user_status", intents=(intent,)):
+        apply_user_status(user, payload.status)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return build_user_read(user)
 
 
 @router.delete("/{client_id}/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -248,11 +286,13 @@ def delete_client_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     ensure_client_scoped_user(user, client_id=scoped_client_id)
-    db.delete(user)
-    db.commit()
+    with delete_guard(db, (user,), actor=current_user, operation="delete_client_user"):
+        db.delete(user)
+        db.commit()
 
 
 @router.get("/{client_id}", response_model=ClientRead)
+@read_snapshot(response_model=ClientRead)
 def get_client(
     client_id: str,
     db: Session = Depends(get_db),
@@ -271,20 +311,32 @@ def update_client(
     _require_client_directory_access(current_user)
     client = _get_client_or_404(client_id, db, current_user)
 
+    proposed = {}
     if payload.slug is not None:
         _assert_unique_client_slug(db, payload.slug.strip(), exclude_client_id=client.id)
-        client.slug = payload.slug.strip()
+        proposed["slug"] = payload.slug.strip()
     if payload.name is not None:
-        client.name = payload.name.strip()
+        proposed["name"] = payload.name.strip()
     if payload.contact_email is not None:
-        client.contact_email = payload.contact_email
+        proposed["contact_email"] = payload.contact_email
     if payload.brand_name is not None:
-        client.brand_name = payload.brand_name.strip() or None
+        proposed["brand_name"] = payload.brand_name.strip() or None
 
-    db.add(client)
-    db.commit()
-    db.refresh(client)
-    return client
+    intent = MutationIntent("UPDATE", RowRef("Client", client.id), tuple(proposed.items()))
+    with write_guard(db, actor=current_user, client_id=client.id, operation="update_client", intents=(intent,)):
+        if "slug" in proposed:
+            _assert_unique_client_slug(db, proposed["slug"], exclude_client_id=client.id)
+            client.slug = proposed["slug"]
+        if "name" in proposed:
+            client.name = proposed["name"]
+        if "contact_email" in proposed:
+            client.contact_email = proposed["contact_email"]
+        if "brand_name" in proposed:
+            client.brand_name = proposed["brand_name"]
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        return client
 
 
 @router.patch("/{client_id}/status", response_model=ClientRead)
@@ -296,11 +348,13 @@ def update_client_status(
 ) -> Client:
     _require_client_directory_access(current_user)
     client = _get_client_or_404(client_id, db, current_user)
-    client.status = payload.status
-    db.add(client)
-    db.commit()
-    db.refresh(client)
-    return client
+    intent = MutationIntent("UPDATE", RowRef("Client", client.id), (("status", payload.status),))
+    with write_guard(db, actor=current_user, client_id=client.id, operation="update_client_status", intents=(intent,)):
+        client.status = payload.status
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        return client
 
 
 @router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -316,4 +370,5 @@ def delete_client(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Type ELIMINAR to confirm client deletion")
 
     client = _get_client_or_404(client_id, db, current_user)
-    delete_client_cascade(client, db)
+    with delete_guard(db, (client,), actor=current_user, operation="delete_client"):
+        delete_client_cascade(client, db)

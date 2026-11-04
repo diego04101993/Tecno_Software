@@ -1,11 +1,15 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.models.entities import Campaign, Channel, Layout, Schedule, User
+from app.models.entities import Branch, Campaign, Channel, Layout, Schedule, User
 from app.schemas.domain import ScheduleCreate, ScheduleRead, ScheduleUpdate
 from app.services.tenancy import (
+    schedule_read_integrity,
+    require_same_client_resource,
     apply_client_filter,
     branch_channel_ids_query,
     branch_schedule_scope_filter,
@@ -17,7 +21,20 @@ from app.services.tenancy import (
 )
 
 
+from app.services.tenant_mutations import delete_guard, write_guard, MutationIntent, SemanticAdapter
+from app.services.tenant_ownership import RowRef
+
+
+from app.services.tenant_responses import read_snapshot
+from app.services.tenant_queries import readable_query
+
 router = APIRouter()
+
+
+def _schedule_semantics(graph, ref, context, row):
+    # This JSON column holds only day numbers, not resource identities.
+    days = row.get("days_of_week") or ()
+    return isinstance(days, (list, tuple)) and all(type(day) is int for day in days)
 
 
 def normalize_schedule_days(days_of_week: list[int]) -> list[int]:
@@ -63,6 +80,7 @@ def get_schedule_in_scope(db: Session, schedule_id: str, current_user: User) -> 
 
 
 @router.get("/", response_model=list[ScheduleRead])
+@read_snapshot(response_model=list[ScheduleRead])
 def list_schedules(
     client_id: str | None = Query(default=None),
     channel_id: str | None = Query(default=None),
@@ -70,23 +88,22 @@ def list_schedules(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[Schedule]:
-    query = apply_client_filter(select(Schedule).order_by(Schedule.created_at.desc()), Schedule, current_user)
+    query = apply_client_filter(readable_query(select(Schedule), Schedule, db=db).where(schedule_read_integrity()).order_by(Schedule.created_at.desc()), Schedule, current_user)
     target_client_id = require_client_scope(current_user, client_id) if client_id or current_user.client_id else None
     if target_client_id:
         query = query.where(Schedule.client_id == target_client_id)
     if channel_id:
         channel = get_channel_in_scope(db, channel_id, current_user)
-        query = query.where(Schedule.channel_id == channel.id)
+        query = query.where(Schedule.channel_id == channel.id, Schedule.client_id == channel.client_id)
     if campaign_id:
-        query = query.where(Schedule.campaign_id == campaign_id)
+        campaign = db.get(Campaign, campaign_id)
+        if campaign is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        require_client_scope(current_user, campaign.client_id)
+        query = query.where(Schedule.campaign_id == campaign.id, Schedule.client_id == campaign.client_id)
     if is_branch_scoped(current_user):
         branch_id = require_branch_assignment(current_user)
-        query = query.where(
-            or_(
-                Schedule.branch_id == branch_id,
-                Schedule.channel_id.in_(branch_channel_ids_query(branch_id)),
-            )
-        )
+        query = query.where(branch_schedule_scope_filter(branch_id))
     return list(db.scalars(query))
 
 
@@ -131,6 +148,7 @@ def create_schedule(
         if payload.branch_id and payload.branch_id != assigned_branch_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Branch access denied")
 
+    require_same_client_resource(db, Branch, payload.branch_id, client_id)
     payload.days_of_week = normalize_schedule_days(payload.days_of_week)
     resolved_branch_id = payload.branch_id or (assigned_branch_id if is_branch_scoped(current_user) and not payload.channel_id else None)
 
@@ -148,11 +166,7 @@ def create_schedule(
         (candidate for candidate in existing_candidates if schedules_match(candidate, payload, client_id=client_id, branch_id=resolved_branch_id)),
         None,
     )
-    if existing_schedule:
-        response.status_code = status.HTTP_200_OK
-        return existing_schedule
-
-    schedule = Schedule(
+    values = dict(
         client_id=client_id,
         campaign_id=payload.campaign_id,
         channel_id=payload.channel_id,
@@ -170,10 +184,18 @@ def create_schedule(
         timezone=payload.timezone,
         priority=payload.priority,
     )
-    db.add(schedule)
-    db.commit()
-    db.refresh(schedule)
-    return schedule
+    ref = RowRef("Schedule", existing_schedule.id if existing_schedule else str(uuid4()))
+    intent = MutationIntent("UPDATE", ref) if existing_schedule else MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=client_id, operation="create_schedule",
+                     intents=(intent,), semantic_adapters=(SemanticAdapter("Schedule", _schedule_semantics),)):
+        if existing_schedule:
+            response.status_code = status.HTTP_200_OK
+            return existing_schedule
+        schedule = Schedule(id=ref.identity, **values)
+        db.add(schedule)
+        db.commit()
+        db.refresh(schedule)
+        return schedule
 
 
 @router.patch("/{schedule_id}", response_model=ScheduleRead)
@@ -189,53 +211,72 @@ def update_schedule(
     schedule = get_schedule_in_scope(db, schedule_id, current_user)
     changes = payload.model_dump(exclude_unset=True)
 
-    if "campaign_id" in changes and changes["campaign_id"]:
-        campaign = db.get(Campaign, changes["campaign_id"])
-        if not campaign or campaign.client_id != schedule.client_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
-        schedule.campaign_id = campaign.id
+    proposed = dict(changes)
+    for field in ("campaign_id", "recurrence", "is_active", "is_looping", "timezone", "priority"):
+        if proposed.get(field) is None:
+            proposed.pop(field, None)
+    if "title" in proposed:
+        proposed["title"] = (proposed["title"] or "").strip()
+        if not proposed["title"]:
+            raise HTTPException(status_code=400, detail="Title is required")
+    if "days_of_week" in proposed:
+        proposed["days_of_week"] = normalize_schedule_days(proposed["days_of_week"] or [])
+    if "priority" in proposed:
+        proposed["priority"] = max(1, proposed["priority"])
+    # days_of_week is the sole opaque Schedule field; it contains scalar days,
+    # never resource identities or media paths. All FKs are proved by the graph.
+    schedule_semantics = SemanticAdapter("Schedule", _schedule_semantics)
+    intent = MutationIntent("UPDATE", RowRef("Schedule", schedule.id), tuple(proposed.items()))
+    with write_guard(db, actor=current_user, client_id=schedule.client_id,
+                     operation="update_schedule", intents=(intent,),
+                     semantic_adapters=(schedule_semantics,)):
+        if "campaign_id" in changes and changes["campaign_id"]:
+            campaign = db.get(Campaign, changes["campaign_id"])
+            if not campaign or campaign.client_id != schedule.client_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
+            schedule.campaign_id = campaign.id
 
-    if "layout_id" in changes:
-        layout_id = changes["layout_id"]
-        if layout_id is None:
-            schedule.layout_id = None
-        else:
-            layout = db.get(Layout, layout_id)
-            if not layout or layout.client_id != schedule.client_id:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layout not found")
-            schedule.layout_id = layout.id
+        if "layout_id" in changes:
+            layout_id = changes["layout_id"]
+            if layout_id is None:
+                schedule.layout_id = None
+            else:
+                layout = db.get(Layout, layout_id)
+                if not layout or layout.client_id != schedule.client_id:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layout not found")
+                schedule.layout_id = layout.id
 
-    if "title" in changes:
-        normalized_title = (changes["title"] or "").strip()
-        if not normalized_title:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title is required")
-        schedule.title = normalized_title
+        if "title" in changes:
+            normalized_title = (changes["title"] or "").strip()
+            if not normalized_title:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title is required")
+            schedule.title = normalized_title
 
-    if "recurrence" in changes and changes["recurrence"] is not None:
-        schedule.recurrence = changes["recurrence"]
-    if "days_of_week" in changes:
-        schedule.days_of_week = normalize_schedule_days(changes["days_of_week"] or [])
-    if "starts_on" in changes:
-        schedule.starts_on = changes["starts_on"]
-    if "ends_on" in changes:
-        schedule.ends_on = changes["ends_on"]
-    if "start_time" in changes:
-        schedule.start_time = changes["start_time"]
-    if "end_time" in changes:
-        schedule.end_time = changes["end_time"]
-    if "is_active" in changes and changes["is_active"] is not None:
-        schedule.is_active = changes["is_active"]
-    if "is_looping" in changes and changes["is_looping"] is not None:
-        schedule.is_looping = changes["is_looping"]
-    if "timezone" in changes and changes["timezone"] is not None:
-        schedule.timezone = changes["timezone"]
-    if "priority" in changes and changes["priority"] is not None:
-        schedule.priority = max(1, changes["priority"])
+        if "recurrence" in changes and changes["recurrence"] is not None:
+            schedule.recurrence = changes["recurrence"]
+        if "days_of_week" in changes:
+            schedule.days_of_week = normalize_schedule_days(changes["days_of_week"] or [])
+        if "starts_on" in changes:
+            schedule.starts_on = changes["starts_on"]
+        if "ends_on" in changes:
+            schedule.ends_on = changes["ends_on"]
+        if "start_time" in changes:
+            schedule.start_time = changes["start_time"]
+        if "end_time" in changes:
+            schedule.end_time = changes["end_time"]
+        if "is_active" in changes and changes["is_active"] is not None:
+            schedule.is_active = changes["is_active"]
+        if "is_looping" in changes and changes["is_looping"] is not None:
+            schedule.is_looping = changes["is_looping"]
+        if "timezone" in changes and changes["timezone"] is not None:
+            schedule.timezone = changes["timezone"]
+        if "priority" in changes and changes["priority"] is not None:
+            schedule.priority = max(1, changes["priority"])
 
-    db.add(schedule)
-    db.commit()
-    db.refresh(schedule)
-    return schedule
+        db.add(schedule)
+        db.commit()
+        db.refresh(schedule)
+        return schedule
 
 
 @router.delete("/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -248,5 +289,6 @@ def delete_schedule(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete schedules")
 
     schedule = get_schedule_in_scope(db, schedule_id, current_user)
-    db.delete(schedule)
-    db.commit()
+    with delete_guard(db, (schedule,), actor=current_user, operation="delete_schedule"):
+        db.delete(schedule)
+        db.commit()

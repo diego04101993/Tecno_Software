@@ -11,7 +11,6 @@ from hashlib import sha256
 from mimetypes import guess_type
 from pathlib import Path
 from tempfile import mkdtemp
-from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 from urllib.parse import quote
@@ -19,7 +18,7 @@ from urllib.parse import quote
 if os.environ.get("DATABASE_URL") != "sqlite://" or os.environ.get("AUTO_SEED") != "false":
     raise RuntimeError("Configure memory SQLite and temporary MEDIA_ROOT before importing app modules")
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
@@ -31,7 +30,7 @@ from app.core.config import get_settings
 from app.models.base import Base
 from app.models.entities import (
     Branch, Campaign, CampaignChannelAssignment, CampaignSequenceItem,
-    CampaignSequenceItemType, Channel, Client, ContentItem, ContentType, UserRole,
+    CampaignSequenceItemType, Channel, Client, ContentItem, ContentType, User, UserRole,
 )
 from app.services.player_runtime import build_player_runtime_config, serialize_content
 from app.services.active_media_policy import ActiveMediaPolicy, classify_active_media
@@ -130,7 +129,12 @@ class ActiveMediaDeliveryTests(TestCase):
         self.tenant = Client(name="SECURITY-1C fixture", slug="security-1c-fixture")
         self.db.add(self.tenant)
         self.db.commit()
-        user = SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id, branch_id=None)
+        user = User(email="active-media-qa@example.com", full_name="Active media QA",
+                    password_hash="synthetic-not-a-login-credential", role=UserRole.CLIENT_ADMIN,
+                    client_id=self.tenant.id, branch_id=None, is_active=True, status="active")
+        self.db.add(user)
+        self.db.commit()
+        user_id = user.id
         app = FastAPI()
         app.include_router(contents.router, prefix="/api/contents")
         app.include_router(media.router)
@@ -139,8 +143,11 @@ class ActiveMediaDeliveryTests(TestCase):
             with Session(self.engine, autoflush=False) as db:
                 yield db
 
+        def isolated_user(db: Session = Depends(get_db)):
+            return db.get(User, user_id)
+
         app.dependency_overrides[get_db] = isolated_db
-        app.dependency_overrides[get_current_user] = lambda: user
+        app.dependency_overrides[get_current_user] = isolated_user
         self.http = TestClient(app)
         self.addCleanup(self.http.close)
 

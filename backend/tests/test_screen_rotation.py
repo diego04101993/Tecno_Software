@@ -4,11 +4,11 @@ from copy import deepcopy
 from datetime import UTC, date, datetime
 import hashlib
 import os
-from types import SimpleNamespace
+from uuid import uuid4
 from unittest import TestCase
 from unittest.mock import patch
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
@@ -23,7 +23,7 @@ from app.models.base import Base
 from app.models.entities import (
     Branch, Campaign, CampaignChannelAssignment, CampaignSequenceItem,
     CampaignSequenceItemType, Channel, ChannelMode, Client, ContentItem,
-    ContentType, DeviceMode, DeviceOutput, Orientation, PlayerDevice, Schedule, UserRole,
+    ContentType, DeviceMode, DeviceOutput, Orientation, PlayerDevice, Schedule, User, UserRole,
 )
 from app.services.device_outputs import build_device_output_definitions, sync_channel_device_outputs
 from app.services.player_runtime import build_player_runtime_config
@@ -57,7 +57,7 @@ class ScreenRotationTests(TestCase):
         self.foreign_branch = Branch(client_id=self.other_tenant.id, name="B1", code="B1")
         self.db.add_all([self.branch, self.other_branch, self.foreign_branch])
         self.db.commit()
-        self.user = SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id, branch_id=None)
+        self.set_qa_user(role=UserRole.CLIENT_ADMIN, client_id=self.tenant.id, branch_id=None)
         self.next_name = 0
         app = FastAPI()  # Deliberately no app.main, lifespan, seed or init_db.
         app.include_router(channels.router, prefix="/api/channels")
@@ -67,9 +67,21 @@ class ScreenRotationTests(TestCase):
             with Session(self.engine, autoflush=False) as db:
                 yield db
 
+        def isolated_user(db: Session = Depends(get_db)):
+            return db.get(User, self.qa_user_id)
+
         app.dependency_overrides[get_db] = isolated_db
-        app.dependency_overrides[get_current_user] = lambda: self.user
+        app.dependency_overrides[get_current_user] = isolated_user
         self.http = TestClient(app)
+
+    def set_qa_user(self, *, role, client_id, branch_id):
+        user = User(id=str(uuid4()), email=f"rotation-{uuid4().hex}@example.com",
+                    full_name="Rotation QA", password_hash="synthetic-not-a-login-credential",
+                    role=role, client_id=client_id, branch_id=branch_id,
+                    is_active=True, status="active")
+        self.db.add(user)
+        self.db.commit()
+        self.qa_user_id = user.id
 
     def tearDown(self) -> None:
         self.http.close()
@@ -284,12 +296,12 @@ class ScreenRotationTests(TestCase):
     def test_client_and_branch_isolation_for_creation_and_updates(self):
         own = self.create(rotation=90)
         other = self.create(branch_id=self.other_branch.id, rotation=270)
-        self.user = SimpleNamespace(role=UserRole.CLIENT_ADMIN, client_id=self.other_tenant.id, branch_id=None)
+        self.set_qa_user(role=UserRole.CLIENT_ADMIN, client_id=self.other_tenant.id, branch_id=None)
         response = self.http.patch(f"/api/channels/{own['id']}", json={"rotation": 180})
         self.assertEqual(response.status_code, 403)
         response = self.http.post("/api/channels/", json={"branch_id": self.branch.id, "name": "Cross tenant", "rotation": 180})
         self.assertEqual(response.status_code, 403)
-        self.user = SimpleNamespace(role=UserRole.BRANCH_MANAGER, client_id=self.tenant.id, branch_id=self.branch.id)
+        self.set_qa_user(role=UserRole.BRANCH_MANAGER, client_id=self.tenant.id, branch_id=self.branch.id)
         response = self.http.patch(f"/api/channels/{other['id']}", json={"rotation": 180})
         self.assertEqual(response.status_code, 403)
         response = self.http.post("/api/channels/", json={"branch_id": self.other_branch.id, "name": "Cross branch", "rotation": 180})
@@ -300,7 +312,7 @@ class ScreenRotationTests(TestCase):
 
     def test_read_only_role_cannot_write_rotation(self):
         created = self.create(rotation=90)
-        self.user = SimpleNamespace(role=UserRole.OPERATOR, client_id=self.tenant.id, branch_id=self.branch.id)
+        self.set_qa_user(role=UserRole.OPERATOR, client_id=self.tenant.id, branch_id=self.branch.id)
         response = self.http.patch(f"/api/channels/{created['id']}", json={"rotation": 180})
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.persisted(created["id"]).device_outputs[0].rotation, 90)

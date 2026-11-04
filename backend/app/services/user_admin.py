@@ -103,6 +103,14 @@ def build_user_permissions(user: User) -> list[str]:
 
 
 def build_user_read(user: User) -> UserRead:
+    from sqlalchemy import inspect
+    from app.services.tenant_responses import safe_model_read
+    state = inspect(user, raiseerr=False)
+    if state is not None and state.session is not None:
+        return safe_model_read(user, UserRead, state.session).model_copy(update={
+            "is_active": bool(user.is_active),
+            "status": normalize_user_status(user.status, fallback_active=bool(user.is_active)),
+        })
     return UserRead(
         id=user.id,
         created_at=user.created_at,
@@ -158,6 +166,20 @@ def list_super_admins(db: Session) -> list[User]:
     return list(db.scalars(select(User).where(User.role == UserRole.SUPER_ADMIN).order_by(User.created_at.asc())))
 
 
+def lock_super_admin_delete_set(db: Session) -> list[User]:
+    """Shared DELETE/demotion/status invariant; locks last to commit/rollback.
+
+    Include inactive super_admin rows too, then evaluate the existing active
+    policy after locking. Stable IDs avoid own-target lock inversion. Every
+    operation that can reduce the active set participates in this same order.
+    """
+    statement = select(User).where(User.role == UserRole.SUPER_ADMIN).order_by(User.id)
+    if db.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    with db.no_autoflush:
+        return list(db.scalars(statement.execution_options(populate_existing=True)))
+
+
 def ensure_super_admin_survives(
     *,
     db: Session,
@@ -166,13 +188,17 @@ def ensure_super_admin_survives(
     next_status: str | None = None,
     deleting: bool = False,
 ) -> None:
+    if not (deleting or next_role is not None or next_status is not None):
+        return
+    # Populate existing identities only after the shared locks have been taken;
+    # a decision based on an earlier role/status snapshot is not authoritative.
+    super_admins = lock_super_admin_delete_set(db)
     is_current_super_admin = target_user.role == UserRole.SUPER_ADMIN
     will_stop_being_super_admin = is_current_super_admin and next_role is not None and next_role != UserRole.SUPER_ADMIN
     will_be_suspended = is_current_super_admin and next_status is not None and normalize_user_status(next_status) != ACTIVE_USER_STATUS
     if not (deleting or will_stop_being_super_admin or will_be_suspended):
         return
 
-    super_admins = list_super_admins(db)
     active_super_admins = [
         user
         for user in super_admins

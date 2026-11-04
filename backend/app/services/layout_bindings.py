@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.entities import Dataset, DatasetColumn, DatasetImport, DatasetRow, Layout, LayoutBindingField, LayoutBindingPreset, LayoutDataBinding
+from app.services.tenancy import safe_tenant_resource
+from app.models.entities import DataSource, Dataset, DatasetColumn, DatasetImport, DatasetRow, Layout, LayoutBindingField, LayoutBindingPreset, LayoutDataBinding
 
 
 LAYOUT_BINDING_PRESETS: dict[LayoutBindingPreset, dict] = {
@@ -107,24 +108,26 @@ def get_preset_definition(preset_key: LayoutBindingPreset | str) -> dict:
 
 
 def get_dataset_snapshot(db: Session, dataset: Dataset) -> tuple[DatasetImport | None, list[DatasetColumn], list[DatasetRow]]:
+    from app.services.tenant_queries import readable_query
     if not dataset.current_import_id:
         return None, [], []
 
-    import_record = db.get(DatasetImport, dataset.current_import_id)
-    if not import_record:
+    import_record = db.scalar(readable_query(select(DatasetImport), DatasetImport, db=db).where(
+        DatasetImport.id == dataset.current_import_id))
+    if not import_record or import_record.dataset_id != dataset.id:
         return None, [], []
 
     columns = list(
         db.scalars(
-            select(DatasetColumn)
-            .where(DatasetColumn.import_id == import_record.id)
+            readable_query(select(DatasetColumn), DatasetColumn, db=db)
+            .where(DatasetColumn.import_id == import_record.id, DatasetColumn.dataset_id == dataset.id)
             .order_by(DatasetColumn.position_index.asc())
         )
     )
     rows = list(
         db.scalars(
-            select(DatasetRow)
-            .where(DatasetRow.import_id == import_record.id)
+            readable_query(select(DatasetRow), DatasetRow, db=db)
+            .where(DatasetRow.import_id == import_record.id, DatasetRow.dataset_id == dataset.id)
             .order_by(DatasetRow.row_index.asc())
         )
     )
@@ -278,6 +281,13 @@ def resolve_binding_payload(
     db: Session,
 ) -> dict:
     zones = normalize_layout_zones(layout)
+    from app.services.tenant_queries import readable_query
+    from app.services.media_references import read_payload_media_owned, MediaReadContext
+    from fastapi import HTTPException
+    if (db.scalar(readable_query(select(Dataset.id), Dataset, db=db,
+                                client_id=layout.client_id).where(Dataset.id == dataset.id)) is None
+            or not read_payload_media_owned(db, layout.client_id, field_payloads, context=MediaReadContext.STRUCTURED)):
+        raise HTTPException(status_code=404, detail="Resource not found")
     selected_zone = next((zone for zone in zones if zone["key"] == zone_key), zones[0] if zones else None)
     preset = get_preset_definition(preset_key)
     import_record, columns, rows = get_dataset_snapshot(db, dataset)
@@ -286,7 +296,7 @@ def resolve_binding_payload(
     errors: list[str] = []
     if zone_key and not any(zone["key"] == zone_key for zone in zones):
         errors.append("La zona seleccionada ya no existe en el layout.")
-    if not import_record:
+    if not import_record or import_record.dataset_id != dataset.id:
         warnings.append("El dataset aun no tiene una importacion vigente para previsualizar.")
 
     mapped_fields, field_errors, field_warnings, missing_required_fields = build_field_summary(preset, field_payloads, columns)
@@ -297,7 +307,9 @@ def resolve_binding_payload(
     return {
         "binding": serialize_binding(binding) if binding else None,
         "preset": preset,
-        "dataset": serialize_dataset(dataset),
+        "dataset": {**serialize_dataset(dataset), "current_import_id": import_record.id if import_record else None,
+                    "row_count": dataset.row_count if import_record else 0,
+                    "column_count": dataset.column_count if import_record else 0},
         "current_import": serialize_import(import_record),
         "zone": selected_zone,
         "fields": list(field_payloads),
@@ -324,10 +336,29 @@ def resolve_binding_payload(
 
 
 def build_layout_data_preview(layout: Layout, bindings: Sequence[LayoutDataBinding], db: Session, row_limit: int | None = None) -> dict:
+    from app.services.tenant_queries import readable_query
     zones = normalize_layout_zones(layout)
     serialized_bindings: list[dict] = []
-    for binding in sorted(bindings, key=lambda item: (item.sort_order, item.created_at or datetime.now(timezone.utc))):
-        dataset = binding.dataset
+    # All alternate callers, including editor-state and revision previews, use
+    # the same complete eligibility predicate before ordering/serialization.
+    eligible_bindings = db.scalars(readable_query(select(LayoutDataBinding), LayoutDataBinding,
+                                                 db=db, client_id=layout.client_id).where(
+        LayoutDataBinding.id.in_([binding.id for binding in bindings]),
+        LayoutDataBinding.layout_id == layout.id,
+        LayoutDataBinding.is_active.is_(True),
+    ).order_by(LayoutDataBinding.sort_order, LayoutDataBinding.created_at))
+    for binding in eligible_bindings:
+        dataset = safe_tenant_resource(db, Dataset, binding.dataset_id, layout.client_id)
+        if not binding.is_active or binding.layout_id != layout.id or dataset is None:
+            continue
+        if not safe_tenant_resource(db, DataSource, dataset.data_source_id, layout.client_id):
+            continue
+        if dataset.current_import_id:
+            record = db.get(DatasetImport, dataset.current_import_id)
+            if record is None or record.dataset_id != dataset.id:
+                continue
+        fields = list(db.scalars(readable_query(select(LayoutBindingField), LayoutBindingField, db=db).where(
+            LayoutBindingField.binding_id == binding.id).order_by(LayoutBindingField.position_index, LayoutBindingField.created_at)))
         field_payloads = [
             {
                 "target_field": field.target_field,
@@ -339,7 +370,7 @@ def build_layout_data_preview(layout: Layout, bindings: Sequence[LayoutDataBindi
                 "is_required": field.is_required,
                 "options_json": field.options_json,
             }
-            for field in sorted(binding.fields, key=lambda item: (item.position_index, item.created_at or datetime.now(timezone.utc)))
+            for field in fields
         ]
         payload = resolve_binding_payload(
             layout=layout,
@@ -351,7 +382,7 @@ def build_layout_data_preview(layout: Layout, bindings: Sequence[LayoutDataBindi
             binding=binding,
             db=db,
         )
-        payload["fields"] = [serialize_field(field) for field in sorted(binding.fields, key=lambda item: (item.position_index, item.created_at or datetime.now(timezone.utc)))]
+        payload["fields"] = [serialize_field(field) for field in fields]
         serialized_bindings.append(payload)
 
     return {

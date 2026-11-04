@@ -1,3 +1,7 @@
+from app.services.tenant_ownership import RowRef
+from uuid import uuid4
+from types import SimpleNamespace
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -32,6 +36,12 @@ from app.services.videowall_geometry import (
     row_col_from_position,
 )
 
+
+from app.services.tenant_mutations import delete_guard, MutationIntent, write_guard
+
+
+from app.services.tenant_responses import read_snapshot, safe_model_read
+from app.services.tenant_queries import readable_query
 
 router = APIRouter()
 MULTI_NODE_RENDER_MODE = "multi-node"
@@ -247,14 +257,20 @@ def _apply_geometry_to_node(node: VideowallNode, geometry: VideowallCellGeometry
     node.height = geometry.height
 
 
+def _node_geometry_values(geometry):
+    return {field: getattr(geometry, field) for field in
+            ("position_index", "row_index", "column_index", "x", "y", "width", "height")}
+
+
 @router.get("/", response_model=list[VideowallRead])
+@read_snapshot(response_model=list[VideowallRead])
 def list_videowalls(
     client_id: str | None = Query(default=None),
     branch_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[Videowall]:
-    query = apply_client_filter(select(Videowall).order_by(Videowall.created_at.desc()), Videowall, current_user)
+    query = apply_client_filter(readable_query(select(Videowall), Videowall, db=db).order_by(Videowall.created_at.desc()), Videowall, current_user)
     target_client_id = require_client_scope(current_user, client_id) if client_id or current_user.client_id else None
     if target_client_id:
         query = query.where(Videowall.client_id == target_client_id)
@@ -305,7 +321,7 @@ def create_videowall(
         else None
     )
 
-    videowall = Videowall(
+    values = dict(
         client_id=client_id,
         name=name,
         render_mode=render_mode,
@@ -319,10 +335,14 @@ def create_videowall(
         start_tolerance_ms=_require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms"),
         sync_mode=(payload.sync_mode or "play_at_timestamp").strip() or "play_at_timestamp",
     )
-    db.add(videowall)
-    db.commit()
-    db.refresh(videowall)
-    return videowall
+    ref = RowRef("Videowall", str(uuid4()))
+    intent = MutationIntent("CREATE", ref, tuple(values.items()))
+    with write_guard(db, actor=current_user, client_id=client_id, operation="create_videowall", intents=(intent,)):
+        videowall = Videowall(id=ref.identity, **values)
+        db.add(videowall)
+        db.commit()
+        db.refresh(videowall)
+        return videowall
 
 
 @router.patch("/{videowall_id}", response_model=VideowallRead)
@@ -374,35 +394,40 @@ def update_videowall(
                 detail="No se puede redimensionar la matriz porque uno o más nodos quedarían fuera de rango",
             )
 
+    copied_fields = ("id", "client_id", "name", "render_mode", "columns", "rows", "total_width", "total_height",
+                     "output_width", "output_height", "primary_channel_id", "start_tolerance_ms", "sync_mode")
+    previous = {field: getattr(videowall, field) for field in copied_fields}
+    proposed_wall = SimpleNamespace(**previous)
+    node_geometries = {}
     if payload.name is not None:
         next_name = payload.name.strip()
         if not next_name:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre del videowall es obligatorio")
-        videowall.name = next_name
+        proposed_wall.name = next_name
     if next_render_mode == HARDWARE_SINGLE_INPUT_RENDER_MODE:
-        requested_primary_channel_id = payload.primary_channel_id if "primary_channel_id" in payload.model_fields_set else videowall.primary_channel_id
+        requested_primary_channel_id = payload.primary_channel_id if "primary_channel_id" in payload.model_fields_set else proposed_wall.primary_channel_id
         primary_channel = _require_hardware_primary_channel(
             db=db,
             current_user=current_user,
-            client_id=videowall.client_id,
+            client_id=proposed_wall.client_id,
             primary_channel_id=requested_primary_channel_id,
-            exclude_videowall_id=videowall.id,
+            exclude_videowall_id=proposed_wall.id,
         )
-        videowall.primary_channel_id = primary_channel.id
+        proposed_wall.primary_channel_id = primary_channel.id
     else:
-        videowall.primary_channel_id = None
+        proposed_wall.primary_channel_id = None
 
-    videowall.render_mode = next_render_mode
-    videowall.columns = columns
-    videowall.rows = rows
-    videowall.total_width = total_width
-    videowall.total_height = total_height
-    videowall.output_width = output_width
-    videowall.output_height = output_height
+    proposed_wall.render_mode = next_render_mode
+    proposed_wall.columns = columns
+    proposed_wall.rows = rows
+    proposed_wall.total_width = total_width
+    proposed_wall.total_height = total_height
+    proposed_wall.output_width = output_width
+    proposed_wall.output_height = output_height
     if payload.start_tolerance_ms is not None:
-        videowall.start_tolerance_ms = _require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms")
+        proposed_wall.start_tolerance_ms = _require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms")
     if payload.sync_mode is not None:
-        videowall.sync_mode = payload.sync_mode.strip() or videowall.sync_mode
+        proposed_wall.sync_mode = payload.sync_mode.strip() or proposed_wall.sync_mode
 
     if next_render_mode == MULTI_NODE_RENDER_MODE:
         for node in nodes:
@@ -414,12 +439,26 @@ def update_videowall(
                 row_index=node.row_index,
                 column_index=node.column_index,
             )
-            _apply_geometry_to_node(node, geometry)
-
-    db.add(videowall)
-    db.commit()
-    db.refresh(videowall)
-    return videowall
+            node_geometries[node.id] = geometry
+    proposed = {field: getattr(proposed_wall, field) for field in copied_fields
+                if field != "id" and getattr(proposed_wall, field) != previous[field]}
+    intents = (MutationIntent("UPDATE", RowRef("Videowall", videowall.id), tuple(proposed.items())),)
+    intents += tuple(MutationIntent("UPDATE", RowRef("VideowallNode", identity),
+                                    tuple(_node_geometry_values(geometry).items()))
+                     for identity, geometry in node_geometries.items())
+    expected_ids = {node.id for node in nodes}
+    with write_guard(db, actor=current_user, client_id=videowall.client_id, operation="update_videowall", intents=intents):
+        if set(db.scalars(select(VideowallNode.id).where(VideowallNode.videowall_id == videowall.id))) != expected_ids:
+            raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
+        for field, value in proposed.items():
+            setattr(videowall, field, value)
+        for node in nodes:
+            if node.id in node_geometries:
+                _apply_geometry_to_node(node, node_geometries[node.id])
+        db.add(videowall)
+        db.commit()
+        db.refresh(videowall)
+        return videowall
 
 
 @router.delete("/{videowall_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -432,47 +471,49 @@ def delete_videowall(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
-    nodes = list(
-        db.scalars(
-            select(VideowallNode)
-            .where(VideowallNode.videowall_id == videowall.id)
-            .order_by(VideowallNode.position_index.asc(), VideowallNode.created_at.asc())
+    with delete_guard(db, (videowall,), actor=current_user, operation="delete_videowall"):
+        nodes = list(
+            db.scalars(
+                select(VideowallNode)
+                .where(VideowallNode.videowall_id == videowall.id)
+                .order_by(VideowallNode.position_index.asc(), VideowallNode.created_at.asc())
+            )
         )
-    )
 
-    blocked_nodes: list[str] = []
-    channels_to_delete: list[Channel] = []
-    if _normalize_render_mode(videowall.render_mode) == HARDWARE_SINGLE_INPUT_RENDER_MODE:
-        if videowall.primary_channel_id:
-            primary_channel = get_channel_in_scope(db, videowall.primary_channel_id, current_user)
-            if is_player_online(primary_channel.last_heartbeat_at):
-                blocked_nodes.append(f"la entrada HDMI principal ({primary_channel.name}) está en línea")
-            else:
-                channels_to_delete.append(primary_channel)
-    else:
+        blocked_nodes: list[str] = []
+        channels_to_delete: list[Channel] = []
+        if _normalize_render_mode(videowall.render_mode) == HARDWARE_SINGLE_INPUT_RENDER_MODE:
+            if videowall.primary_channel_id:
+                primary_channel = get_channel_in_scope(db, videowall.primary_channel_id, current_user)
+                if is_player_online(primary_channel.last_heartbeat_at):
+                    blocked_nodes.append(f"la entrada HDMI principal ({primary_channel.name}) está en línea")
+                else:
+                    channels_to_delete.append(primary_channel)
+        else:
+            for node in nodes:
+                channel = get_channel_in_scope(db, node.channel_id, current_user)
+                if is_player_online(channel.last_heartbeat_at):
+                    blocked_nodes.append(f"el monitor {node.position_index} ({channel.name}) está en línea")
+                    continue
+                channels_to_delete.append(channel)
+
+        if blocked_nodes:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=build_videowall_delete_block_message(videowall, blocked_nodes),
+            )
+
         for node in nodes:
-            channel = get_channel_in_scope(db, node.channel_id, current_user)
-            if is_player_online(channel.last_heartbeat_at):
-                blocked_nodes.append(f"el monitor {node.position_index} ({channel.name}) está en línea")
-                continue
-            channels_to_delete.append(channel)
-
-    if blocked_nodes:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=build_videowall_delete_block_message(videowall, blocked_nodes),
-        )
-
-    for node in nodes:
-        db.delete(node)
-    for channel in channels_to_delete:
-        cleanup_channel_delete_dependencies(db, channel)
-        db.delete(channel)
-    db.delete(videowall)
-    db.commit()
+            db.delete(node)
+        for channel in channels_to_delete:
+            cleanup_channel_delete_dependencies(db, channel)
+            db.delete(channel)
+        db.delete(videowall)
+        db.commit()
 
 
 @router.get("/{videowall_id}/nodes", response_model=list[VideowallNodeRead])
+@read_snapshot(response_model=list[VideowallNodeRead])
 def list_nodes(
     videowall_id: str,
     db: Session = Depends(get_db),
@@ -483,7 +524,7 @@ def list_nodes(
         return []
     return list(
         db.scalars(
-            select(VideowallNode)
+            readable_query(select(VideowallNode), VideowallNode, db=db)
             .where(VideowallNode.videowall_id == videowall_id)
             .order_by(VideowallNode.row_index.asc(), VideowallNode.column_index.asc(), VideowallNode.position_index.asc())
         )
@@ -548,12 +589,22 @@ def upsert_node(
     )
     _ensure_node_slot_available(videowall.id, geometry, db, exclude_node_id=existing_node.id if existing_node else None)
 
-    node = existing_node or VideowallNode(videowall_id=videowall.id, channel_id=channel.id)
-    _apply_geometry_to_node(node, geometry)
-    db.add(node)
-    db.commit()
-    db.refresh(node)
-    return node
+    values = dict(videowall_id=videowall.id, channel_id=channel.id, **_node_geometry_values(geometry))
+    ref = RowRef("VideowallNode", existing_node.id if existing_node else str(uuid4()))
+    intents = (MutationIntent("UPDATE", RowRef("Videowall", videowall.id)),
+               MutationIntent("UPDATE", RowRef("Channel", channel.id)),
+               MutationIntent("UPDATE" if existing_node else "CREATE", ref, tuple(values.items())))
+    with write_guard(db, actor=current_user, client_id=videowall.client_id, operation="upsert_node", intents=intents):
+        if db.scalar(select(VideowallNode.id).where(VideowallNode.channel_id == channel.id,
+                        VideowallNode.videowall_id != videowall.id).limit(1)):
+            raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
+        _ensure_node_slot_available(videowall.id, geometry, db, exclude_node_id=existing_node.id if existing_node else None)
+        node = existing_node or VideowallNode(id=ref.identity, videowall_id=videowall.id, channel_id=channel.id)
+        _apply_geometry_to_node(node, geometry)
+        db.add(node)
+        db.commit()
+        db.refresh(node)
+        return node
 
 
 @router.patch("/{videowall_id}/nodes/{node_id}", response_model=VideowallNodeRead)
@@ -590,12 +641,15 @@ def update_node_position(
         fallback_column_index=node.column_index,
     )
     _ensure_node_slot_available(videowall.id, geometry, db, exclude_node_id=node.id)
-    _apply_geometry_to_node(node, geometry)
-
-    db.add(node)
-    db.commit()
-    db.refresh(node)
-    return node
+    intent = MutationIntent("UPDATE", RowRef("VideowallNode", node.id), tuple(_node_geometry_values(geometry).items()))
+    with write_guard(db, actor=current_user, client_id=videowall.client_id, operation="update_node_position",
+                     intents=(MutationIntent("UPDATE", RowRef("Videowall", videowall.id)), intent)):
+        _ensure_node_slot_available(videowall.id, geometry, db, exclude_node_id=node.id)
+        _apply_geometry_to_node(node, geometry)
+        db.add(node)
+        db.commit()
+        db.refresh(node)
+        return node
 
 
 @router.delete("/{videowall_id}/nodes/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -619,21 +673,23 @@ def delete_node_screen(
     if not node:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Videowall node not found")
 
-    channel = get_channel_in_scope(db, node.channel_id, current_user)
-    delete_block_message = get_channel_delete_block_message(db, channel, include_videowall_membership=False)
-    if delete_block_message:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=delete_block_message,
-        )
+    with delete_guard(db, (node,), actor=current_user, operation="delete_node_screen"):
+        channel = get_channel_in_scope(db, node.channel_id, current_user)
+        delete_block_message = get_channel_delete_block_message(db, channel, include_videowall_membership=False)
+        if delete_block_message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=delete_block_message,
+            )
 
-    cleanup_channel_delete_dependencies(db, channel)
-    db.delete(node)
-    db.delete(channel)
-    db.commit()
+        cleanup_channel_delete_dependencies(db, channel)
+        db.delete(node)
+        db.delete(channel)
+        db.commit()
 
 
 @router.get("/{videowall_id}/preview")
+@read_snapshot()
 def get_preview(
     videowall_id: str,
     db: Session = Depends(get_db),
@@ -642,12 +698,12 @@ def get_preview(
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
     nodes = list(
         db.scalars(
-            select(VideowallNode)
+            readable_query(select(VideowallNode), VideowallNode, db=db)
             .where(VideowallNode.videowall_id == videowall_id)
             .order_by(VideowallNode.row_index.asc(), VideowallNode.column_index.asc(), VideowallNode.position_index.asc())
         )
     )
     return {
-        "videowall": VideowallRead.model_validate(videowall).model_dump(),
+        "videowall": safe_model_read(videowall, VideowallRead, db).model_dump(),
         "nodes": [VideowallNodeRead.model_validate(node).model_dump() for node in nodes],
     }
