@@ -3,6 +3,8 @@ import { useParams } from "react-router-dom";
 
 import { SectionCard } from "../components/SectionCard";
 import { VideowallMatrix } from "../components/VideowallMatrix";
+import { VideowallPublicationsPanel } from "../components/dashboard/VideowallPublicationsPanel";
+import { VideowallPlaybackGroupsPanel } from "../components/dashboard/VideowallPlaybackGroupsPanel";
 import { apiRequest } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { canAccessGlobalClients, canWriteClientScope } from "../lib/rbac";
@@ -140,6 +142,11 @@ export function VideowallPage() {
   return (
     <div className="space-y-6">
       {error ? <div className="rounded-[24px] bg-rose-50 px-5 py-4 text-sm text-rose-700">{error}</div> : null}
+
+      {selectedVideowall ? <VideowallPlaybackGroupsPanel wall={selectedVideowall} nodes={nodes} channels={channels} token={token}
+        canManage={canManageVideowalls} onSaved={async (saved) => { setVideowalls((previous) => previous.map((wall) => wall.id === saved.id ? saved : wall)); await loadData(saved.id); }} /> : null}
+      {selectedVideowall && !selectedVideowall.playback_groups_enabled ? <VideowallPublicationsPanel wall={selectedVideowall} nodes={nodes} token={token}
+        canManage={canManageVideowalls} onSaved={(saved) => setVideowalls((previous) => previous.map((wall) => wall.id === saved.id ? saved : wall))} /> : null}
 
       <div className="grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
         <SectionCard title="Videowalls" subtitle="La configuración permanece simple, pero ya vive dentro del cliente correcto.">

@@ -5,6 +5,8 @@ import { apiRequest } from "../../lib/api";
 import type { Channel, Videowall, VideowallNode, VideowallRenderMode } from "../../types/domain";
 import { getApiErrorMessage } from "./apiError";
 import { SimpleVideowallMatrix } from "./SimpleVideowallMatrix";
+import { VideowallPublicationsPanel } from "./VideowallPublicationsPanel";
+import { VideowallPlaybackGroupsPanel } from "./VideowallPlaybackGroupsPanel";
 
 function normalizePositiveInt(value: number, fallback: number) {
   if (!Number.isFinite(value) || value <= 0) {
@@ -20,6 +22,7 @@ export function VideowallEditDrawer({
   videowall,
   nodes,
   channels,
+  canManage = false,
   onClose,
   onSaved,
 }: {
@@ -28,6 +31,7 @@ export function VideowallEditDrawer({
   videowall: Videowall | null;
   nodes: VideowallNode[];
   channels: Channel[];
+  canManage?: boolean;
   onClose: () => void;
   onSaved: (videowall: Videowall) => Promise<void> | void;
 }) {
@@ -79,7 +83,7 @@ export function VideowallEditDrawer({
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!token) {
+    if (!token || !canManage) {
       return;
     }
 
@@ -90,7 +94,7 @@ export function VideowallEditDrawer({
       const response = await apiRequest<Videowall>(`/videowalls/${activeVideowall.id}`, {
         method: "PATCH",
         token,
-        body: {
+        body: activeVideowall.playback_groups_enabled ? { name: name.trim() } : {
           name: name.trim(),
           render_mode: renderMode,
           rows: normalizePositiveInt(rows, activeVideowall.rows),
@@ -142,7 +146,13 @@ export function VideowallEditDrawer({
 
         {error ? <div className="mt-5 rounded-[20px] bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
 
+        <div className="mt-5"><VideowallPlaybackGroupsPanel wall={activeVideowall} nodes={nodes} channels={channels} token={token}
+          canManage={canManage} onSaved={onSaved} /></div>
+        {!activeVideowall.playback_groups_enabled ? <div className="mt-5"><VideowallPublicationsPanel wall={activeVideowall} nodes={nodes} token={token}
+          canManage={canManage} onSaved={onSaved} /></div> : null}
+
         <form className="mt-6 space-y-5" onSubmit={handleSubmit}>
+          {activeVideowall.playback_groups_enabled ? <p className="text-sm text-slate-600">Edita la distribución y reproducción en el panel superior. Este formulario sólo cambia el nombre.</p> : null}
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
             <div className="rounded-[24px] border border-slate-200 bg-white p-4">
               <label className="mb-2 block text-sm font-semibold text-slate-700">Nombre del grupo</label>
@@ -173,6 +183,7 @@ export function VideowallEditDrawer({
                         active ? "border-cyan-300 bg-cyan-50" : "border-slate-200 bg-white hover:border-slate-300",
                       ].join(" ")}
                       type="button"
+                      disabled={Boolean(activeVideowall.playback_groups_enabled)}
                       onClick={() => setRenderMode(option.id)}
                     >
                       <p className="font-semibold text-ink">{option.title}</p>
@@ -184,7 +195,7 @@ export function VideowallEditDrawer({
             </div>
           </div>
 
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <fieldset disabled={Boolean(activeVideowall.playback_groups_enabled)} className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             <div>
               <label className="mb-2 block text-sm font-semibold text-slate-700">Filas</label>
               <input type="number" min={1} value={rows} onChange={(event) => setRows(Number(event.target.value) || 1)} />
@@ -209,7 +220,7 @@ export function VideowallEditDrawer({
               <label className="mb-2 block text-sm font-semibold text-slate-700">Salida HDMI alto</label>
               <input type="number" min={1} value={outputHeight} onChange={(event) => setOutputHeight(Number(event.target.value) || 1)} />
             </div>
-          </div>
+          </fieldset>
 
           {isHardwareSingleInput ? (
             <section className="rounded-[24px] border border-slate-200 bg-slate-50 p-5">
@@ -283,13 +294,14 @@ export function VideowallEditDrawer({
                 />
               </div>
               <p className="mt-4 text-xs text-slate-500">
-                Los nodos actuales se conservan. Si reduces filas o columnas y algún nodo queda fuera de rango, el backend bloqueará el cambio.
+                {activeVideowall.playback_groups_enabled ? "La distribución guardada se modifica desde el panel físico superior; los nodos no asignados conservan su identidad."
+                  : "Los nodos actuales se conservan. Para reducir el layout preservando nodos fuera de rango, usa Configurar layout y grupos."}
               </p>
             </section>
           )}
 
           <div className="flex flex-wrap gap-3">
-            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting} type="submit">
+            <button className="rounded-[20px] bg-ink px-5 py-4 font-semibold text-white" disabled={isSubmitting || !canManage || !token} type="submit">
               {isSubmitting ? "Guardando..." : "Guardar videowall"}
             </button>
             <button

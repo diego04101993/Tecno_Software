@@ -9,6 +9,7 @@ import logging
 from collections import defaultdict
 from enum import Enum
 from dataclasses import dataclass
+from types import MappingProxyType
 from urllib.parse import urlsplit, urljoin
 
 from contextlib import contextmanager
@@ -30,6 +31,319 @@ from app.services.media_storage import MediaPathError, StoredUpload, resolve_sto
 logger = logging.getLogger(__name__)
 _STATE = "media_reference_operation"
 _SQLITE_LOCK = RLock()
+_GENERATED_REFS = "vw1_generated_reference_batch"
+_OWNERSHIP_VALIDATION_PHASE = "media_ownership_validation_phase"
+
+
+class _OwnershipValidationPhase:
+    """Read-only proof lifetime, never a Session/request/transaction-wide cache.
+
+    READ COMMITTED alone cannot justify reuse. Ownership indexes may be reused
+    only while the exact complete canonical path batch remains coordinated.
+    Public index builders and lookups outside that batch remain fresh.
+    """
+    def __init__(self, db):
+        self.db = db
+        self.connection = db.connection()
+        self.transaction = db.get_transaction()
+        self.connection_transaction = self.connection.get_transaction()
+        self.media_state = db.info.get(_STATE)
+        self.paths = frozenset((self.media_state or {}).get("paths") or ())
+        self.coordinator = (self.media_state or {}).get("connection")
+        self.media_engine = (self.media_state or {}).get("engine")
+        self.sqlite_coordinator = (self.media_state or {}).get("sqlite")
+        self.coordinator_transaction = self.coordinator.get_transaction() if self.coordinator is not None else None
+        self.indexes = {}
+        self.invalidate_callbacks = []
+        self.tainted = False
+        self.active = True
+        self.reusable = True
+        self.listeners = []
+
+    def invalidate(self):
+        self.tainted = True
+        self.indexes.clear()
+        for callback in self.invalidate_callbacks:
+            callback()
+
+    def decline(self):
+        self.reusable = False
+        self.indexes.clear()
+        for callback in self.invalidate_callbacks:
+            callback()
+
+    def deny(self, *_args):
+        from app.services.tenant_relations import conflict
+        self.invalidate()
+        raise conflict()
+
+    def check(self):
+        from app.services.tenant_relations import conflict
+        if (not self.active or self.tainted or self.db.info.get(_OWNERSHIP_VALIDATION_PHASE) is not self
+                or self.db.get_transaction() is not self.transaction
+                or self.connection.closed or self.connection.get_transaction() is not self.connection_transaction
+                or self.db.new or self.db.dirty or self.db.deleted):
+            self.invalidate()
+            raise conflict()
+        if self.db.info.get(_STATE) is not self.media_state:
+            self.invalidate()
+            raise conflict()
+        if self.media_state is not None and (
+                self.media_state.get("connection") is not self.coordinator
+                or self.media_state.get("engine") is not self.media_engine
+                or self.media_state.get("sqlite") != self.sqlite_coordinator
+                or frozenset(self.media_state.get("paths") or ()) != self.paths
+                or self.media_state.get("committed")):
+            self.invalidate()
+            raise conflict()
+        if self.coordinator is not None and (self.coordinator.closed
+                or self.coordinator.get_transaction() is not self.coordinator_transaction):
+            self.invalidate()
+            raise conflict()
+
+    def before_cursor(self, _conn, _cursor, _statement, _parameters, context, _many):
+        """Only structured read statements are valid during a proof phase.
+
+        Inspect the entire SQL expression, including writable CTEs. Unknown
+        driver/text SQL cannot silently mutate authority behind a cached proof.
+        The normal writer's DML runs after this scope has removed its listeners.
+        SQL function names remain reviewed backend code; this is not a general
+        SQL sandbox for user-supplied statements or arbitrary stored functions.
+        """
+        from sqlalchemy.sql.ddl import DDLElement
+        from sqlalchemy.sql.elements import TextClause
+        self.check()
+        statement = context.compiled.statement if context.compiled is not None else None
+        if statement is None or isinstance(statement, TextClause):
+            # Preserve these exact, known read operations, without assuming a
+            # general SQL parser or retaining any proof across unknown code.
+            import re
+            if re.fullmatch(r"\s*SELECT\s+(?:1|current_database\s*\(\s*\)|current_schema\s*\(\s*\))\s*;?\s*",
+                            _statement, flags=re.IGNORECASE):
+                self.decline()
+                return
+            self.deny()
+        if statement is None or not getattr(statement, "is_select", False):
+            self.deny()
+        pending, seen = [statement], set()
+        while pending:
+            node = pending.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if getattr(node, "is_dml", False) or isinstance(node, (DDLElement, TextClause)):
+                self.deny()
+            pending.extend(node.get_children())
+
+    def transaction_ended(self, *_args):
+        self.invalidate()
+
+    def install(self):
+        for target, name, callback in (
+            (self.db, "before_flush", self.deny),
+            (self.db, "before_commit", self.deny),
+            (self.db, "after_transaction_end", self.transaction_ended),
+            (self.connection, "before_cursor_execute", self.before_cursor),
+            (self.connection, "commit", self.deny),
+            (self.connection, "rollback", self.transaction_ended),
+        ):
+            event.listen(target, name, callback)
+            self.listeners.append((target, name, callback))
+
+    def close(self):
+        self.active = False
+        self.indexes.clear()
+        for target, name, callback in reversed(self.listeners):
+            event.remove(target, name, callback)
+        self.listeners.clear()
+        self.invalidate_callbacks.clear()
+
+    def owners(self, root, path):
+        self.check()
+        if (not self.reusable or not self.paths or path not in self.paths or self.media_state is None
+                or (self.db.get_bind().dialect.name == "postgresql" and self.coordinator is None)
+                or (self.db.get_bind().dialect.name == "sqlite" and not self.media_state.get("sqlite"))):
+            return media_reference_owners(self.db, root)
+        key = root.resolve()
+        if key not in self.indexes:
+            self.indexes[key] = MappingProxyType({p: frozenset(owners)
+                for p, owners in media_reference_owners(self.db, root).items()})
+        self.check()
+        return self.indexes[key]
+
+
+@contextmanager
+def media_ownership_validation_phase(db):
+    """One pure preflight only; exit/rollback/exception cannot retain authority."""
+    from app.services.tenant_relations import conflict
+    existing = db.info.get(_OWNERSHIP_VALIDATION_PHASE)
+    if existing is not None:
+        if type(existing) is _OwnershipValidationPhase:
+            existing.invalidate()
+        raise conflict()
+    if db.new or db.dirty or db.deleted:
+        raise conflict()
+    phase = _OwnershipValidationPhase(db)
+    db.info[_OWNERSHIP_VALIDATION_PHASE] = phase
+    failed = False
+    try:
+        phase.install()
+        try:
+            yield phase
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            # An unsafe mutation followed by no further cache lookup must also
+            # fail closed. Do not mask an exception already rejecting the proof.
+            if not failed:
+                phase.check()
+    finally:
+        phase.close()
+        db.info.pop(_OWNERSHIP_VALIDATION_PHASE, None)
+
+
+def _private_identity(path: Path):
+    import stat
+    if path.is_symlink():
+        raise MediaPathError("GENERATED_MEDIA_SOURCE_INVALID")
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+        raise MediaPathError("GENERATED_MEDIA_SOURCE_INVALID")
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+class _GeneratedReferenceBatch:
+    """Backend-only capability for a complete, guarded publication batch.
+
+    No schema accepts this object. Reservations do not write public files or
+    establish ownership; the fresh tenant guard must authorize every CREATE.
+    """
+    def __init__(self, db, pairs):
+        from sqlalchemy import inspect
+        from uuid import uuid4
+        self.db, self.plan = db, None
+        self.entries = []
+        self.contents = tuple(content for content, _ in pairs)
+        self.transaction = None
+        root = get_settings().MEDIA_ROOT.resolve()
+        seen = set()
+        for content, private in pairs:
+            if (type(content) is not ContentItem or not inspect(content).transient
+                    or not content.id or content.id in seen or content.file_path is not None
+                    or db.get(Client, content.client_id) is None):
+                raise MediaPathError("GENERATED_REFERENCE_INVALID")
+            seen.add(content.id)
+            private = Path(private)
+            info = _private_identity(private)
+            private = private.resolve()
+            if private.is_relative_to(root) or private.suffix.lower() not in {".png", ".mp4"}:
+                raise MediaPathError("GENERATED_MEDIA_SOURCE_INVALID")
+            digest = sha256()
+            with private.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if _private_identity(private) != info:
+                raise MediaPathError("GENERATED_MEDIA_CHANGED")
+            from app.services.media_storage import contained_media_path, normalize_upload_filename
+            if normalize_upload_filename(content.client_id) != content.client_id:
+                raise MediaPathError("GENERATED_REFERENCE_INVALID")
+            destination = contained_media_path(root, root / content.client_id / (uuid4().hex + private.suffix.lower()))
+            if destination.exists() or destination.is_symlink():
+                raise MediaPathError("GENERATED_MEDIA_TARGET_EXISTS")
+            content.file_path = "/media/" + destination.relative_to(root).as_posix()
+            self.entries.append(dict(content=content, private=private, identity=info,
+                                     destination=destination, checksum=digest.hexdigest(), published=None))
+
+    def authorizes(self, identity, client_id, path):
+        for entry in self.entries:
+            content = entry["content"]
+            if (content.id, content.client_id, entry["destination"]) != (identity, client_id, path):
+                continue
+            try:
+                if _private_identity(entry["private"]) != entry["identity"]:
+                    return False
+                if entry["published"] is None:
+                    return not path.exists() and not path.is_symlink()
+                return _private_identity(path) == entry["published"]
+            except (OSError, MediaPathError):
+                return False
+        return False
+
+    def publish(self):
+        from app.services.media_storage import promote_generated_media
+        from app.services.tenant_relations import conflict
+        if (self.plan is None or not self.plan._gate.active
+                or self.db.get_transaction() is not self.plan._transaction
+                or self.transaction is not self.db.get_transaction()):
+            raise conflict()
+        state = self.db.info.get(_STATE)
+        if state is None or any(e["destination"] not in (state["paths"] or set()) for e in self.entries):
+            raise MediaPathError("MEDIA_LOCK_REQUIRED")
+        root = get_settings().MEDIA_ROOT
+        for entry in self.entries:
+            content = entry["content"]
+            if not self.authorizes(content.id, content.client_id, entry["destination"]):
+                raise MediaPathError("GENERATED_MEDIA_CHANGED")
+            if entry["published"] is not None:
+                raise MediaPathError("GENERATED_REFERENCE_ALREADY_PUBLISHED")
+            uploaded = promote_generated_media(root, content.client_id, entry["private"],
+                                               entry["destination"], entry["checksum"])
+            entry["published"] = _private_identity(uploaded.physical_path)
+            # All mutations remain in the caller's one transaction. Complete
+            # orphans after a failed commit follow the existing upload policy.
+            self.db.add(content)
+
+
+@contextmanager
+def generated_content_references(db, pairs):
+    """Reserve private worker results; caller builds intents, guards, then publish()."""
+    if _GENERATED_REFS in db.info or db.new or db.dirty or db.deleted:
+        raise MediaPathError("GENERATED_REFERENCE_SCOPE_INVALID")
+    pairs = tuple(pairs)
+    if not pairs:
+        raise MediaPathError("GENERATED_REFERENCE_EMPTY")
+    batch = _GeneratedReferenceBatch(db, pairs)
+    db.info[_GENERATED_REFS] = batch
+    try:
+        yield batch
+    finally:
+        batch.plan = None
+        db.info.pop(_GENERATED_REFS, None)
+
+
+def generated_media_reference_authorized(db, identity, client_id, path):
+    batch = db.info.get(_GENERATED_REFS)
+    return (type(batch) is _GeneratedReferenceBatch
+            and batch.authorizes(identity, client_id, path))
+
+
+@contextmanager
+def generated_reference_guard(db, plan):
+    """Bind the capability to the actual, already checked A6/A7 write plan."""
+    from app.services.tenant_relations import conflict
+    batch = db.info.get(_GENERATED_REFS)
+    if batch is None:
+        yield
+        return
+    if type(batch) is not _GeneratedReferenceBatch or batch.plan is not None:
+        raise conflict()
+    created = {intent.reference.identity for intent in plan.intents
+               if intent.action == "CREATE" and intent.reference.model == "ContentItem"}
+    proposals = {p.reference.identity: p.values for p in plan.proposed
+                 if p.reference.model == "ContentItem"}
+    if created != {c.id for c in batch.contents}:
+        raise conflict()
+    for content in batch.contents:
+        values = proposals.get(content.id)
+        if (values is None or values.get("file_path") != content.file_path
+                or values.get("client_id") != content.client_id):
+            raise conflict()
+    batch.plan, batch.transaction = plan, db.get_transaction()
+    try:
+        yield
+    finally:
+        batch.plan = None
 
 
 def _strings(value):
@@ -102,7 +416,11 @@ def media_protected_paths(db: Session, root: Path) -> set[Path]:
 
 def media_owned_by(db: Session, root: Path, path: Path, client_id: str,
                    references: dict[Path, set[str | None]] | None = None) -> bool:
-    refs = references if references is not None else media_reference_owners(db, root)
+    phase = db.info.get(_OWNERSHIP_VALIDATION_PHASE)
+    if phase is not None:
+        phase.check()
+    refs = references if references is not None else (
+        phase.owners(root, path) if phase is not None else media_reference_owners(db, root))
     owners = set(refs.get(path, set()))
     # A directory can veto contradictory historical records, never establish ownership.
     parts = path.relative_to(root.resolve()).parts

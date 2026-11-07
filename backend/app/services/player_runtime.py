@@ -831,14 +831,32 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Player operation unavailable")
     client = db.get(Client, channel.client_id)
     branch = db.get(Branch, channel.branch_id)
-    schedule_current, campaigns_payload, primary_campaign = _resolve_runtime_campaigns(channel, db)
+    from app.services.videowall_playback_groups import resolve_channel_playback_group
+    playback_context = resolve_channel_playback_group(db, channel)
+    standalone_group = playback_context is not None and (
+        playback_context[1] is None or playback_context[1].mode == "INDIVIDUAL")
+    from app.services.videowall_runtime import build_node_slice_runtime
+    node_slice = None if standalone_group else build_node_slice_runtime(channel, db, base_url, generated_at,
+                                         snapshot_coherent=snapshot_coherent, playback_context=playback_context)
+    if node_slice is not None:
+        return node_slice
+    if standalone_group:
+        group = playback_context[1]
+        primary_campaign = safe_tenant_resource(db, Campaign, group.campaign_id, channel.client_id) if group else None
+        schedule_current = None
+        campaigns_payload = ([dict(campaign_id=primary_campaign.id, name=primary_campaign.name,
+            description=primary_campaign.description, layout_id=_safe_layout_id(db, primary_campaign.layout_id, channel.client_id),
+            source="playback_group", playlist_items_count=len(_runtime_sequence_items(primary_campaign.id, db)))]
+            if primary_campaign else [])
+    else:
+        schedule_current, campaigns_payload, primary_campaign = _resolve_runtime_campaigns(channel, db)
     sequence_payload, playlist_payload, contents_payload = _build_sequence_runtime(primary_campaign, db, base_url)
 
     resolved_layout_id = (schedule_current.layout_id if schedule_current else None) or (primary_campaign.layout_id if primary_campaign else None)
     layout = safe_tenant_resource(db, Layout, resolved_layout_id, channel.client_id)
     layout_payload, layout_revision_payload, dataset_runtime_data = _resolve_layout_runtime(layout, db)
 
-    videowall_payload = _resolve_videowall_runtime(channel, db)
+    videowall_payload = None if standalone_group else _resolve_videowall_runtime(channel, db)
     audio_payload = _resolve_audio_runtime(channel, db, base_url)
     touch_payload = _resolve_touch_runtime(channel, db)
     output_mapping_payload = _resolve_output_mapping(channel)
@@ -846,7 +864,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
                and output.root_channel_id == channel.id
                and _runtime_output_allowed(db, output.channel_id, channel.client_id)]
 
-    effective_mode = channel.mode.value
+    effective_mode = "normal" if standalone_group else channel.mode.value
     if channel.mode == ChannelMode.TOUCH:
         effective_mode = ChannelMode.TOUCH.value
 
@@ -890,7 +908,7 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
         "runtime_generated_at": generated_at.isoformat(),
         "server_time": generated_at.isoformat(),
         "play_at_timestamp": play_at_timestamp,
-        "channel": serialize_channel(channel),
+        "channel": dict(serialize_channel(channel), mode="normal") if standalone_group else serialize_channel(channel),
         "device": serialize_runtime_device(channel, eligible_outputs=outputs),
         "branch": serialize_branch(branch) if branch else None,
         "client": serialize_client(client) if client else None,

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.entities import (
@@ -24,6 +24,8 @@ from app.models.entities import (
     Schedule,
     TouchLocation,
     TouchMap,
+    VideowallPublication,
+    VideowallPublicationAsset,
 )
 from app.services.content_cleanup import cleanup_files, delete_content_items, preflight_content_files
 from app.services.media_references import lock_media_paths, media_reference_operation, approve_media_cleanup
@@ -207,6 +209,12 @@ def _content_is_referenced_in_kiosk(content: ContentItem, db: Session) -> bool:
 
 
 def _content_has_live_references(content: ContentItem, db: Session, removing_campaign_ids=()) -> bool:
+    # Publication history is durable authority, including FAILED/old ACTIVE
+    # generations. No status/tenant filter may hide a surviving reference.
+    if db.scalar(select(VideowallPublicationAsset.id).where(or_(
+            VideowallPublicationAsset.master_content_id == content.id,
+            VideowallPublicationAsset.derived_content_id == content.id)).limit(1)):
+        return True
     if db.scalar(select(CampaignSequenceItem.id).where(CampaignSequenceItem.content_id == content.id, CampaignSequenceItem.campaign_id.not_in(removing_campaign_ids)).limit(1)):
         return True
     if db.scalar(select(CampaignPlaylistItem.id).where(CampaignPlaylistItem.content_id == content.id, CampaignPlaylistItem.campaign_id.not_in(removing_campaign_ids)).limit(1)):
@@ -223,6 +231,9 @@ def _content_has_live_references(content: ContentItem, db: Session, removing_cam
 
 
 def _campaign_has_live_references(campaign: Campaign, db: Session) -> bool:
+    if db.scalar(select(VideowallPublication.id).where(
+            VideowallPublication.campaign_id == campaign.id).limit(1)):
+        return True
     if db.scalar(select(CampaignChannelAssignment.id).where(CampaignChannelAssignment.campaign_id == campaign.id).limit(1)):
         return True
     if db.scalar(select(Schedule.id).where(Schedule.campaign_id == campaign.id).limit(1)):

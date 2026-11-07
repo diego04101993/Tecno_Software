@@ -77,7 +77,7 @@ def _edge_predicate(entity, edge, owner, profile, context, *, bad=None, cycles=N
     from sqlalchemy.orm import aliased
     target = aliased(model_class(edge.target))
     condition = _owner(target, edge.target) == owner
-    if edge.key == "LayoutRevision.created_by_user_id":
+    if edge.key in {"LayoutRevision.created_by_user_id", "VideowallPublication.requested_by_user_id"}:
         condition = or_(condition, and_(target.role.in_(tuple(GLOBAL_ROLES)),
                                         target.client_id.is_(None), target.branch_id.is_(None)))
     conditions = [target.id == getattr(entity, edge.field), condition]
@@ -102,6 +102,28 @@ def _edge_predicate(entity, edge, owner, profile, context, *, bad=None, cycles=N
         conditions.append(or_(entity.branch_id.is_(None), target.branch_id == entity.branch_id))
     if edge.target == "PlayerDevice":
         conditions.extend((target.branch_id == entity.branch_id, target.channel_id == entity.channel_id))
+    if edge.key == "Videowall.active_publication_id":
+        conditions.extend((target.wall_id == entity.id, target.playback_group_id.is_(None),
+                           or_(entity.media_delivery == "legacy", and_(
+                               target.status == "ACTIVE", target.loop_start_epoch_ms.is_not(None)))))
+    if edge.key == "VideowallPlaybackGroup.active_publication_id":
+        conditions.extend((target.playback_group_id == entity.id, target.wall_id == entity.wall_id,
+                           target.campaign_id == entity.campaign_id, entity.mode == "SYNCHRONIZED",
+                           target.status == "ACTIVE", target.loop_start_epoch_ms.is_not(None)))
+    if edge.key == "VideowallPublication.playback_group_id":
+        conditions.extend((target.wall_id == entity.wall_id, target.branch_id == entity.branch_id))
+    if edge.key == "VideowallPlaybackGroupMember.node_id":
+        group = aliased(model_class("VideowallPlaybackGroup"))
+        channel = aliased(model_class("Channel"))
+        conditions.append(select(group.id).join(channel, channel.id == target.channel_id).where(
+            group.id == entity.group_id, target.videowall_id == group.wall_id,
+            target.layout_enabled.is_(True), channel.branch_id == group.branch_id).correlate(entity, target).exists())
+    if edge.key == "VideowallPublicationAsset.node_id":
+        publication = aliased(model_class("VideowallPublication"))
+        channel = aliased(model_class("Channel"))
+        conditions.append(select(publication.id).join(channel, channel.id == target.channel_id).where(
+            publication.id == entity.publication_id, target.videowall_id == publication.wall_id,
+            channel.branch_id == publication.branch_id).correlate(entity, target).exists())
     if edge.key in {"AudioAssignment.music_playlist_id", "AudioAssignment.spot_playlist_id"}:
         conditions.append(target.kind == ("music" if edge.field == "music_playlist_id" else "spot"))
     if profile == "RUNTIME":
@@ -316,7 +338,13 @@ def readable_query(statement, model, *, db=None, profile="READ", client_id=None,
         from app.services.media_references import readable_media_ids
         statement = statement.where(cls.id.in_(readable_media_ids(db, name)))
     fields = model_spec(name).opaque_fields
-    if fields and name not in {"ContentItem", "DatasetImport", "LayoutRevision", "User", "PlayerDevice"}:
+    if name in {"VideowallPublication", "VideowallPublicationAsset"}:
+        if db is None:
+            raise conflict()
+        from app.services.videowall_integrity import readable_publication_ids
+        statement = statement.where(cls.id.in_(readable_publication_ids(db, name, profile=profile)))
+    if fields and name not in {"ContentItem", "DatasetImport", "LayoutRevision", "User", "PlayerDevice",
+                               "VideowallPublication", "VideowallPublicationAsset"}:
         if db is None:
             raise conflict()
         from app.services.media_references import readable_payload_ids

@@ -27,6 +27,23 @@ services:
     depends_on:
       - postgres
 
+  videowall-worker:
+    profiles: ["videowall"]
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.workers.videowall"]
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env.example
+    environment:
+      MEDIA_ROOT: /app/storage/uploads
+      VW1_WORK_ROOT: /app/storage/processing/videowall
+    volumes:
+      - ./backend:/app
+      - ./backend/storage/uploads:/app/storage/uploads
+    depends_on:
+      - postgres
+
   frontend:
     build:
       context: ./frontend

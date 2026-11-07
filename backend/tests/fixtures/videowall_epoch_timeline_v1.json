@@ -1,0 +1,17 @@
+{
+  "contract": "epoch_timeline_v1",
+  "pre_epoch_policy": "WAIT; modulo results below are mathematics, not permission to start playback",
+  "loop_start_epoch_ms": 1800000000000,
+  "duration_ms": [2000, 3500, 1500],
+  "loop_duration_ms": 7000,
+  "cases": [
+    {"server_now_ms": 1799999999999, "item_index": 2, "item_offset_ms": 1499},
+    {"server_now_ms": 1800000000000, "item_index": 0, "item_offset_ms": 0},
+    {"server_now_ms": 1800000001999, "item_index": 0, "item_offset_ms": 1999},
+    {"server_now_ms": 1800000002000, "item_index": 1, "item_offset_ms": 0},
+    {"server_now_ms": 1800000004500, "item_index": 1, "item_offset_ms": 2500},
+    {"server_now_ms": 1800000005500, "item_index": 2, "item_offset_ms": 0},
+    {"server_now_ms": 1800000007000, "item_index": 0, "item_offset_ms": 0},
+    {"server_now_ms": 1800000076123, "item_index": 2, "item_offset_ms": 623}
+  ]
+}

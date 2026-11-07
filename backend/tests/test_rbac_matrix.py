@@ -1,4 +1,4 @@
-"""All eight real roles, 497 HTTP cases and 37 WebSocket cases."""
+"""All eight real roles, 503 HTTP cases and 37 WebSocket cases."""
 from test_tenant_isolation import TenantFixture
 from app.models.entities import *
 from app.api.routes import realtime
@@ -32,6 +32,8 @@ class RbacMatrixTests(TenantFixture):
         db.commit()
         ids={k+"_id":v.id for k,v in B.items()}
         ids.update(client_id=cb,user_id=users["B_client_operator"].id,videowall_id=B["wall"].id,content_id=B["content"].id,folder_id=B["folder"].id,playlist_id=B["playlist"].id,item_id=B["audioitem"].id,playlist_item_id=B["legacy"].id,sequence_item_id=B["sequence"].id,revision_id=B["revision"].id,touch_map_id=B["map"].id,map_id=B["map"].id,assignment_id=B["touch_assignment"].id)
+        # Foreign-wall scope must reject before publication lookup.
+        ids["publication_id"] = "11111111-1111-4111-8111-111111111111"
         def field_value(name,annotation):
             if name in ids:return ids[name]
             if name=="data_source_id":return B["source"].id
@@ -129,7 +131,7 @@ class RbacMatrixTests(TenantFixture):
                     results.append(dict(label=f"{who} cross direction {kind}", safe=safe))
             finally:
                 fixture.doCleanups()
-        self.assertEqual(len(results), 497)
+        self.assertEqual(len(results), 509)
         self.assertEqual([r for r in results if not r["safe"]], [])
 
     def test_websocket_matrix(self):

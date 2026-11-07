@@ -1069,6 +1069,7 @@ export function ClientOverviewPage() {
   }
 
   async function handleVideowallSaved(savedVideowall: Videowall) {
+    setVideowallEditTarget((current) => current?.videowall.id === savedVideowall.id ? { ...current, videowall: savedVideowall } : current);
     await loadDashboard();
     setFeedback({
       tone: "success",
@@ -1625,6 +1626,7 @@ export function ClientOverviewPage() {
 
       <VideowallEditDrawer
         open={Boolean(videowallEditTarget)}
+        canManage={canManageInfrastructure}
         token={token}
         videowall={videowallEditTarget?.videowall ?? null}
         nodes={videowallEditTarget ? nodesByVideowallId.get(videowallEditTarget.videowall.id) ?? [] : []}

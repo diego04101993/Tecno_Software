@@ -716,6 +716,7 @@ class VideowallCreate(BaseModel):
     primary_channel_id: str | None = None
     start_tolerance_ms: int = 250
     sync_mode: str = "play_at_timestamp"
+    media_delivery: Literal["legacy", "node_slice"] = "legacy"
 
 
 class VideowallUpdate(BaseModel):
@@ -730,6 +731,7 @@ class VideowallUpdate(BaseModel):
     primary_channel_id: str | None = None
     start_tolerance_ms: int | None = None
     sync_mode: str | None = None
+    media_delivery: Literal["legacy", "node_slice"] | None = None
 
 
 class VideowallRead(TimestampedModel):
@@ -745,6 +747,30 @@ class VideowallRead(TimestampedModel):
     primary_channel_id: str | None = None
     start_tolerance_ms: int
     sync_mode: str
+    media_delivery: Literal["legacy", "node_slice"] = "legacy"
+    active_publication_id: str | None = None
+    playback_groups_enabled: bool = False
+
+
+class VideowallPublicationCreate(SensitiveRequest):
+    model_config = {"extra": "forbid"}
+    campaign_id: str = Field(strict=True, min_length=1, max_length=36)
+    playback_group_id: str | None = Field(default=None, strict=True, min_length=1, max_length=36)
+
+
+class VideowallPublicationRead(TimestampedModel):
+    wall_id: str
+    campaign_id: str
+    playback_group_id: str | None = None
+    status: Literal["PENDING", "PROCESSING", "READY", "ACTIVE", "FAILED"]
+    expected_asset_count: int
+    validated_asset_count: int = 0
+    loop_duration_ms: int | None = None
+    loop_start_epoch_ms: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    activated_at: datetime | None = None
+    is_current_active: bool = False
 
 
 class VideowallNodeCreate(BaseModel):
@@ -774,6 +800,70 @@ class VideowallNodeRead(TimestampedModel):
     y: int
     width: int
     height: int
+    layout_enabled: bool = True
+
+
+class VideowallPhysicalNode(SensitiveRequest):
+    model_config = {"extra": "forbid"}
+    node_id: str = Field(strict=True, min_length=1, max_length=36)
+    row_index: int = Field(strict=True, ge=0)
+    column_index: int = Field(strict=True, ge=0)
+
+
+class VideowallPhysicalLayoutUpdate(SensitiveRequest):
+    model_config = {"extra": "forbid"}
+    rows: int = Field(strict=True, gt=0, le=32)
+    columns: int = Field(strict=True, gt=0, le=32)
+    total_width: int = Field(strict=True, gt=0)
+    total_height: int = Field(strict=True, gt=0)
+    output_width: int = Field(strict=True, gt=0)
+    output_height: int = Field(strict=True, gt=0)
+    nodes: list[VideowallPhysicalNode] = Field(max_length=1024)
+
+
+class VideowallPlaybackGroupInput(SensitiveRequest):
+    model_config = {"extra": "forbid"}
+    id: str | None = Field(default=None, strict=True, min_length=1, max_length=36)
+    name: str = Field(strict=True, min_length=1, max_length=120)
+    mode: Literal["INDIVIDUAL", "SYNCHRONIZED"]
+    campaign_id: str = Field(strict=True, min_length=1, max_length=36)
+    node_ids: list[str] = Field(min_length=1, max_length=1024)
+
+
+class VideowallPlaybackGroupsUpdate(SensitiveRequest):
+    model_config = {"extra": "forbid"}
+    groups: list[VideowallPlaybackGroupInput] = Field(max_length=1024)
+
+
+class VideowallPlaybackGroupMemberRead(BaseModel):
+    id: str
+    group_id: str
+    node_id: str
+    channel_id: str
+    position_index: int
+    row_index: int
+    column_index: int
+    physical_position_index: int
+    physical_row_index: int
+    physical_column_index: int
+
+
+class VideowallPlaybackGroupRead(BaseModel):
+    id: str
+    client_id: str
+    branch_id: str
+    wall_id: str
+    name: str
+    mode: Literal["INDIVIDUAL", "SYNCHRONIZED"]
+    campaign_id: str
+    active_publication_id: str | None = None
+    members: list[VideowallPlaybackGroupMemberRead]
+    rows: int
+    columns: int
+    total_width: int
+    total_height: int
+    output_width: int
+    output_height: int
 
 
 class KioskScreenCreate(BaseModel):

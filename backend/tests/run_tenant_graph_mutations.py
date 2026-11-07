@@ -222,6 +222,7 @@ def mutation_runners():
         "A9_R3": rbac.run_a9_r3_mutations, "A9_R4": rbac.run_a9_r4_mutations,
         "A10_R1": rbac.run_a10_r1_mutations,
         "A10_R2": rbac.run_a10_r2_mutations,
+        "VW1": matrix.run_vw1_mutations,
     }
 
 

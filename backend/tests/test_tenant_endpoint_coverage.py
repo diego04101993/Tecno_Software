@@ -32,7 +32,7 @@ class TenantEndpointCoverageTests(TestCase):
                             actual.add((dec.func.attr.upper(), dec.args[0].value, node.name))
         expected = {(o.method, o.path, o.function) for o in OPERATIONS}
         self.assertEqual(actual, expected)
-        self.assertEqual(sum(o.method != "WS" for o in OPERATIONS), 153)
+        self.assertEqual(sum(o.method != "WS" for o in OPERATIONS), 159)
         self.assertEqual(sum(o.method == "WS" for o in OPERATIONS), 2)
 
     def test_models_and_exclusions_are_explicit_not_implicit_allow(self):
@@ -55,8 +55,8 @@ class A10CoverageGeneratorTests(TestCase):
         actual = {(r["METHOD"], r["PATH"], r["FUNCTION"].rsplit(".", 1)[-1])
                   for r in data["endpoints"]}
         self.assertEqual(actual, {(o.method, o.path, o.function) for o in OPERATIONS})
-        self.assertEqual(len(data["models"]), 36)
-        self.assertEqual(len(data["relations"]), 87)
+        self.assertEqual(len(data["models"]), 40)
+        self.assertEqual(len(data["relations"]), 105)
         for relation in data["relations"]:
             self.assertEqual(relation["fingerprint"], relation["approved_fingerprint"])
         self.assertNotIn("app.services.tenant_ownership.RowRef", CENTRAL_GUARDS)

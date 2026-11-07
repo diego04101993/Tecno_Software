@@ -23,6 +23,22 @@ from app.services.tenant_relations import MODEL_SPECS, RELATION_SPECS, model_cla
 
 COVERAGE = []
 ROLES = ("client_admin", "staff_operator", "staff_admin", "super_admin")
+VW1_RELATION_KEYS = frozenset((
+    "Videowall.active_publication_id", "VideowallPublication.client_id",
+    "VideowallPublication.branch_id", "VideowallPublication.wall_id",
+    "VideowallPublication.campaign_id", "VideowallPublication.requested_by_user_id",
+    "VideowallPublicationAsset.publication_id", "VideowallPublicationAsset.node_id",
+    "VideowallPublicationAsset.master_content_id", "VideowallPublicationAsset.derived_content_id",
+))
+GROUP_RELATION_KEYS = frozenset((
+    "VideowallPlaybackGroup.client_id", "VideowallPlaybackGroup.branch_id",
+    "VideowallPlaybackGroup.wall_id", "VideowallPlaybackGroup.campaign_id",
+    "VideowallPlaybackGroup.active_publication_id", "VideowallPlaybackGroupMember.group_id",
+    "VideowallPlaybackGroupMember.node_id", "VideowallPublication.playback_group_id",
+))
+PROTECTED_GROUP_RELATION_KEYS = frozenset((
+    "VideowallPlaybackGroup.active_publication_id", "VideowallPublication.playback_group_id",
+))
 
 
 class DeleteMatrixFixture(GraphFixture):
@@ -42,7 +58,7 @@ class DeleteMatrixFixture(GraphFixture):
                           for row in connection.exec_driver_sql("PRAGMA foreign_key_list(" + spec.table + ")")}
             expected = {(edge.model, edge.field, model_spec(edge.target).table, edge.on_delete or "NO ACTION")
                         for edge in RELATION_SPECS}
-            self.assertEqual(actual, expected, "QA schema must contain all 87 real FK effects")
+            self.assertEqual(actual, expected, "QA schema must contain all 97 real FK effects")
         else:
             Base.metadata.create_all(self.engine)
         self.db = Session(self.engine, expire_on_commit=False, autoflush=False)
@@ -52,6 +68,9 @@ class DeleteMatrixFixture(GraphFixture):
         self.seeded = {}
         self.building = set()
         self.actors = {}
+        self.vw1_rows = {}
+        self.playback_group_rows = {}
+        self.playback_group_publication_rows = {}
         for side in ("A", "B"):
             self.ensure("Client", side)
             for role in ROLES:
@@ -63,6 +82,10 @@ class DeleteMatrixFixture(GraphFixture):
         self.db.commit()
 
     def ensure(self, name, side):
+        if name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"}:
+            return self._ensure_playback_group(side, with_member=name == "VideowallPlaybackGroupMember")[name]
+        if name in {"VideowallPublication", "VideowallPublicationAsset"}:
+            return self._ensure_vw1(side)[name]
         key = (name, side)
         if key in self.seeded:
             return self.seeded[key]
@@ -98,11 +121,182 @@ class DeleteMatrixFixture(GraphFixture):
         self.building.remove(key)
         return obj
 
+    def _ensure_playback_group(self, side, *, with_member=False):
+        """Empty retained group or independent valid member scope, never fabricated IDs.
+
+        An empty foreign target permits persisting a corrupt group_id without
+        first colliding with the independent UNIQUE(group_id, position_index).
+        The member's intact positive control still has its own complete scope.
+        """
+        key = side, with_member
+        if key not in self.playback_group_rows:
+            client = self.ensure("Client", side)
+            branch = self.ensure("Branch", side)
+            campaign = self.ensure("Campaign", side)
+            wall = self.add(E.Videowall, client_id=client.id, name="Group QA " + side,
+                rows=1, columns=1, total_width=1920, total_height=1080,
+                output_width=1920, output_height=1080, playback_groups_enabled=True)
+            channel = self.add(E.Channel, client_id=client.id, branch_id=branch.id,
+                name="Group QA panel " + side + (" member" if with_member else " empty"), mode=E.ChannelMode.VIDEOWALL,
+                resolution_width=1920, resolution_height=1080, canvas_width=1920, canvas_height=1080)
+            node = self.add(E.VideowallNode, videowall_id=wall.id, channel_id=channel.id,
+                position_index=1, row_index=0, column_index=0, x=0, y=0, width=1920, height=1080,
+                layout_enabled=True)
+            group = self.add(E.VideowallPlaybackGroup, client_id=client.id, branch_id=branch.id,
+                wall_id=wall.id, name="Group QA " + side, mode="INDIVIDUAL", campaign_id=campaign.id)
+            member = (self.add(E.VideowallPlaybackGroupMember, group_id=group.id, node_id=node.id,
+                position_index=1, row_index=0, column_index=0) if with_member else None)
+            self.playback_group_rows[key] = dict(VideowallPlaybackGroup=group,
+                VideowallPlaybackGroupMember=member, client=client, branch=branch, wall=wall,
+                campaign=campaign, node=node, channel=channel)
+            self.db.commit()
+        return self.playback_group_rows[key]
+
+    def _ensure_playback_group_publication(self, side):
+        """Real owned, complete ACTIVE scope for the two publication-context edges."""
+        if side not in self.playback_group_publication_rows:
+            owned = self._ensure_vw1(side, active=True)
+            wall, publication = owned["wall"], owned["VideowallPublication"]
+            wall.playback_groups_enabled = True
+            wall.active_publication_id = None
+            group = self.add(E.VideowallPlaybackGroup, client_id=owned["client"].id,
+                branch_id=owned["branch"].id, wall_id=wall.id, name="Published group QA " + side,
+                mode="SYNCHRONIZED", campaign_id=owned["campaign"].id)
+            members = [self.add(E.VideowallPlaybackGroupMember, group_id=group.id, node_id=node.id,
+                position_index=node.position_index, row_index=0, column_index=node.position_index - 1)
+                for node in owned["nodes"]]
+            publication.playback_group_id = group.id
+            group.active_publication_id = publication.id
+            self.db.commit()
+            self.playback_group_publication_rows[side] = dict(owned,
+                VideowallPlaybackGroup=group, VideowallPlaybackGroupMember=members[0], members=members)
+        return self.playback_group_publication_rows[side]
+
+    def _ensure_vw1(self, side, *, ready=False, active=False):
+        """Owned DB-scope fixtures, not codec/media quality test evidence."""
+        import hashlib
+        import json
+        from tempfile import TemporaryDirectory
+        from app.core.config import get_settings
+        group = self.vw1_rows.get(side)
+        if group is None:
+            client, branch, requestor = (self.ensure(name, side) for name in ("Client", "Branch", "User"))
+            wall = self.add(E.Videowall, client_id=client.id, name="VW1 graph " + side,
+                            rows=1, columns=3, total_width=5760, total_height=1080,
+                            output_width=1920, output_height=1080)
+            node_rows = []
+            for position in (1, 2, 3):
+                channel = self.add(E.Channel, client_id=client.id, branch_id=branch.id,
+                                   name="VW1 graph " + side + " " + str(position), mode=E.ChannelMode.VIDEOWALL,
+                                   resolution_width=1920, resolution_height=1080, canvas_width=1920, canvas_height=1080)
+                node_rows.append(self.add(E.VideowallNode, videowall_id=wall.id, channel_id=channel.id,
+                    position_index=position, row_index=0, column_index=position-1,
+                    x=(position-1)*1920, y=0, width=1920, height=1080))
+            root = Path(get_settings().MEDIA_ROOT).resolve()
+            if root.is_relative_to(Path(__file__).resolve().parents[2]):
+                raise RuntimeError("VW1 graph media must stay outside the checkout")
+            root.mkdir(parents=True, exist_ok=True)
+            directory = TemporaryDirectory(prefix="vw1-graph-", dir=root)
+            self.addCleanup(directory.cleanup)
+            def owned_file(label):
+                # Deliberately synthetic bytes: these tests measure ownership,
+                # FK integrity and mutation effects, never FFmpeg/codec validity.
+                data = ("synthetic-vw1-graph-" + side + "-" + label).encode()
+                path = Path(directory.name) / (label + ".mp4")
+                path.write_bytes(data)
+                checksum = hashlib.sha256(data).hexdigest()
+                content = self.add(E.ContentItem, client_id=client.id, name="VW1 " + label,
+                    type=E.ContentType.VIDEO, file_path="/media/" + path.relative_to(root).as_posix(),
+                    metadata_json={"content_type": "video/mp4", "checksum": checksum, "size": len(data)})
+                return content, checksum, len(data)
+            master, source_sha, _ = owned_file("master")
+            campaign = self.add(E.Campaign, client_id=client.id, name="VW1 graph " + side)
+            item = self.add(E.CampaignSequenceItem, campaign_id=campaign.id, content_id=master.id,
+                            item_type="content", sort_order=1, duration_seconds=1)
+            geometry = dict(rows=1, columns=3, total_width=5760, total_height=1080,
+                            panel_width=1920, panel_height=1080, tolerance_ms=250,
+                            nodes=[dict(id=node.id, channel_id=node.channel_id, position_index=node.position_index,
+                                row_index=0, column_index=node.position_index-1, crop_x=(node.position_index-1)*1920,
+                                crop_y=0, crop_width=1920, crop_height=1080) for node in node_rows])
+            program = dict(campaign_id=campaign.id, items=[dict(id=item.id, master_content_id=master.id,
+                           type="video", sort_order=1, duration_ms=None)])
+            publication = self.add(E.VideowallPublication, client_id=client.id, branch_id=branch.id,
+                wall_id=wall.id, campaign_id=campaign.id, requested_by_user_id=requestor.id,
+                program_snapshot_json=program, geometry_snapshot_json=geometry,
+                geometry_signature=hashlib.sha256(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                expected_asset_count=3)
+            assets = [self.add(E.VideowallPublicationAsset, publication_id=publication.id, node_id=node.id,
+                      master_content_id=master.id, logical_item_id=item.id, position_index=node.position_index,
+                      sort_order=1, width=1920, height=1080) for node in node_rows]
+            group = dict(VideowallPublication=publication, VideowallPublicationAsset=assets[0], client=client,
+                         wall=wall, branch=branch, requestor=requestor, master=master, campaign=campaign,
+                         nodes=node_rows, assets=assets, derived=[], owned_file=owned_file, source_sha=source_sha)
+            self.vw1_rows[side] = group
+        publication = group["VideowallPublication"]
+        if (ready or active) and publication.status == "PENDING":
+            program = dict(publication.program_snapshot_json)
+            program["items"] = [{**program["items"][0], "duration_ms": 1000}]
+            publication.program_snapshot_json = program
+            publication.status = "READY"
+            publication.loop_duration_ms = 1000
+            for asset in group["assets"]:
+                content, checksum, size = group["owned_file"]("derived-" + str(asset.position_index))
+                group["derived"].append(content)
+                asset.derived_content_id = content.id
+                asset.duration_ms, asset.mime_type, asset.checksum, asset.size_bytes = 1000, "video/mp4", checksum, size
+                asset.probe_json = dict(fps_num=25, fps_den=1, frame_count=25, has_audio=False,
+                                        keyframe_pts_ms=[0], source_sha256=group["source_sha"])
+                asset.validated = True
+        if active:
+            publication.status = "ACTIVE"
+            publication.loop_start_epoch_ms = 10000
+            publication.activated_at = datetime.now(UTC)
+            group["wall"].media_delivery = "node_slice"
+            group["wall"].active_publication_id = publication.id
+        self.db.commit()
+        return group
+
     def actor(self, side, role):
         return self.actors[side if role == "client_admin" else "A", role]
 
     def scenario(self, edge, source_side, *, foreign):
         target_side = ("B" if source_side == "A" else "A") if foreign else source_side
+        if edge.key in GROUP_RELATION_KEYS:
+            published = edge.key in {"VideowallPlaybackGroup.active_publication_id", "VideowallPublication.playback_group_id"}
+            group = (self._ensure_playback_group_publication(source_side) if published
+                     else self._ensure_playback_group(source_side, with_member=edge.model == "VideowallPlaybackGroupMember"))
+            source = group[edge.model]
+            if foreign:
+                target = (self._ensure_playback_group_publication(target_side)["VideowallPublication"]
+                          if edge.target == "VideowallPublication" else self.ensure(edge.target, target_side))
+            else:
+                target = {"client_id": group["client"], "branch_id": group["branch"], "wall_id": group["wall"],
+                          "campaign_id": group["campaign"], "node_id": group.get("node"),
+                          "group_id": group["VideowallPlaybackGroup"],
+                          "playback_group_id": group["VideowallPlaybackGroup"],
+                          "active_publication_id": group.get("VideowallPublication")}[edge.field]
+            setattr(source, edge.field, target.id)
+            self.db.commit()
+            self.db.expire_all()
+            return source, target, target_side
+        if edge.key in VW1_RELATION_KEYS:
+            group = self._ensure_vw1(source_side, ready=edge.field == "derived_content_id",
+                                     active=edge.key == "Videowall.active_publication_id")
+            source = group["wall"] if edge.model == "Videowall" else group[edge.model]
+            if edge.key == "Videowall.active_publication_id":
+                target = self._ensure_vw1(target_side, active=True)["VideowallPublication"]
+            elif not foreign:
+                target = {"client_id": self.ensure("Client", source_side), "branch_id": group["branch"],
+                          "wall_id": group["wall"], "campaign_id": group["campaign"],
+                          "requested_by_user_id": group["requestor"], "publication_id": group["VideowallPublication"],
+                          "node_id": group["nodes"][0], "master_content_id": group["master"],
+                          "derived_content_id": group["derived"][0] if group["derived"] else None}[edge.field]
+            else:
+                target = self.ensure(edge.target, target_side)
+            setattr(source, edge.field, target.id)
+            self.db.commit()
+            self.db.expire_all()
+            return source, target, target_side
         source = self.ensure(edge.model, source_side)
         target = self.ensure(edge.target, target_side)
         if source is target:
@@ -136,6 +330,21 @@ class DeleteMatrixFixture(GraphFixture):
                              (409, "TENANT_RELATION_CONFLICT"))
 
     def check_edge(self, edge):
+        if edge.key in VW1_RELATION_KEYS or edge.key in PROTECTED_GROUP_RELATION_KEYS:
+            # VW1 has no release/GC operation. Test both intact and corrupt
+            # graphs as protected; the original 87 policies below are unchanged.
+            for side in ("A", "B"):
+                for foreign in (False, True):
+                    source, target, target_side = self.scenario(edge, side, foreign=foreign)
+                    for role in ROLES:
+                        with self.subTest(edge=edge.key, side=side, role=role, foreign=foreign):
+                            self.rejection((target,), self.actor(target_side, role))
+                            COVERAGE.append(dict(EDGE=edge.key, CASE=side + ("_foreign" if foreign else "_protected"),
+                                ENGINE=self.engine.dialect.name, ROLE=role, RESULT="PASS", ZERO_MUTATION=True,
+                                CLASSIFICATION=edge.delete_policy, DATABASE_EFFECT=edge.on_delete or "RESTRICT"))
+                    self.doCleanups()
+                    self.setUp()
+            return
         for side in ("A", "B"):
             foreign = edge.delete_policy == "NEEDS_PREFLIGHT"
             source, target, target_side = self.scenario(edge, side, foreign=foreign)
@@ -261,7 +470,7 @@ class DeleteExecutionTests(DeleteMatrixFixture):
     def test_client_whole_graph_legitimate_delete(self):
         from app.services.client_cleanup import delete_client_cascade
         from app.models.base import Base
-        for spec in MODEL_SPECS:
+        for spec in (spec for spec in MODEL_SPECS if spec.name not in {"VideowallPublication", "VideowallPublicationAsset"}):
             self.ensure(spec.name, "A")
         self.db.commit()
         client = self.ensure("Client", "A")
@@ -465,6 +674,9 @@ class DeleteConcurrencyTests(DeleteExecutionTests):
 class DeletePlanCoverageTests(DeleteMatrixFixture):
     def check_plan_edge(self, edge):
         source, target, side = self.scenario(edge, "A", foreign=False)
+        if edge.key in VW1_RELATION_KEYS or edge.key in PROTECTED_GROUP_RELATION_KEYS:
+            self.rejection((target,), self.actor(side, "super_admin"))
+            return
         with self.no_effects(), mutations.delete_guard(self.db, (target,), actor=self.actor(side, "super_admin")) as plan:
             self.assertTrue(any(d.relation_key == edge.key and d.reference == self.ref(source)
                                 for p in plan.plans for d in p.dependencies), edge.key)
@@ -473,12 +685,27 @@ class DeletePlanCoverageTests(DeleteMatrixFixture):
         from sqlalchemy import delete
         from sqlalchemy.exc import IntegrityError
         source, target, side = self.scenario(edge, "A", foreign=False)
+        if edge.key in VW1_RELATION_KEYS or edge.key in PROTECTED_GROUP_RELATION_KEYS:
+            # Real FK behavior is verified by migration 016 tests; no public
+            # service may release a publication or its protected dependencies.
+            self.rejection((target,), self.actor(side, "super_admin"))
+            return
         source_id = source.id
+        target_id = target.id
         with mutations.delete_guard(self.db, (target,), actor=self.actor(side, "super_admin")):
             if not edge.on_delete:
                 with self.assertRaises(IntegrityError):
                     self.db.execute(delete(type(target)).where(type(target).id == target.id))
                 self.db.rollback()
+                return
+            if edge.on_delete == "RESTRICT":
+                with self.assertRaises(IntegrityError):
+                    self.db.execute(delete(type(target)).where(type(target).id == target_id))
+                self.db.rollback()
+                surviving = self.db.get(type(source), source_id)
+                self.assertIsNotNone(surviving, edge.key)
+                self.assertIsNotNone(self.db.get(type(target), target_id), edge.key)
+                self.assertEqual(getattr(surviving, edge.field), target_id, edge.key)
                 return
             self.db.execute(delete(type(target)).where(type(target).id == target.id))
             self.db.flush()
@@ -540,6 +767,145 @@ def _assertion_sites(function, *anchors):
     return frozenset(sites)
 
 
+class VW1MutationDefenseTests(DeleteMatrixFixture):
+    """Specific scope/state defenses, independent of media codec QA."""
+
+    def _typed_rejection(self, row, marker):
+        with self.no_effects(), self.assertRaises(HTTPException) as caught:
+            intent = mutations.MutationIntent("UPDATE", self.ref(row), ())
+            with mutations.write_guard(self.db, actor=self.actor("A", "super_admin"),
+                    client_id=self.ensure("Client", "A").id,
+                    operation="prepare_videowall_publication", intents=(intent,)):
+                self.fail(marker)
+        self.assertEqual((caught.exception.status_code, caught.exception.detail),
+                         (409, "TENANT_RELATION_CONFLICT"))
+
+    def _typed_row_rejection(self, row, changes, marker):
+        from app.services import videowall_integrity as integrity
+        from app.services.tenant_ownership import context_for_actor
+        graph = mutations._WriteGraph(self.db)
+        graph.media_validation_locked = True
+        context = context_for_actor(self.db, self.actor("A", "super_admin"),
+                                    client_id=self.ensure("Client", "A").id)
+        ref = self.ref(row)
+        original = dict(graph.snapshot(ref))
+        changed = {**original, **changes}
+        validator = (integrity.publication_semantics if ref.model == "VideowallPublication"
+                     else integrity.asset_semantics)
+        with self.no_effects():
+            self.assertTrue(validator(graph, ref, context, original), "VW1 intact typed fixture must remain valid")
+            self.assertFalse(validator(graph, ref, context, changed), marker)
+
+    def test_protected_publication_delete(self):
+        client = self._ensure_vw1("A")["client"]
+        with self.no_effects(), self.assertRaises(HTTPException) as caught:
+            with mutations.delete_guard(self.db, (client,), actor=self.actor("A", "super_admin")):
+                self.fail("VW1 protected publication delete was approved")
+        self.assertEqual((caught.exception.status_code, caught.exception.detail),
+                         (409, "TENANT_RELATION_CONFLICT"))
+
+    def test_geometry_signature_is_authoritative(self):
+        publication = self._ensure_vw1("A")["VideowallPublication"]
+        self.corrupt(publication, geometry_signature="f" * 64)
+        self._typed_rejection(publication, "VW1 mismatched geometry signature was accepted")
+
+    def test_expected_asset_count_matches_program(self):
+        publication = self._ensure_vw1("A")["VideowallPublication"]
+        self._typed_row_rejection(publication, {"expected_asset_count": 6}, "VW1 incomplete asset cardinality was accepted")
+
+    def test_asset_position_matches_frozen_node(self):
+        asset = self._ensure_vw1("A")["assets"][0]
+        self._typed_row_rejection(asset, {"position_index": 2}, "VW1 wrong frozen node position was accepted")
+
+    def test_derived_content_cannot_be_master(self):
+        group = self._ensure_vw1("A", ready=True)
+        asset = group["assets"][0]
+        self._typed_row_rejection(asset, {"derived_content_id": group["master"].id},
+                                  "VW1 master was accepted as a playable derived slice")
+
+    def test_secondary_node_cannot_retain_audio(self):
+        asset = self._ensure_vw1("A", ready=True)["assets"][1]
+        self._typed_row_rejection(asset, {"probe_json": {**asset.probe_json, "has_audio": True}},
+                                  "VW1 secondary node audio was accepted")
+
+
+def run_vw1_mutations():
+    """Six source-bound VW1 defects, each with passing intact controls."""
+    import inspect as source_inspect
+    from types import CodeType, FunctionType
+    from app.services import videowall_integrity as integrity
+
+    cases = (
+        ("vw1_delete_protection", mutations, "delete_guard",
+         'ref.model in {"VideowallPublication", "VideowallPublicationAsset"}', "False",
+         "test_protected_publication_delete"),
+        ("vw1_geometry_signature", integrity, "publication_semantics",
+         'geometry_signature(geometry) != row["geometry_signature"]', "False",
+         "test_geometry_signature_is_authoritative"),
+        ("vw1_asset_cardinality", integrity, "publication_semantics",
+         'row["expected_asset_count"] != len(program["items"]) * len(geometry["nodes"])', "False",
+         "test_expected_asset_count_matches_program"),
+        ("vw1_frozen_node_position", integrity, "asset_semantics",
+         'row["position_index"] != node["position_index"]', "False",
+         "test_asset_position_matches_frozen_node"),
+        ("vw1_master_as_derived", integrity, "asset_semantics",
+         'row["derived_content_id"] == row["master_content_id"]', "False",
+         "test_derived_content_cannot_be_master"),
+        ("vw1_secondary_audio", integrity, "asset_semantics",
+         '(row["position_index"] != 1 and probe["has_audio"])', "False",
+         "test_secondary_node_cannot_retain_audio"),
+    )
+    results = []
+    for name, owner, attr, before, after, method in cases:
+        original = getattr(owner, attr)
+        unwrapped = source_inspect.unwrap(original)
+        source = source_inspect.getsource(original)
+        edits = [(before, after)]
+        if name == "vw1_asset_cardinality":
+            # Both cardinality comparisons defend the same expected-count
+            # invariant; omitting only one leaves a redundant defense intact.
+            edits.append(('len(assets) != row["expected_asset_count"]', "False"))
+        altered = source
+        for old, new in edits:
+            if altered.count(old) != 1:
+                raise AssertionError("VW1 mutation target is not unique: " + name)
+            altered = altered.replace(old, new)
+        # Compile the complete lexical module without executing it. Compiling
+        # an isolated function can change optimized constants/code structure,
+        # which must never be mistaken for the intact source control.
+        path = Path(unwrapped.__code__.co_filename)
+        module_source = path.read_text(encoding="utf-8")
+        if module_source.count(source) != 1:
+            raise AssertionError("VW1 source function is not unique: " + name)
+        module_code = compile(module_source.replace(source, altered), str(path), "exec", dont_inherit=True)
+        def codes(code):
+            yield code
+            for constant in code.co_consts:
+                if isinstance(constant, CodeType):
+                    yield from codes(constant)
+        targets = [code for code in codes(module_code)
+                   if code.co_qualname == unwrapped.__code__.co_qualname
+                   and code.co_firstlineno == unwrapped.__code__.co_firstlineno]
+        if len(targets) != 1:
+            raise AssertionError("VW1 compiled mutation target is not unique: " + name)
+        changed = FunctionType(targets[0], unwrapped.__globals__, unwrapped.__name__,
+                               unwrapped.__defaults__, unwrapped.__closure__)
+        changed.__kwdefaults__ = unwrapped.__kwdefaults__
+        if original is not unwrapped:
+            if original.__wrapped__ is not unwrapped or attr != "delete_guard":
+                raise AssertionError("Unreviewed VW1 mutation decorator: " + name)
+            changed = contextmanager(changed)
+        defense = (_assertion_sites(VW1MutationDefenseTests.test_protected_publication_delete,
+                                   'self.fail("VW1 protected publication delete was approved")')
+                   if name == "vw1_delete_protection" else
+                   _assertion_sites(VW1MutationDefenseTests._typed_rejection, "self.fail(marker)")
+                   if name == "vw1_geometry_signature" else
+                   _assertion_sites(VW1MutationDefenseTests._typed_row_rejection, "self.assertFalse(validator("))
+        results.append(_run_delete_mutation(name, owner, attr, changed,
+            VW1MutationDefenseTests, method, defense, after_setup=True))
+    return results
+
+
 class _MutationProbe(unittest.TestResult):
     def __init__(self):
         super().__init__()
@@ -587,7 +953,7 @@ _PLAN_EDITS = {
     ),
     "revalidation_omitted": (
         ('confirmed = preflight_relationship_graph(gate, tuple(MutationIntent("DELETE", ref) for ref in rediscovered),\n'
-         '                                                  discovery_spec, semantic_adapters=_delete_adapters())',
+         '                                                      discovery_spec, semantic_adapters=_delete_adapters())',
          "confirmed = plan"),
     ),
 }
@@ -900,6 +1266,10 @@ def run_a7_mutations():
     """A kill requires a passing control and the specific defense assertion."""
     results = []
     for edge in RELATION_SPECS:
+        if edge.key in VW1_RELATION_KEYS or edge.key in GROUP_RELATION_KEYS:
+            # Keep the original 87 approval-plan mutants intact. VW1's
+            # protected-until-release contract has its own targeted mutants.
+            continue
         name, method = "omit_delete_edge:" + edge.key, "test_effect_" + edge.key.replace(".", "_")
         results.append(_run_delete_mutation(
             name, mutations, "RELATION_SPECS", tuple(e for e in RELATION_SPECS if e.key != edge.key),
@@ -914,7 +1284,7 @@ def run_a7_mutations():
     from dataclasses import replace
     import inspect as source_inspect
     source = source_inspect.getsource(mutations._locked_delete_plan)
-    needle = "confirmed = preflight_relationship_graph(gate, tuple(MutationIntent(\"DELETE\", ref) for ref in rediscovered),\n                                                  discovery_spec, semantic_adapters=_delete_adapters())"
+    needle = "confirmed = preflight_relationship_graph(gate, tuple(MutationIntent(\"DELETE\", ref) for ref in rediscovered),\n                                                      discovery_spec, semantic_adapters=_delete_adapters())"
     assert source.count(needle) == 1
     stale_guard = _recompile_delete_plan(((needle, "confirmed = plan"),))
     intact_plan = _recompile_delete_plan()
@@ -1968,7 +2338,7 @@ class DeleteMutationHarnessTests(unittest.TestCase):
 
     def test_three_plan_mutations_have_original_and_recompiled_controls(self):
         revalidation = ('confirmed = preflight_relationship_graph(gate, tuple(MutationIntent("DELETE", ref) for ref in rediscovered),\n'
-                        '                                                  discovery_spec, semantic_adapters=_delete_adapters())')
+                        '                                                      discovery_spec, semantic_adapters=_delete_adapters())')
         for name, replacements, cls, method in (
             ("stale_branch_plan_reused",
              (("expanded = _effect_roots(graph, initial, operation)", "expanded = preliminary"),
@@ -1995,7 +2365,7 @@ WRITE_COVERAGE = []
 
 
 class WriteEdgeMatrixTests(DeleteMatrixFixture):
-    """87 write edges: positive control, current corruption and proposed cross-tenant FK.
+    """97 write edges: positive control, current corruption and proposed cross-tenant FK.
 
     Service preflight matrix; HTTP routing/permission coverage is exercised
     separately. Factory writes happen before measured production validation.
@@ -2240,7 +2610,9 @@ def run_a8_mutations():
     zero_core = _assertion_sites(GraphFixture.no_effects, "self.assertEqual(effects, []", "self.assertFalse(self.db.new")
     cases = []
     def guard_case(name, module, prefix, cls, method, sites):
-        cases.append((name, module, "write_guard", (("    _clean(db)\n", prefix + "    _clean(db)\n"),), cls, method, sites))
+        # Match the top-level preflight boundary, not intent_factory's nested
+        # cleanliness check. The original mutant payload/defense is unchanged.
+        cases.append((name, module, "write_guard", (("\n    _clean(db)\n", "\n" + prefix + "    _clean(db)\n"),), cls, method, sites))
     guard_case("orm_assignment_before_guard", schedules,
         '    db.get(model_class("Schedule"), intents[0].reference.identity).title = "premature"\n',
         TenantA8WriteEntryTests, "test_schedule_name_patch_rejects_historical_foreign_relation_before_assignment", zero_core)
@@ -2527,3 +2899,18 @@ def _legacy_defense_sites(group, name):
             raise AssertionError("Registered legacy defense moved/disappeared: " + name)
         sites.add((str(path), matches[occurrence]))
     return frozenset(sites)
+
+
+class VW1HarnessAnchorTests(unittest.TestCase):
+    def test_a8_guard_anchor_targets_top_level_preflight(self):
+        import inspect as source_inspect
+        source = source_inspect.getsource(mutations.write_guard)
+        self.assertEqual(source.count("    _clean(db)\n"), 2,
+                         "Old anchor also matches intent_factory's nested check")
+        self.assertEqual(source.count("\n    _clean(db)\n"), 1)
+        with self.assertRaises(AssertionError):
+            _a8_compile_registered(mutations.write_guard, (("    _clean(db)\n", "    pass\n"),))
+        changed, proof = _a8_compile_registered(mutations.write_guard,
+            (("\n    _clean(db)\n", "\n    yield None\n    return\n    _clean(db)\n"),))
+        self.assertNotEqual(_mutation_fingerprint(changed), _mutation_fingerprint(mutations.write_guard))
+        self.assertTrue(proof)

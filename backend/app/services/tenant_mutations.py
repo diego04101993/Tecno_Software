@@ -10,7 +10,7 @@ from types import MappingProxyType
 from app.services.tenant_relations import (
     OPERATIONS, RELATION_SPECS, conflict, model_class, model_spec,
 )
-from app.services.tenant_ownership import RowRef, TenantGraph, freeze, ContextIntegrityState
+from app.services.tenant_ownership import RowRef, TenantGraph, freeze, ContextIntegrityState, OperationContext
 
 
 def _clean(session):
@@ -63,7 +63,243 @@ class SemanticAdapter:
             raise conflict()
 
 
-class _ProposedGraph(TenantGraph):
+class _SnapshotStore(dict):
+    """Observe explicit snapshot replacement without changing stored facts."""
+    def __init__(self):
+        super().__init__()
+        self.generation = 0
+
+    def __setitem__(self, key, value):
+        if key in self and self[key] is not value:
+            self.generation += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.generation += 1
+        super().__delitem__(key)
+
+    def clear(self):
+        self.generation += 1
+        super().clear()
+
+    def pop(self, key, *default):
+        if key in self:
+            self.generation += 1
+        return super().pop(key, *default)
+
+    def popitem(self):
+        self.generation += 1
+        return super().popitem()
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+
+class _GraphValidationMemo:
+    """Pure facts over locked, immutable snapshots in one preflight only.
+
+    Incoming discovery, semantics, file validation and authorization still run.
+    No cache exists while the handler is assigning/flushing/committing rows.
+    """
+    def __init__(self, graph, authority, gate):
+        self.graph, self.authority = graph, authority
+        self.gate = gate
+        self.gate_token = gate.token if gate is not None else None
+        self.media_validation_locked = getattr(graph, "media_validation_locked", None)
+        self.generation = graph.snapshots.generation
+        self.caches = {}
+        self.views = {}
+        # Replay obligations survive DECLINE: clearing a reusable result must
+        # never erase a file validation already coalesced during this phase.
+        self.semantic_obligations = {}
+
+    def clear(self):
+        self.caches.clear()
+        self.views.clear()
+
+    def check(self):
+        self.authority.check()
+        if (self.graph.snapshots.generation != self.generation
+                or getattr(self.graph, "media_validation_locked", None) is not self.media_validation_locked
+                or (self.gate is not None and (not self.gate.active or self.gate.graph is not self.graph
+                    or self.gate.transaction is not self.authority.transaction
+                    or self.gate.token is not self.gate_token))):
+            self.authority.invalidate()
+            raise conflict()
+
+    def locked(self, ref):
+        row = self.graph.snapshots.get(ref)
+        proof = self.graph._snapshot_lock_proofs.get(ref)
+        return (self.graph.locking and type(row) is MappingProxyType
+                and proof is not None and proof[0] is row
+                and proof[1] is self.authority.transaction
+                and self.gate is not None and self.gate.graph is self.graph
+                and self.gate.active and self.gate.transaction is self.authority.transaction)
+
+    def owner_chain_locked(self, view, ref):
+        from app.services.tenant_relations import GLOBAL_ROLES
+        from app.services.tenant_ownership import enum_value
+        visited = set()
+        while ref not in visited:
+            visited.add(ref)
+            if not self.locked(ref):
+                return False
+            row = view.snapshot(ref)
+            if row is None:
+                return False
+            spec = model_spec(ref.model)
+            if spec.owner_kind == "root" or (ref.model == "User" and enum_value(row.get("role")) in GLOBAL_ROLES):
+                return True
+            identity = row.get(spec.owner_field)
+            if type(identity) is not str or not identity:
+                return False
+            ref = RowRef(spec.owner_target, identity)
+        return False
+
+    def cache(self, view, kind):
+        self.check()
+        proposals = getattr(view, "_proposals", None)
+        removed = getattr(view, "_removed_playback_members", None)
+        signature = proposals, removed
+        previous = self.views.get(view)
+        if previous is not None and (previous[0] is not proposals or previous[1] != removed):
+            self.caches.pop(view, None)
+        self.views[view] = signature
+        return self.caches.setdefault(view, {}).setdefault(kind, {})
+
+    def _semantic_key(self, view, ref, context, row, adapter):
+        authority = self.authority
+        if (not authority.reusable or adapter.validate is not _write_semantics
+                or ref.model not in {"ContentItem", "DatasetImport"}
+                or not _PhaseGraphFacts._immutable_context(context)
+                or row is not self.graph.snapshots.get(ref) or not self.locked(ref)
+                or not self.owner_chain_locked(view, ref)
+                or not isinstance(self.graph, _WriteGraph)):
+            return None
+        if self.graph.media_validation_locked and (not authority.paths or authority.media_state is None
+                or (authority.coordinator is None and not authority.sqlite_coordinator)
+                or not self.graph.media_paths.issubset(authority.paths)):
+            return None
+        return ref, context, id(row)
+
+    def semantic_reused(self, view, ref, context, row, adapter):
+        key = self._semantic_key(view, ref, context, row, adapter)
+        return key is not None and key in self.cache(view, "semantic")
+
+    def remember_semantic(self, view, ref, context, row, adapter):
+        key = self._semantic_key(view, ref, context, row, adapter)
+        if key is not None:
+            self.cache(view, "semantic")[key] = True
+            self.semantic_obligations[view, key] = view, ref, context, row, adapter
+
+    def revalidate_semantics(self):
+        """Fresh full builtin checks at the phase boundary, before any yield.
+
+        No adapter call is reused here. Discovery only collects the union of
+        paths from the initial and final fresh checks; it grants no ownership.
+        The next fresh confirmation phase holds the complete batch and the
+        guard still requires identical paths/plans before any handler yield.
+        Proposals, custom validators and other models never qualify.
+        """
+        for view, ref, context, row, adapter in tuple(self.semantic_obligations.values()):
+            self.check()
+            if row is not view.snapshot(ref) or not self.locked(ref):
+                raise conflict()
+            if adapter.validate(view, ref, context, row) is not True:
+                raise conflict()
+            self.check()
+            if (self.graph.media_validation_locked
+                    and not self.graph.media_paths.issubset(self.authority.paths)):
+                raise conflict()
+
+
+class _PhaseGraphFacts:
+    """Opt-in memoization; direct foundation/read graph callers stay unchanged."""
+    def _phase_memo(self):
+        base = getattr(self, "_persisted", self)
+        memo = getattr(base, "_validation_memo", None)
+        if memo is not None:
+            memo.check()
+            if not memo.authority.reusable:
+                return None
+        return memo
+
+    @staticmethod
+    def _immutable_context(context):
+        return context is None or type(context) in {OperationContext, _PlayerWriteScope, _InternalDeleteScope}
+
+    def resolve_owner(self, row, expected_client=None, *, _visited=frozenset()):
+        memo = self._phase_memo()
+        if memo is None or _visited or not isinstance(row, RowRef):
+            return super().resolve_owner(row, expected_client, _visited=_visited)
+        key = row, expected_client
+        cache = memo.cache(self, "owner")
+        if key in cache:
+            return cache[key]
+        result = super().resolve_owner(row, expected_client, _visited=_visited)
+        if memo.owner_chain_locked(self, row):
+            cache[key] = result
+        return result
+
+    def branch(self, ref, *, _visited=frozenset()):
+        memo = self._phase_memo()
+        if memo is None or _visited or not isinstance(ref, RowRef):
+            return super().branch(ref, _visited=_visited)
+        cache = memo.cache(self, "branch")
+        if ref in cache and memo.locked(ref):
+            return cache[ref]
+        result = super().branch(ref, _visited=_visited)
+        if memo.locked(ref):
+            cache[ref] = result
+        return result
+
+    def _relation_local_valid(self, ref, edge, *, snapshot=None, profile="WRITE", context=None):
+        memo = self._phase_memo()
+        if memo is None or not isinstance(ref, RowRef) or not self._immutable_context(context):
+            return super()._relation_local_valid(ref, edge, snapshot=snapshot, profile=profile, context=context)
+        from app.services.tenant_relations import relation_spec
+        policy = relation_spec(edge.key if hasattr(edge, "key") else edge)
+        canonical = self.snapshot(ref)
+        if (snapshot is not None and snapshot is not canonical) or not memo.locked(ref):
+            return super()._relation_local_valid(ref, edge, snapshot=snapshot, profile=profile, context=context)
+        key = ref, policy, profile, context
+        cache = memo.cache(self, "relation")
+        if key in cache:
+            return cache[key]
+        result = super()._relation_local_valid(ref, edge, snapshot=snapshot, profile=profile, context=context)
+        target = canonical.get(policy.field) if canonical else None
+        if result and (target is None or memo.locked(RowRef(policy.target, target))):
+            cache[key] = result
+        return result
+
+    def collection_children(self, ref, profile):
+        memo = self._phase_memo()
+        if memo is None or not isinstance(ref, RowRef) or not memo.locked(ref):
+            return super().collection_children(ref, profile)
+        cache = memo.cache(self, "collection")
+        key = ref, profile
+        if key not in cache:
+            cache[key] = super().collection_children(ref, profile)
+        return cache[key]
+
+    def context_integrity(self, ref, context, *, profile="WRITE", snapshot=None):
+        memo = self._phase_memo()
+        if (memo is None or not isinstance(ref, RowRef)
+                or not self._immutable_context(context) or not memo.locked(ref)
+                or (snapshot is not None and snapshot is not self.snapshot(ref))):
+            return super().context_integrity(ref, context, profile=profile, snapshot=snapshot)
+        cache = memo.cache(self, "context")
+        key = ref, profile, context
+        if key in cache:
+            return cache[key]
+        result = super().context_integrity(ref, context, profile=profile, snapshot=snapshot)
+        if result.state == ContextIntegrityState.CONSISTENT and all(memo.locked(child) for child in result.checked):
+            cache[key] = result
+        return result
+
+
+class _ProposedGraph(_PhaseGraphFacts, TenantGraph):
     def __init__(self, graph, proposals):
         self.session = graph.session
         self._persisted = graph
@@ -103,16 +339,24 @@ class _ProposedGraph(TenantGraph):
 
 
 def _semantics(graph, ref, context, adapters):
+    if ref in getattr(graph, "_removed_playback_members", ()):
+        return  # explicit membership DELETE; persisted old state is checked separately
     if type(adapters) is not tuple or len({a.model for a in adapters}) != len(adapters):
         raise conflict()
     row = graph.snapshot(ref)
     # Scalar credentials/labels are not ownership-bearing media references.
     exempt = {"password_hash", "player_token_hash", "source_filename", "sample_value", "fallback_value"}
-    present = any(row.get(k) for k in model_spec(ref.model).opaque_fields if k not in exempt)
+    present = (ref.model in {"VideowallPublication", "VideowallPublicationAsset", "VideowallPlaybackGroup", "VideowallPlaybackGroupMember"}
+               or any(row.get(k) for k in model_spec(ref.model).opaque_fields if k not in exempt))
     if present:
         adapter = next((a for a in adapters if a.model == ref.model), None)
+        memo = graph._phase_memo() if isinstance(graph, _PhaseGraphFacts) else None
+        if adapter is not None and memo is not None and memo.semantic_reused(graph, ref, context, row, adapter):
+            return
         if adapter is None or adapter.validate(graph, ref, context, row) is not True:
             raise conflict()
+        if memo is not None:
+            memo.remember_semantic(graph, ref, context, row, adapter)
 
 
 @dataclass(frozen=True)
@@ -261,6 +505,9 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
             create=intent.action == "CREATE", adapters=semantic_adapters,
         ))
     view = _ProposedGraph(graph, proposed)
+    if operation.function == "update_playback_groups":
+        view._removed_playback_members = frozenset(i.reference for i in intents
+            if i.action == "DELETE" and i.reference.model == "VideowallPlaybackGroupMember")
     for proposal in proposed:
         view.assert_integrity(proposal.reference, context)
         _semantics(view, proposal.reference, context, semantic_adapters)
@@ -291,7 +538,8 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
             for edge in RELATION_SPECS:
                 if edge.target != ref.model:
                     continue
-                if (isinstance(graph, _WriteGraph) and edge.key == "LayoutRevision.created_by_user_id"
+                if (isinstance(graph, _WriteGraph) and edge.key in {
+                        "LayoutRevision.created_by_user_id", "VideowallPublication.requested_by_user_id"}
                         and ref.model == "User"
                         and graph.resolve_owner(ref).state.value == "GLOBAL_PRINCIPAL"
                         and view.resolve_owner(ref).state.value == "GLOBAL_PRINCIPAL"):
@@ -362,11 +610,13 @@ class _InternalDeleteScope:
     parent: object = None
 
 
-class _DeleteGraph(TenantGraph):
+class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
     def __init__(self, session):
         super().__init__(session)
-        self.snapshots = {}
+        self.snapshots = _SnapshotStore()
+        self._snapshot_lock_proofs = {}
         self.locking = False
+        self._validation_memo = None
 
     def snapshot(self, row):
         from sqlalchemy import select
@@ -374,12 +624,26 @@ class _DeleteGraph(TenantGraph):
         if ref not in self.snapshots:
             cls = model_class(ref.model)
             statement = select(*(getattr(cls, k) for k in model_spec(ref.model).columns)).where(cls.id == ref.identity)
-            if self.locking and self.session.get_bind().dialect.name == "postgresql":
+            dialect = self.session.get_bind().dialect.name
+            locked = self.locking and dialect == "postgresql"
+            if locked:
                 statement = statement.with_for_update()
             with self.session.no_autoflush:
                 value = self.session.execute(statement).mappings().one_or_none()
             self.snapshots[ref] = freeze(dict(value)) if value is not None else None
-        return self.snapshots[ref]
+            # Eligibility records the actual locked load, not merely a mutable
+            # ``locking`` flag or a caller-prepopulated immutable dictionary.
+            # SQLite's active gate owns BEGIN IMMEDIATE in this transaction;
+            # the phase also binds that exact gate before reusing any fact.
+            if self.locking and dialect == "sqlite":
+                locked = self.session.connection().connection.driver_connection.in_transaction
+            if locked and value is not None:
+                self._snapshot_lock_proofs[ref] = (self.snapshots[ref], self.session.get_transaction())
+        result = self.snapshots[ref]
+        memo = self._validation_memo
+        if memo is not None and result is not None and not memo.locked(ref):
+            memo.authority.decline()
+        return result
 
     def authorize_row(self, ref, context):
         if type(context) is _InternalDeleteScope:
@@ -392,7 +656,34 @@ class _DeleteGraph(TenantGraph):
 
 
 @contextmanager
-def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=()):
+def _graph_validation_phase(graph, gate=None):
+    """Caches stop before the next fresh pass or any handler-side mutation."""
+    from app.services.media_references import media_ownership_validation_phase
+    if getattr(graph, "_validation_memo", None) is not None:
+        raise conflict()
+    with media_ownership_validation_phase(graph.session) as authority:
+        memo = _GraphValidationMemo(graph, authority, gate)
+        graph._validation_memo = memo
+        authority.invalidate_callbacks.append(memo.clear)
+        failed = False
+        try:
+            try:
+                yield
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                if not failed:
+                    memo.revalidate_semantics()
+                    memo.check()
+        finally:
+            graph._validation_memo = None
+            memo.clear()
+            memo.semantic_obligations.clear()
+
+
+@contextmanager
+def write_guard(db, *, actor, client_id, operation, intents=None, semantic_adapters=(), intent_factory=None):
     """Approve a complete write batch before the handler's first ORM assignment.
 
     Uses the A6 tenant gate and A7 fresh, locking snapshots. Locks live until
@@ -404,6 +695,10 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
     from app.services.tenant_ownership import context_for_actor, enum_value
 
     _clean(db)
+    if ((intents is None) == (intent_factory is None)
+            or (intent_factory is not None and (not callable(intent_factory)
+                or operation != "activate_videowall_publication"))):
+        raise conflict()
     spec = next((item for item in OPERATIONS if item.function == operation), None)
     if spec is None or spec.method not in {"POST", "PUT", "PATCH"}:
         raise conflict()
@@ -412,10 +707,10 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
     if actor_before != (context.actor.role, context.actor.client_id, context.actor.branch_id):
         raise conflict()
     graph = _WriteGraph(db)
-    graph.new_content_refs = frozenset(intent.reference for intent in intents
+    graph.new_content_refs = frozenset(intent.reference for intent in (intents or ())
                                       if intent.action == "CREATE" and intent.reference.model == "ContentItem")
-    prepared_versions = _prepared_row_versions(db, intents)
-    if operation == "create_client" and len(intents) == 1:
+    prepared_versions = _prepared_row_versions(db, intents or ())
+    if operation == "create_client" and intents is not None and len(intents) == 1:
         intent = intents[0]
         if intent.action == "CREATE" and intent.reference.model == "Client" and context.client_id is None:
             graph.new_roots = frozenset((intent.reference,))
@@ -430,7 +725,7 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
             raise conflict()
         connection.execute(text("SET LOCAL lock_timeout = '10s'"))
     try:
-        if any(intent.reference.model == "User" for intent in intents):
+        if any(intent.reference.model == "User" for intent in (intents or ())):
             from app.services.user_admin import lock_super_admin_delete_set
             lock_super_admin_delete_set(db)
         gate_type = _GlobalWriteGate if context.client_id is None else MutationGate
@@ -440,6 +735,17 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
             graph.snapshot(actor_ref)
             if context_for_actor(db, actor, client_id=client_id) != context:
                 raise conflict()
+            if intent_factory is not None:
+                # Backend-only pure preparation after the tenant gate. In VW1
+                # this fixes activation's persisted clock after lock waits.
+                # Request data never supplies a callable or a mutation plan.
+                intents = intent_factory()
+                _clean(db)
+                if type(intents) is not tuple or not intents:
+                    raise conflict()
+                graph.new_content_refs = frozenset(i.reference for i in intents
+                    if i.action == "CREATE" and i.reference.model == "ContentItem")
+                prepared_versions = _prepared_row_versions(db, intents)
             for ref, previous in prepared_versions.items():
                 current = graph.snapshot(ref)
                 if current is None or any(not _same_prepared_value(value, current.get(key))
@@ -448,8 +754,9 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
             # Each snapshot is SELECT ... FOR UPDATE on PostgreSQL. Incoming
             # references committed before their anchor lock enter discovery;
             # subsequent FK writers wait until this transaction ends.
-            plan = preflight_relationship_graph(gate, intents, spec,
-                                                semantic_adapters=semantic_adapters)
+            with _graph_validation_phase(graph, gate):
+                plan = preflight_relationship_graph(gate, intents, spec,
+                                                    semantic_adapters=semantic_adapters)
             with ExitStack() as media_locks:
                 paths = frozenset(graph.media_paths)
                 if paths:
@@ -459,14 +766,17 @@ def write_guard(db, *, actor, client_id, operation, intents, semantic_adapters=(
                 graph.snapshots.clear()
                 graph.media_paths.clear()
                 graph.media_validation_locked = True
-                confirmed = preflight_relationship_graph(gate, intents, spec,
-                                                         semantic_adapters=semantic_adapters)
+                with _graph_validation_phase(graph, gate):
+                    confirmed = preflight_relationship_graph(gate, intents, spec,
+                                                             semantic_adapters=semantic_adapters)
                 if (plan.proposed != confirmed.proposed or plan.checked != confirmed.checked
                         or plan.dependencies != confirmed.dependencies or paths != frozenset(graph.media_paths)):
                     raise conflict()
                 confirmed.assert_usable(gate, context)
                 db.expire_all()
-                yield confirmed
+                from app.services.media_references import generated_reference_guard
+                with generated_reference_guard(db, confirmed):
+                    yield confirmed
     except DBAPIError as exc:
         if getattr(exc.orig, "sqlstate", None) not in {"40001", "40P01", "55P03"}:
             raise
@@ -552,7 +862,8 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
                 current = graph.snapshot(ref)
                 if current is None or any(not _same_prepared_value(value, current.get(key)) for key, value in previous.items()):
                     raise conflict()
-            plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
+            with _graph_validation_phase(graph, gate):
+                plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
             with ExitStack() as media_locks:
                 paths = frozenset(graph.media_paths)
                 if paths:
@@ -562,7 +873,8 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
                 graph.snapshots.clear()
                 graph.media_paths.clear()
                 graph.media_validation_locked = True
-                confirmed = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
+                with _graph_validation_phase(graph, gate):
+                    confirmed = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
                 if (plan.proposed != confirmed.proposed or plan.checked != confirmed.checked
                         or plan.dependencies != confirmed.dependencies or paths != frozenset(graph.media_paths)):
                     raise conflict()
@@ -621,7 +933,14 @@ def _write_semantics(graph, ref, context, row):
     Labels, telemetry and tabular data never establish ownership. Only typed
     persisted media references can prove local media ownership. No HTTP fetch.
     """
+    # These models' scalar/telemetry values never carry media ownership. Their
+    # owner/context checks remain in the complete preflight outside this helper;
+    # resolving an owner here used to compute an unused result before True.
+    if ref.model in {"Channel", "DataSource", "DatasetColumn", "DatasetRow",
+                     "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "User"}:
+        return True
     from collections.abc import Mapping
+    from sqlalchemy import select
     from app.core.config import get_settings
     from app.services.media_references import _local_url, media_owned_by
     from app.services.media_storage import MediaPathError, resolve_stored_media_path
@@ -676,7 +995,35 @@ def _write_semantics(graph, ref, context, row):
             return local_media(value)
         return True
 
+    if ref.model == "VideowallPublication":
+        from app.services.videowall_integrity import publication_semantics
+        return publication_semantics(graph, ref, context, row)
+    if ref.model == "VideowallPublicationAsset":
+        from app.services.videowall_integrity import asset_semantics
+        return asset_semantics(graph, ref, context, row)
+    if ref.model in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"}:
+        from app.services.videowall_playback_groups import playback_group_semantics
+        return playback_group_semantics(graph, ref, context, row)
     if ref.model == "ContentItem":
+        if isinstance(graph, _ProposedGraph):
+            previous = graph._persisted.snapshot(ref)
+            if previous is not None and any(previous.get(k) != row.get(k) for k in ("file_path", "type")):
+                from app.models.entities import VideowallPublicationAsset
+                referenced = graph.session.scalar(select(VideowallPublicationAsset.id).where(
+                    (VideowallPublicationAsset.master_content_id == ref.identity)
+                    | (VideowallPublicationAsset.derived_content_id == ref.identity)).limit(1))
+                if referenced:
+                    return False
+        if ref in base.new_content_refs:
+            from app.services.media_references import generated_media_reference_authorized
+            try:
+                generated_path = resolve_stored_media_path(root, row.get("file_path"), must_exist=False)
+                if (generated_path is not None and generated_media_reference_authorized(
+                        graph.session, ref.identity, owner.client_id, generated_path)):
+                    base.media_paths.add(generated_path)
+                    return True
+            except MediaPathError:
+                return False
         if ref in base.new_content_refs and base.media_validation_locked:
             from fastapi import HTTPException
             from app.services.media_references import require_media_owner
@@ -714,7 +1061,8 @@ def _write_semantics(graph, ref, context, row):
 
 def _write_adapters():
     from app.services.tenant_relations import MODEL_SPECS
-    return tuple(SemanticAdapter(spec.name, _write_semantics) for spec in MODEL_SPECS if spec.opaque_fields)
+    return tuple(SemanticAdapter(spec.name, _write_semantics) for spec in MODEL_SPECS
+                 if spec.opaque_fields or spec.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"})
 
 
 class _GlobalWriteGate(MutationGate):
@@ -762,7 +1110,8 @@ def _delete_semantics(graph, ref, context, row):
 
 def _delete_adapters():
     from app.services.tenant_relations import MODEL_SPECS
-    return tuple(SemanticAdapter(s.name, _delete_semantics) for s in MODEL_SPECS if s.opaque_fields)
+    return tuple(SemanticAdapter(s.name, _delete_semantics) for s in MODEL_SPECS
+                 if s.opaque_fields or s.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"})
 
 
 def _effect_roots(graph, roots, operation):
@@ -818,13 +1167,15 @@ def _locked_delete_plan(gate, initial, operation, discovery_spec):
         graph.snapshots.clear()
         expanded = _effect_roots(graph, initial, operation)
         intents = tuple(MutationIntent("DELETE", ref) for ref in expanded)
-        plan = preflight_relationship_graph(gate, intents, discovery_spec, semantic_adapters=_delete_adapters())
+        with _graph_validation_phase(graph, gate):
+            plan = preflight_relationship_graph(gate, intents, discovery_spec, semantic_adapters=_delete_adapters())
         graph.snapshots.clear()
         rediscovered = _effect_roots(graph, initial, operation)
         if rediscovered != expanded:
             continue
-        confirmed = preflight_relationship_graph(gate, tuple(MutationIntent("DELETE", ref) for ref in rediscovered),
-                                                  discovery_spec, semantic_adapters=_delete_adapters())
+        with _graph_validation_phase(graph, gate):
+            confirmed = preflight_relationship_graph(gate, tuple(MutationIntent("DELETE", ref) for ref in rediscovered),
+                                                      discovery_spec, semantic_adapters=_delete_adapters())
         if (plan.checked != confirmed.checked or plan.dependencies != confirmed.dependencies
                 or plan.proposed != confirmed.proposed):
             raise conflict()
@@ -1007,6 +1358,13 @@ def delete_guard(db, rows, *, actor=None, operation="delete_client", branch_id=N
                 for p in plans
             ))
             approval = DeleteApproval(roots, tuple(plans), covered, db.get_transaction())
+            # V1 has no publication release/GC endpoint. Keep its masters,
+            # slices and structural parents protected until an explicit release
+            # policy exists, rather than relying on a late RESTRICT failure or
+            # deleting media still needed by a prepared/offline wall.
+            if any(ref.model in {"VideowallPublication", "VideowallPublicationAsset"}
+                   for ref in covered):
+                raise conflict()
             _clean(db)
             db.expire_all()  # handlers cannot reuse identity-map values from before the locks
             db.info[_DELETE_STATE] = approval

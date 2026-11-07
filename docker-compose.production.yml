@@ -59,6 +59,32 @@ services:
       proxy_net:
         ipv4_address: 172.30.250.3
 
+  # Opt in only after migration 016 has been reviewed/applied. No web listener.
+  videowall-worker:
+    profiles: ["videowall"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.production
+    command: ["python", "-m", "app.workers.videowall"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DEBUG: "false"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      MEDIA_ROOT: /app/storage/uploads
+      AUTO_SEED: "false"
+      VW1_WORK_ROOT: /app/storage/processing/videowall
+    volumes:
+      - backend_uploads:/app/storage/uploads
+      - videowall_processing:/app/storage/processing/videowall
+    networks:
+      - app_net
+
   frontend:
     build:
       context: ./frontend
@@ -87,6 +113,7 @@ services:
 volumes:
   postgres_data:
   backend_uploads:
+  videowall_processing:
   caddy_data:
   caddy_config:
 

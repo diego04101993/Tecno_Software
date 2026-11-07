@@ -2,7 +2,7 @@ from datetime import date, datetime, time
 from enum import Enum
 import secrets
 
-from sqlalchemy import Boolean, Date, DateTime, Enum as SqlEnum, ForeignKey, Integer, JSON, String, Text, Time, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
@@ -767,6 +767,7 @@ class Schedule(UUIDMixin, TimestampMixin, Base):
 
 class Videowall(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "videowalls"
+    __table_args__ = (CheckConstraint("media_delivery IN ('legacy','node_slice')", name="ck_videowalls_media_delivery"),)
 
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -780,6 +781,11 @@ class Videowall(UUIDMixin, TimestampMixin, Base):
     primary_channel_id: Mapped[str | None] = mapped_column(ForeignKey("channels.id", ondelete="SET NULL"), unique=True)
     start_tolerance_ms: Mapped[int] = mapped_column(Integer, default=250)
     sync_mode: Mapped[str] = mapped_column(String(40), default="play_at_timestamp")
+    media_delivery: Mapped[str] = mapped_column(String(24), nullable=False, default="legacy", server_default="legacy")
+    playback_groups_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    active_publication_id: Mapped[str | None] = mapped_column(ForeignKey(
+        "videowall_publications.id", ondelete="SET NULL", use_alter=True,
+        name="fk_videowalls_active_publication"))
 
     client: Mapped[Client] = relationship(back_populates="videowalls")
     nodes: Mapped[list["VideowallNode"]] = relationship(back_populates="videowall", cascade="all, delete-orphan")
@@ -799,9 +805,110 @@ class VideowallNode(UUIDMixin, TimestampMixin, Base):
     y: Mapped[int] = mapped_column(Integer, default=0)
     width: Mapped[int] = mapped_column(Integer, default=1920)
     height: Mapped[int] = mapped_column(Integer, default=1080)
+    layout_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
     videowall: Mapped[Videowall] = relationship(back_populates="nodes")
     channel: Mapped[Channel] = relationship(back_populates="videowall_nodes")
+
+
+class VideowallPlaybackGroup(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "videowall_playback_groups"
+    __table_args__ = (CheckConstraint("mode IN ('INDIVIDUAL','SYNCHRONIZED')", name="ck_vw_playback_group_mode"),)
+
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
+    wall_id: Mapped[str] = mapped_column(ForeignKey("videowalls.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    mode: Mapped[str] = mapped_column(String(24), nullable=False)
+    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False)
+    active_publication_id: Mapped[str | None] = mapped_column(ForeignKey(
+        "videowall_publications.id", ondelete="SET NULL", use_alter=True,
+        name="fk_vw_playback_group_active_publication"))
+
+
+class VideowallPlaybackGroupMember(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "videowall_playback_group_members"
+    __table_args__ = (
+        UniqueConstraint("node_id", name="uq_vw_group_current_node"),
+        UniqueConstraint("group_id", "position_index", name="uq_vw_group_local_position"),
+        CheckConstraint("position_index > 0 AND row_index >= 0 AND column_index >= 0", name="ck_vw_group_member_position"),
+    )
+
+    group_id: Mapped[str] = mapped_column(ForeignKey("videowall_playback_groups.id", ondelete="CASCADE"), nullable=False)
+    node_id: Mapped[str] = mapped_column(ForeignKey("videowall_nodes.id", ondelete="RESTRICT"), nullable=False)
+    position_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    column_index: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class VideowallPublication(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "videowall_publications"
+    __table_args__ = (
+        CheckConstraint("status IN ('PENDING','PROCESSING','READY','ACTIVE','FAILED')", name="ck_vw_publications_status"),
+        CheckConstraint("expected_asset_count > 0", name="ck_vw_publications_asset_count"),
+        CheckConstraint("attempt_count >= 0", name="ck_vw_publications_attempt_count"),
+        CheckConstraint("loop_duration_ms IS NULL OR loop_duration_ms > 0", name="ck_vw_publications_loop_duration"),
+        CheckConstraint("loop_start_epoch_ms IS NULL OR loop_start_epoch_ms >= 0", name="ck_vw_publications_epoch"),
+        CheckConstraint("status NOT IN ('READY','ACTIVE') OR loop_duration_ms IS NOT NULL", name="ck_vw_publications_ready_timeline"),
+        CheckConstraint("status != 'ACTIVE' OR (loop_start_epoch_ms IS NOT NULL AND activated_at IS NOT NULL)", name="ck_vw_publications_active_epoch"),
+        CheckConstraint("encoding_profile = 'code302_h264_cfr_v1'", name="ck_vw_publications_encoding_profile"),
+        Index("ix_vw_publications_claim", "status", "lease_expires_at", "created_at"),
+        Index("ix_vw_publications_wall_created", "wall_id", "created_at"),
+        Index("ix_vw_publications_client_branch", "client_id", "branch_id"),
+    )
+
+    client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
+    wall_id: Mapped[str] = mapped_column(ForeignKey("videowalls.id", ondelete="CASCADE"), nullable=False)
+    playback_group_id: Mapped[str | None] = mapped_column(ForeignKey("videowall_playback_groups.id", ondelete="RESTRICT"))
+    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False)
+    requested_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING", server_default="PENDING")
+    program_snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    geometry_snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    geometry_signature: Mapped[str] = mapped_column(String(64), nullable=False)
+    encoding_profile: Mapped[str] = mapped_column(String(64), nullable=False, default="code302_h264_cfr_v1", server_default="code302_h264_cfr_v1")
+    expected_asset_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    loop_duration_ms: Mapped[int | None] = mapped_column(BigInteger)
+    loop_start_epoch_ms: Mapped[int | None] = mapped_column(BigInteger)
+    lease_token: Mapped[str | None] = mapped_column(String(64))
+    lease_owner: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(String(500))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class VideowallPublicationAsset(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "videowall_publication_assets"
+    __table_args__ = (
+        UniqueConstraint("publication_id", "logical_item_id", "position_index", name="uq_vw_publication_item_node"),
+        UniqueConstraint("derived_content_id", name="uq_vw_publication_derived_content"),
+        CheckConstraint("position_index > 0", name="ck_vw_publication_assets_position"),
+        CheckConstraint("sort_order >= 1 AND width > 0 AND height > 0", name="ck_vw_publication_assets_geometry"),
+        CheckConstraint("duration_ms IS NULL OR duration_ms > 0", name="ck_vw_publication_assets_duration"),
+        CheckConstraint("size_bytes IS NULL OR size_bytes > 0", name="ck_vw_publication_assets_size"),
+        CheckConstraint("NOT validated OR (derived_content_id IS NOT NULL AND duration_ms IS NOT NULL AND mime_type IS NOT NULL AND checksum IS NOT NULL AND size_bytes IS NOT NULL)", name="ck_vw_publication_assets_validated"),
+        Index("ix_vw_publication_assets_master", "master_content_id"),
+        Index("ix_vw_publication_assets_node", "node_id"),
+    )
+
+    publication_id: Mapped[str] = mapped_column(ForeignKey("videowall_publications.id", ondelete="CASCADE"), nullable=False)
+    node_id: Mapped[str] = mapped_column(ForeignKey("videowall_nodes.id", ondelete="RESTRICT"), nullable=False)
+    master_content_id: Mapped[str] = mapped_column(ForeignKey("contents.id", ondelete="RESTRICT"), nullable=False)
+    derived_content_id: Mapped[str | None] = mapped_column(ForeignKey("contents.id", ondelete="RESTRICT"))
+    logical_item_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    position_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger)
+    mime_type: Mapped[str | None] = mapped_column(String(120))
+    checksum: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    probe_json: Mapped[dict | None] = mapped_column(JSON)
+    validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
 
 class KioskScreen(UUIDMixin, TimestampMixin, Base):

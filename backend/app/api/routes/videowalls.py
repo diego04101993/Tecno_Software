@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.api.routes.channels import cleanup_channel_delete_dependencies, get_channel_delete_block_message, join_human_list
-from app.models.entities import Channel, ChannelMode, User, Videowall, VideowallNode
+from app.models.entities import Channel, ChannelMode, User, Videowall, VideowallNode, VideowallPublication, VideowallPlaybackGroup
 from app.schemas.domain import (
     VideowallCreate,
     VideowallNodeCreate,
@@ -16,6 +16,11 @@ from app.schemas.domain import (
     VideowallNodeUpdate,
     VideowallRead,
     VideowallUpdate,
+    VideowallPublicationCreate,
+    VideowallPublicationRead,
+    VideowallPhysicalLayoutUpdate,
+    VideowallPlaybackGroupsUpdate,
+    VideowallPlaybackGroupRead,
 )
 from app.services.presence import is_player_online
 from app.services.tenancy import (
@@ -42,6 +47,9 @@ from app.services.tenant_mutations import delete_guard, MutationIntent, write_gu
 
 from app.services.tenant_responses import read_snapshot, safe_model_read
 from app.services.tenant_queries import readable_query
+from app.services.videowall_publications import (
+    activate_publication, create_publication, publication_read, require_node_slice_geometry,
+)
 
 router = APIRouter()
 MULTI_NODE_RENDER_MODE = "multi-node"
@@ -334,7 +342,10 @@ def create_videowall(
         primary_channel_id=primary_channel.id if primary_channel else None,
         start_tolerance_ms=_require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms"),
         sync_mode=(payload.sync_mode or "play_at_timestamp").strip() or "play_at_timestamp",
+        media_delivery=payload.media_delivery,
     )
+    if payload.media_delivery == "node_slice":
+        require_node_slice_geometry(values)
     ref = RowRef("Videowall", str(uuid4()))
     intent = MutationIntent("CREATE", ref, tuple(values.items()))
     with write_guard(db, actor=current_user, client_id=client_id, operation="create_videowall", intents=(intent,)):
@@ -357,6 +368,10 @@ def update_videowall(
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
     next_render_mode = _normalize_render_mode(payload.render_mode if payload.render_mode is not None else videowall.render_mode)
+    if videowall.playback_groups_enabled and any(
+        key in payload.model_fields_set and getattr(payload, key) is not None and getattr(payload, key) != getattr(videowall, key)
+        for key in ("render_mode", "rows", "columns", "total_width", "total_height", "output_width", "output_height", "media_delivery")):
+        raise HTTPException(status_code=409, detail="Usa el editor de layout físico para cambiar esta matriz")
     next_columns = payload.columns if payload.columns is not None else videowall.columns
     next_rows = payload.rows if payload.rows is not None else videowall.rows
     next_total_width = payload.total_width if payload.total_width is not None else videowall.total_width
@@ -388,14 +403,14 @@ def update_videowall(
 
     if next_render_mode == MULTI_NODE_RENDER_MODE:
         for node in nodes:
-            if node.row_index < 0 or node.row_index >= rows or node.column_index < 0 or node.column_index >= columns:
+            if node.layout_enabled and (node.row_index < 0 or node.row_index >= rows or node.column_index < 0 or node.column_index >= columns):
                 raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="No se puede redimensionar la matriz porque uno o más nodos quedarían fuera de rango",
             )
 
     copied_fields = ("id", "client_id", "name", "render_mode", "columns", "rows", "total_width", "total_height",
-                     "output_width", "output_height", "primary_channel_id", "start_tolerance_ms", "sync_mode")
+                     "output_width", "output_height", "primary_channel_id", "start_tolerance_ms", "sync_mode", "media_delivery", "active_publication_id")
     previous = {field: getattr(videowall, field) for field in copied_fields}
     proposed_wall = SimpleNamespace(**previous)
     node_geometries = {}
@@ -428,9 +443,17 @@ def update_videowall(
         proposed_wall.start_tolerance_ms = _require_positive_int(payload.start_tolerance_ms, "start_tolerance_ms")
     if payload.sync_mode is not None:
         proposed_wall.sync_mode = payload.sync_mode.strip() or proposed_wall.sync_mode
+    if payload.media_delivery is not None:
+        proposed_wall.media_delivery = payload.media_delivery
+        if payload.media_delivery == "legacy":
+            proposed_wall.active_publication_id = None
+    if proposed_wall.media_delivery == "node_slice" and not videowall.playback_groups_enabled:
+        require_node_slice_geometry(proposed_wall)
 
     if next_render_mode == MULTI_NODE_RENDER_MODE:
         for node in nodes:
+            if not node.layout_enabled:
+                continue
             geometry = compute_videowall_cell_by_row_col(
                 columns=columns,
                 rows=rows,
@@ -459,6 +482,97 @@ def update_videowall(
         db.commit()
         db.refresh(videowall)
         return videowall
+
+
+@router.get("/{videowall_id}/publications", response_model=list[VideowallPublicationRead])
+@read_snapshot(response_model=list[VideowallPublicationRead])
+def list_videowall_publications(
+    videowall_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    playback_group_id: str | None = Query(default=None),
+) -> list[VideowallPublicationRead]:
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    rows = db.scalars(readable_query(select(VideowallPublication), VideowallPublication, db=db)
+                      .where(VideowallPublication.wall_id == wall.id,
+                             VideowallPublication.client_id == wall.client_id)
+                      .order_by(VideowallPublication.created_at.desc(), VideowallPublication.id.desc()))
+    return [publication_read(db, row, wall) for row in rows
+            if playback_group_id is None or row.playback_group_id == playback_group_id]
+
+
+@router.post("/{videowall_id}/publications", response_model=VideowallPublicationRead,
+             status_code=status.HTTP_201_CREATED)
+def prepare_videowall_publication(
+    videowall_id: str,
+    payload: VideowallPublicationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideowallPublicationRead:
+    if not can_write_client_scope(current_user):
+        raise HTTPException(status_code=403, detail="You do not have permission to prepare publications")
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    group = None
+    if payload.playback_group_id:
+        group = db.get(VideowallPlaybackGroup, payload.playback_group_id)
+        if group is None or group.wall_id != wall.id or group.client_id != wall.client_id:
+            raise HTTPException(status_code=404, detail="Playback group not found")
+    publication = create_publication(db, wall, payload.campaign_id, current_user, playback_group=group)
+    return publication_read(db, publication, wall)
+
+
+@router.post("/{videowall_id}/publications/{publication_id}/activate", response_model=VideowallPublicationRead)
+def activate_videowall_publication(
+    videowall_id: str,
+    publication_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> VideowallPublicationRead:
+    if not can_write_client_scope(current_user):
+        raise HTTPException(status_code=403, detail="You do not have permission to activate publications")
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    publication = activate_publication(db, wall, publication_id, current_user)
+    return publication_read(db, publication, wall)
+
+
+@router.get("/{videowall_id}/playback-groups", response_model=list[VideowallPlaybackGroupRead])
+@read_snapshot(response_model=list[VideowallPlaybackGroupRead])
+def list_playback_groups(
+    videowall_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.videowall_playback_groups import read_group
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    rows = db.scalars(readable_query(select(VideowallPlaybackGroup), VideowallPlaybackGroup, db=db)
+        .where(VideowallPlaybackGroup.wall_id == wall.id, VideowallPlaybackGroup.client_id == wall.client_id)
+        .order_by(VideowallPlaybackGroup.created_at, VideowallPlaybackGroup.id))
+    return [read_group(db, group) for group in rows
+            if not is_branch_scoped(current_user) or group.branch_id == require_branch_assignment(current_user)]
+
+
+@router.put("/{videowall_id}/playback-groups", response_model=list[VideowallPlaybackGroupRead])
+def update_playback_groups(
+    videowall_id: str,
+    payload: VideowallPlaybackGroupsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.videowall_playback_groups import replace_playback_groups
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    return replace_playback_groups(db, wall, payload, current_user)
+
+
+@router.put("/{videowall_id}/physical-layout", response_model=VideowallRead)
+def update_physical_videowall_layout(
+    videowall_id: str,
+    payload: VideowallPhysicalLayoutUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.videowall_playback_groups import update_physical_layout
+    wall = get_videowall_in_scope(videowall_id, db, current_user)
+    return update_physical_layout(db, wall, payload, current_user)
 
 
 @router.delete("/{videowall_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -542,6 +656,8 @@ def upsert_node(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    if videowall.playback_groups_enabled:
+        raise HTTPException(status_code=409, detail="Usa el editor de layout físico para cambiar esta matriz")
     _ensure_multi_node_videowall(videowall)
     channel = get_channel_in_scope(db, payload.channel_id, current_user)
     if channel.client_id != videowall.client_id:
@@ -619,6 +735,8 @@ def update_node_position(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to modify videowalls")
 
     videowall = get_videowall_in_scope(videowall_id, db, current_user)
+    if videowall.playback_groups_enabled:
+        raise HTTPException(status_code=409, detail="Usa el editor de layout físico para cambiar esta matriz")
     _ensure_multi_node_videowall(videowall)
     node = db.scalar(
         select(VideowallNode)

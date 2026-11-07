@@ -138,6 +138,62 @@ class StoredUpload:
     size: int
 
 
+def promote_generated_media(media_root: Path, client_id: str, source: Path,
+                            destination: Path, expected_checksum: str) -> StoredUpload:
+    """Publish a private worker result to a reserved UUID; never overwrite.
+
+    The caller holds the tenant gate and complete media lock batch. This only
+    copies bytes; it never grants ownership or commits a database transaction.
+    """
+    import hashlib
+    source = Path(source)
+    if source.is_symlink() or not source.is_file() or source.resolve().is_relative_to(media_root.resolve()):
+        raise MediaPathError("GENERATED_MEDIA_SOURCE_INVALID")
+    if normalize_upload_filename(client_id) != client_id:
+        raise MediaPathError("GENERATED_MEDIA_TARGET_INVALID")
+    destination = contained_media_path(media_root, destination)
+    if destination.parent != media_root.resolve() / client_id:
+        raise MediaPathError("GENERATED_MEDIA_TARGET_INVALID")
+    _reject_directory_redirects(media_root, destination.parent)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _reject_directory_redirects(media_root, destination.parent)
+    if destination.exists() or destination.is_symlink():
+        raise MediaPathError("GENERATED_MEDIA_TARGET_EXISTS")
+    temporary = None
+    identity = None
+    try:
+        digest = hashlib.sha256()
+        with source.open("rb") as original, tempfile.NamedTemporaryFile(
+                mode="wb", prefix=".generated-", suffix=".tmp",
+                dir=destination.parent, delete=False) as buffer:
+            temporary = Path(buffer.name)
+            info = os.fstat(buffer.fileno())
+            identity = (info.st_dev, info.st_ino)
+            for block in iter(lambda: original.read(1024 * 1024), b""):
+                digest.update(block)
+                buffer.write(block)
+            buffer.flush()
+            os.fsync(buffer.fileno())
+            size = buffer.tell()
+        if size <= 0 or digest.hexdigest() != expected_checksum:
+            raise MediaPathError("GENERATED_MEDIA_CHANGED")
+        validate_media_file(media_root, temporary)
+        os.link(temporary, destination)
+        return StoredUpload(destination, source.name, size)
+    except MediaPathError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise MediaPathError("GENERATED_MEDIA_PUBLISH_FAILED") from exc
+    finally:
+        if temporary is not None:
+            _reject_directory_redirects(media_root, temporary.parent)
+            validate_media_file(media_root, temporary)
+            current = temporary.lstat()
+            if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+                raise MediaPathError("GENERATED_MEDIA_TEMP_CHANGED")
+            temporary.unlink()
+
+
 def write_media_upload(media_root: Path, directory_parts: tuple[str, ...], filename: str | None,
                        content_type: str | None, source: BinaryIO) -> StoredUpload:
     """Write completely, then atomically link to a unique, never-overwritten name.

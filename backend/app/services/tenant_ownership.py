@@ -277,7 +277,7 @@ class TenantGraph:
             return False
         source_owner = self.resolve_owner(ref)
         target_owner = self.resolve_owner(target)
-        if (edge.key == "LayoutRevision.created_by_user_id"
+        if (edge.key in {"LayoutRevision.created_by_user_id", "VideowallPublication.requested_by_user_id"}
                 and target_owner.state == OwnerState.GLOBAL_PRINCIPAL):
             return True
         if (source_owner.state != OwnerState.OWNED or target_owner.state != OwnerState.OWNED
@@ -286,6 +286,47 @@ class TenantGraph:
         if context is not None and context.branch_id is not None:
             branch = self.branch(target)
             if branch is not None and branch != context.branch_id:
+                return False
+        if edge.key == "Videowall.active_publication_id":
+            if target_row["wall_id"] != ref.identity:
+                return False
+            if target_row.get("playback_group_id") is not None:
+                return False
+            if row["media_delivery"] == "node_slice" and (
+                    target_row["status"] != "ACTIVE" or target_row["loop_start_epoch_ms"] is None):
+                return False
+        if edge.key == "VideowallPlaybackGroup.active_publication_id":
+            if (target_row.get("playback_group_id") != ref.identity or target_row["wall_id"] != row["wall_id"]
+                    or target_row["campaign_id"] != row["campaign_id"] or row["mode"] != "SYNCHRONIZED"
+                    or target_row["status"] != "ACTIVE" or target_row["loop_start_epoch_ms"] is None):
+                return False
+        if edge.key == "VideowallPublication.playback_group_id":
+            if target_row["wall_id"] != row["wall_id"] or target_row["branch_id"] != row["branch_id"]:
+                return False
+        if edge.key == "VideowallPlaybackGroupMember.node_id":
+            group = self.snapshot(RowRef("VideowallPlaybackGroup", row["group_id"]))
+            channel = self.snapshot(RowRef("Channel", target_row["channel_id"]))
+            if (group is None or channel is None or target_row["videowall_id"] != group["wall_id"]
+                    or not target_row["layout_enabled"] or channel["branch_id"] != group["branch_id"]):
+                return False
+        if edge.model == "VideowallPublicationAsset":
+            publication = self.snapshot(RowRef("VideowallPublication", row["publication_id"]))
+            if publication is None:
+                return False
+            if edge.field == "node_id":
+                channel = self.snapshot(RowRef("Channel", target_row["channel_id"]))
+                if (target_row["videowall_id"] != publication["wall_id"] or channel is None
+                        or channel["branch_id"] != publication["branch_id"]):
+                    return False
+            if edge.field == "master_content_id":
+                program = publication.get("program_snapshot_json")
+                if not isinstance(program, Mapping) or not isinstance(program.get("items"), (list, tuple)):
+                    return False
+                item = next((i for i in program["items"] if isinstance(i, Mapping)
+                             and i.get("id") == row["logical_item_id"]), None)
+                if item is None or item.get("master_content_id") != value:
+                    return False
+            if edge.field == "derived_content_id" and value == row["master_content_id"]:
                 return False
         if edge.key in {"DatasetColumn.import_id", "DatasetRow.import_id", "Dataset.current_import_id"}:
             dataset_id = ref.identity if ref.model == "Dataset" else row["dataset_id"]

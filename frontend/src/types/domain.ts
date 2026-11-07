@@ -20,6 +20,9 @@ export type LayoutTemplate = "single" | "two_columns" | "four_grid" | "custom";
 export type ScheduleRecurrence = "once" | "daily" | "weekly" | "custom";
 export type ChannelStatus = "online" | "offline" | "unknown";
 export type VideowallRenderMode = "multi-node" | "hardware-single-input";
+export type VideowallMediaDelivery = "legacy" | "node_slice";
+export type VideowallPublicationStatus = "PENDING" | "PROCESSING" | "READY" | "ACTIVE" | "FAILED";
+export type VideowallPlaybackGroupMode = "INDIVIDUAL" | "SYNCHRONIZED";
 export type KioskActionType = "open_url" | "switch_screen" | "play_video" | "navigate_menu";
 export type AudioPlaylistKind = "music" | "spot";
 export type AudioSpotRotationMode = "sequential" | "random";
@@ -451,6 +454,27 @@ export interface Videowall {
   primary_channel_id: string | null;
   start_tolerance_ms: number;
   sync_mode: string;
+  media_delivery?: VideowallMediaDelivery;
+  active_publication_id?: string | null;
+  playback_groups_enabled?: boolean;
+}
+
+export interface VideowallPublication {
+  id: string;
+  wall_id: string;
+  campaign_id: string;
+  playback_group_id?: string | null;
+  status: VideowallPublicationStatus;
+  error_code: string | null;
+  error_message: string | null;
+  expected_asset_count: number;
+  validated_asset_count: number;
+  loop_duration_ms: number | null;
+  loop_start_epoch_ms: number | null;
+  created_at: string;
+  updated_at: string | null;
+  activated_at: string | null;
+  is_current_active: boolean;
 }
 
 export interface VideowallNode {
@@ -459,6 +483,7 @@ export interface VideowallNode {
   updated_at: string | null;
   videowall_id: string;
   channel_id: string;
+  layout_enabled?: boolean;
   position_index: number;
   row_index: number;
   column_index: number;
@@ -470,6 +495,37 @@ export interface VideowallNode {
   crop_y?: number;
   crop_width?: number;
   crop_height?: number;
+}
+
+export interface VideowallPlaybackGroupMember {
+  id: string;
+  group_id: string;
+  node_id: string;
+  channel_id: string;
+  position_index: number;
+  row_index: number;
+  column_index: number;
+  physical_position_index: number;
+  physical_row_index: number;
+  physical_column_index: number;
+}
+
+export interface VideowallPlaybackGroup {
+  id: string;
+  client_id: string;
+  branch_id: string;
+  wall_id: string;
+  name: string;
+  mode: VideowallPlaybackGroupMode;
+  campaign_id: string;
+  active_publication_id: string | null;
+  members: VideowallPlaybackGroupMember[];
+  rows: number;
+  columns: number;
+  total_width: number;
+  total_height: number;
+  output_width: number;
+  output_height: number;
 }
 
 export interface KioskScreen {
