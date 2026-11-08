@@ -26,6 +26,22 @@ def assert_related_clients(client_id: str, related_client_ids: Iterable[str | No
         raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
 
 
+def assert_related_clients_query(client_id: str, db: Session, statement: Select) -> None:
+    """Prove every selected owner matches, returning one boolean rather than history.
+
+    Callers supply the complete one-column owner query, without a tenant filter.
+    IS DISTINCT FROM keeps NULL/unresolved ownership fail-closed.
+    """
+    assert_related_clients(client_id, ())
+    owners = statement.subquery()
+    if len(owners.c) != 1:
+        assert_related_clients(client_id, (None,))
+    owner = next(iter(owners.c))
+    incompatible = select(1).select_from(owners).where(owner.is_distinct_from(client_id)).exists()
+    if db.scalar(select(incompatible)):
+        assert_related_clients(client_id, (None,))
+
+
 def assert_same_client(resource, client_id: str):
     if resource is None or not client_id or resource.client_id != client_id:
         raise HTTPException(status_code=404, detail="Resource not found")

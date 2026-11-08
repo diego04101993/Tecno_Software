@@ -1231,6 +1231,7 @@ class A8WriteHTTPTests(HistoricalRelationFixture):
         self.add(PlayerHeartbeat, player_device_id=a["player"].id, channel_id=a["channel"].id,
                  branch_id=a["branch"].id, client_id=self.tenants["A"].id,
                  status="online", current_content_id=b["content"].id)
+        self.add(DeviceOutput, root_channel_id=a["channel"].id, channel_id=b["channel"].id, name="QA", display_order=0)
         self.db.commit()
         self.reject("POST", "/api/player/heartbeat", who="player_A", body={"status": "online"})
 

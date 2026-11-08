@@ -329,6 +329,41 @@ class DeleteMatrixFixture(GraphFixture):
             self.assertEqual((caught.exception.status_code, caught.exception.detail),
                              (409, "TENANT_RELATION_CONFLICT"))
 
+    def assert_telemetry_delete_proof(self, approval, edge, source, target):
+        """PG leaf certificates replace history IDs, never the security proof.
+
+        SQLite, non-telemetry and reviewed-fallback paths retain their exact
+        original ID/dependency assertions at the two call sites below.
+        """
+        if self.engine.dialect.name != "postgresql" or edge.model not in {
+                "PlayerHeartbeat", "PlayerPlaybackEvent"}:
+            return False
+        source_ref, target_ref = self.ref(source), self.ref(target)
+        proofs = tuple(proof for plan in approval.plans
+                       for proof in getattr(plan, "telemetry", ())
+                       if getattr(proof, "model", None) == edge.model
+                       and getattr(proof, "relation_key", None) == edge.key
+                       and getattr(proof, "parent", None) == target_ref)
+        if not proofs:
+            return False
+        from app.services.tenant_telemetry import TelemetryDependency
+        for proof in proofs:
+            self.assertIs(type(proof), TelemetryDependency)
+            self.assertEqual((proof.model, proof.relation_key, proof.parent),
+                             (edge.model, edge.key, target_ref))
+            self.assertIs(type(proof.count), int)
+            self.assertGreater(proof.count, 0)
+        self.assertIs(mutations.require_delete_coverage(self.db, (source_ref,)), approval)
+        cls = model_class(edge.model)
+        # Independent DB membership proof; no tenant predicate can hide a row.
+        self.assertTrue(self.db.scalar(select(select(cls.id).where(
+            cls.id == source_ref.identity, getattr(cls, edge.field) == target_ref.identity).exists())))
+        self.assertNotIn(source_ref, approval.covered)
+        self.assertFalse(any(source_ref in plan.checked for plan in approval.plans))
+        self.assertFalse(any(intent.reference == source_ref
+                             for plan in approval.plans for intent in plan.intents))
+        return True
+
     def check_edge(self, edge):
         if edge.key in VW1_RELATION_KEYS or edge.key in PROTECTED_GROUP_RELATION_KEYS:
             # VW1 has no release/GC operation. Test both intact and corrupt
@@ -358,9 +393,10 @@ class DeleteMatrixFixture(GraphFixture):
                         self.assertEqual(source_owner.client_id, target_owner.client_id)
                         with self.no_effects():
                             with mutations.delete_guard(self.db, (target,), actor=self.actor(target_side, role)) as approval:
-                                self.assertIn(self.ref(source), approval.covered)
-                                self.assertTrue(any(d.relation_key == edge.key and d.reference == self.ref(source)
-                                                    for p in approval.plans for d in p.dependencies))
+                                if not self.assert_telemetry_delete_proof(approval, edge, source, target):
+                                    self.assertIn(self.ref(source), approval.covered)
+                                    self.assertTrue(any(d.relation_key == edge.key and d.reference == self.ref(source)
+                                                        for p in approval.plans for d in p.dependencies))
                     COVERAGE.append(dict(EDGE=edge.key, CASE=side + ("_foreign" if foreign else "_derived"),
                         ENGINE=self.engine.dialect.name, ROLE=role, RESULT="PASS", ZERO_MUTATION=True,
                         CLASSIFICATION=edge.delete_policy, DATABASE_EFFECT=edge.on_delete or "RESTRICT"))
@@ -678,8 +714,9 @@ class DeletePlanCoverageTests(DeleteMatrixFixture):
             self.rejection((target,), self.actor(side, "super_admin"))
             return
         with self.no_effects(), mutations.delete_guard(self.db, (target,), actor=self.actor(side, "super_admin")) as plan:
-            self.assertTrue(any(d.relation_key == edge.key and d.reference == self.ref(source)
-                                for p in plan.plans for d in p.dependencies), edge.key)
+            if not self.assert_telemetry_delete_proof(plan, edge, source, target):
+                self.assertTrue(any(d.relation_key == edge.key and d.reference == self.ref(source)
+                                    for p in plan.plans for d in p.dependencies), edge.key)
 
     def check_database_effect(self, edge):
         from sqlalchemy import delete
@@ -1376,7 +1413,14 @@ def run_previous_mutations_with_a7_boundary(*, only=None):
 
     @contextmanager
     def no_a7_guard(*args, **kwargs):
-        yield None
+        # This historical replay intentionally removes authorization. It only
+        # supplies the handler's own patches so timestamp assignment can reach
+        # the original unsafe-write witness; it grants no production capability.
+        from types import SimpleNamespace
+        yield SimpleNamespace(proposed=tuple(
+            SimpleNamespace(reference=intent.reference, values=dict(intent.patch))
+            for intent in (kwargs.get("intents") or ())
+        ))
 
     original_guard = mutations.delete_guard
     original_write_guard = mutations.write_guard

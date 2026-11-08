@@ -192,8 +192,9 @@ def get_runtime_config(
 
     intent = MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), (("last_seen_at", datetime.now(UTC)),))
     with player_write_guard(db, channel=channel, player_device=player_device,
-                            operation="get_runtime_config", intents=(intent,)):
-        player_device.last_seen_at = dict(intent.patch)["last_seen_at"]
+                            operation="get_runtime_config", intents=(intent,)) as plan:
+        player_device.last_seen_at = next(p.values["last_seen_at"] for p in plan.proposed
+                                          if p.reference == intent.reference)
         db.add(player_device)
         db.commit()
     return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
@@ -255,7 +256,14 @@ def create_player_heartbeat(
         MutationIntent("CREATE", ref, tuple(values.items())),
     )
     with player_write_guard(db, channel=channel, player_device=player_device,
-                            operation="create_player_heartbeat", intents=intents):
+                            operation="create_player_heartbeat", intents=intents) as plan:
+        # Same-device telemetry is serialized at its authoritative rows. Use
+        # the approved timestamps so an older request admitted later cannot
+        # move last_seen_at/last_ping_at backwards.
+        channel_values["last_ping_at"] = next(p.values["last_ping_at"] for p in plan.proposed
+                                               if p.reference == intents[0].reference)
+        device_values["last_seen_at"] = next(p.values["last_seen_at"] for p in plan.proposed
+                                             if p.reference == intents[1].reference)
         for key, value in channel_values.items():
             setattr(channel, key, value)
         for key, value in device_values.items():

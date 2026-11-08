@@ -56,6 +56,7 @@ from app.services.player_runtime import build_campaign_sequence_preview_payload
 from app.services.tenancy import (
     optional_relation_id,
     assert_related_clients,
+    assert_related_clients_query,
     related_client_matches,
     require_same_client_resource,
     apply_client_filter,
@@ -186,8 +187,8 @@ def preflight_campaign_delete(db: Session, campaign: Campaign) -> None:
             .where(CampaignChannelAssignment.campaign_id == campaign.id)))
         for model, campaign_field in ((PlayerHeartbeat, PlayerHeartbeat.current_campaign_id),
                                       (PlayerPlaybackEvent, PlayerPlaybackEvent.campaign_id)):
-            assert_related_clients(campaign.client_id, db.scalars(
-                select(model.client_id).where(campaign_field == campaign.id)))
+            assert_related_clients_query(campaign.client_id, db,
+                select(model.client_id).where(campaign_field == campaign.id))
 
 
 @router.patch("/{campaign_id}/playback-mode", response_model=CampaignRead)

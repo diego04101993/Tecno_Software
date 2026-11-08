@@ -16,7 +16,7 @@ from app.services.media_references import (
     lock_media_paths, media_reference_operation, require_media_commit,
     approve_media_cleanup, approved_media_cleanup_paths,
 )
-from app.services.tenancy import assert_related_clients
+from app.services.tenancy import assert_related_clients, assert_related_clients_query
 from app.models.entities import (
     AudioPlaylistItem,
     AudioPlaylist,
@@ -298,8 +298,12 @@ def preflight_content_relationships(contents: list[ContentItem], db: Session) ->
                 (PlayerHeartbeat, PlayerHeartbeat.current_content_id),
                 (PlayerPlaybackEvent, PlayerPlaybackEvent.content_id),
             ):
-                assert_related_clients(content.client_id, db.scalars(
-                    select(model.client_id).where(content_key == content.id)))
+                if model in (PlayerHeartbeat, PlayerPlaybackEvent):
+                    assert_related_clients_query(content.client_id, db,
+                        select(model.client_id).where(content_key == content.id))
+                else:
+                    assert_related_clients(content.client_id, db.scalars(
+                        select(model.client_id).where(content_key == content.id)))
 
 
 def delete_content_items(contents: list[ContentItem], db: Session) -> list[Path]:

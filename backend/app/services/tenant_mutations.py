@@ -370,6 +370,7 @@ class MutationPlan:
     _gate: object
     _transaction: object
     _gate_token: object
+    telemetry: tuple = ()
 
     def assert_usable(self, gate, context):
         if (gate is not self._gate or not gate.active or context != self.context
@@ -421,6 +422,25 @@ class MutationGate:
 
     def __exit__(self, *exc):
         self.active = False
+
+
+class _PlayerTelemetryGate(MutationGate):
+    """Compatible readers of the structural tenant barrier, never a writer bypass."""
+    def __enter__(self):
+        from sqlalchemy import text
+        if self.graph.session.get_bind().dialect.name != "postgresql":
+            return super().__enter__()
+        _clean(self.graph.session)
+        if self.active or self.context.client_id is None:
+            raise conflict()
+        self.graph.authorize_row(RowRef("Client", self.context.client_id), self.context)
+        connection = self.graph.session.connection()
+        digest = sha256(("tecno.tenant.write.v1:" + self.context.client_id).encode()).digest()[:8]
+        key = int.from_bytes(digest, "big", signed=True)
+        connection.execute(text("SELECT pg_advisory_xact_lock_shared(:key)"), {"key": key})
+        self.transaction = self.graph.session.get_transaction()
+        self.token, self.active = object(), True
+        return self
 
 
 def _write_models(graph, operation):
@@ -514,7 +534,7 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
     # Incoming discovery deliberately has NO tenant predicate: filtering by owner
     # here would hide exactly the foreign dependencies this guard must catch.
     queue = list(sorted(roots, key=lambda r: (r.model, r.identity)))
-    checked, context_checked, dependencies = set(), set(), []
+    checked, context_checked, dependencies, telemetry = set(), set(), [], []
     with graph.session.no_autoflush:
         while queue:
             ref = queue.pop(0)
@@ -547,10 +567,43 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
                     # name/status/role change within global roles. These revisions
                     # belong to their layouts, not to the User being updated.
                     continue
-                cls = model_class(edge.model)
-                ids = set(graph.session.scalars(
-                    select(cls.id).where(getattr(cls, edge.field) == ref.identity).order_by(cls.id)
-                ).all())
+                skip_history = (edge.model in {"PlayerHeartbeat", "PlayerPlaybackEvent"}
+                                and type(graph) is _PlayerTelemetryGraph
+                                and graph._skip_prior_telemetry(gate, context, operation, intents))
+                if skip_history:
+                    # Existing report rows are not authority for an activity-only
+                    # operation. Its approved patches cannot change their FKs or
+                    # parent ownership/context. New CREATE roots still receive
+                    # every normal scope, closure, opaque and two-pass check.
+                    ids = set()
+                else:
+                    from app.services.tenant_telemetry import validate_telemetry_incoming
+                    builtin = (_TELEMETRY_WRITE_SEMANTICS if isinstance(graph, _WriteGraph)
+                               else _TELEMETRY_DELETE_SEMANTICS)
+                    adapter = next((a for a in semantic_adapters if a.model == edge.model), None)
+                    certificate = (validate_telemetry_incoming(graph, view, ref, edge, proposed, context)
+                                   if adapter is not None and adapter.validate is builtin else None)
+                    if certificate is not None:
+                        telemetry.append(certificate)
+                        # History models are reviewed leaves. Their outgoing parent
+                        # closure is checked with the original graph and adapters;
+                        # these parents must not become new incoming-discovery roots.
+                        for parent_ref in certificate.references:
+                            for parent_graph in (graph, view):
+                                parent_proof = parent_graph.context_integrity(parent_ref, context, profile="DELETE")
+                                if parent_proof.state != ContextIntegrityState.CONSISTENT:
+                                    raise conflict()
+                            context_checked.update(parent_proof.checked)
+                            for related in parent_proof.checked:
+                                if graph.snapshot(related) is not None:
+                                    _semantics(graph, related, context, semantic_adapters)
+                                _semantics(view, related, context, semantic_adapters)
+                        ids = set()
+                    else:
+                        cls = model_class(edge.model)
+                        ids = set(graph.session.scalars(
+                            select(cls.id).where(getattr(cls, edge.field) == ref.identity).order_by(cls.id)
+                        ).all())
                 ids.update(p.reference.identity for p in proposed
                            if p.reference.model == edge.model and p.values.get(edge.field) == ref.identity)
                 for identity in sorted(ids):
@@ -567,6 +620,7 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
     return MutationPlan(
         context, operation, intents, tuple(proposed), tuple(dependencies),
         tuple(sorted(checked | context_checked, key=lambda r: (r.model, r.identity))), gate, gate.transaction, gate.token,
+        tuple(telemetry),
     )
 
 
@@ -618,6 +672,9 @@ class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
         self.locking = False
         self._validation_memo = None
 
+    def _row_lock_mode(self, ref):
+        return "update"
+
     def snapshot(self, row):
         from sqlalchemy import select
         ref = self.reference(row)
@@ -627,7 +684,10 @@ class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
             dialect = self.session.get_bind().dialect.name
             locked = self.locking and dialect == "postgresql"
             if locked:
-                statement = statement.with_for_update()
+                if self._row_lock_mode(ref) == "share":
+                    statement = statement.with_for_update(read=True)
+                else:
+                    statement = statement.with_for_update()
             with self.session.no_autoflush:
                 value = self.session.execute(statement).mappings().one_or_none()
             self.snapshots[ref] = freeze(dict(value)) if value is not None else None
@@ -770,6 +830,7 @@ def write_guard(db, *, actor, client_id, operation, intents=None, semantic_adapt
                     confirmed = preflight_relationship_graph(gate, intents, spec,
                                                              semantic_adapters=semantic_adapters)
                 if (plan.proposed != confirmed.proposed or plan.checked != confirmed.checked
+                        or plan.telemetry != confirmed.telemetry
                         or plan.dependencies != confirmed.dependencies or paths != frozenset(graph.media_paths)):
                     raise conflict()
                 confirmed.assert_usable(gate, context)
@@ -790,6 +851,71 @@ class _PlayerWriteScope:
     branch_id: str | None
     parent: object = None
     parent_relation: object = None
+
+
+def _player_telemetry_shape(channel, device, operation, intents):
+    """Only backend-authored activity patches may use the shared tenant barrier."""
+    from datetime import datetime
+    if device is None or type(intents) is not tuple:
+        return False
+    expected = {
+        "create_player_heartbeat": ("PlayerHeartbeat", {"status", "last_ping_at", "current_playback"},
+                                    {"last_seen_at", "app_version"}),
+        "create_player_playback_event": ("PlayerPlaybackEvent", None, set()),
+        "get_runtime_config": (None, None, {"last_seen_at"}),
+    }.get(operation)
+    if expected is None or any(not isinstance(i, MutationIntent) for i in intents):
+        return False
+    history, channel_fields, device_fields = expected
+    wanted = {RowRef("PlayerDevice", device.id)}
+    if channel_fields is not None:
+        wanted.add(RowRef("Channel", channel.id))
+    updates, creates = set(), []
+    for intent in intents:
+        values = dict(intent.patch)
+        if intent.action == "UPDATE" and intent.reference in wanted:
+            if intent.reference in updates:
+                return False
+            fields = device_fields if intent.reference.model == "PlayerDevice" else channel_fields
+            if not set(values) <= fields:
+                return False
+            if any(key in values and not isinstance(values[key], datetime)
+                   for key in ("last_seen_at", "last_ping_at")):
+                return False
+            updates.add(intent.reference)
+        elif intent.action == "CREATE" and intent.reference.model == history:
+            if not set(values) <= (set(model_spec(history).columns) - {"id", "created_at", "updated_at"}):
+                return False
+            if any(values.get(key) != value for key, value in (
+                    ("player_device_id", device.id), ("channel_id", channel.id),
+                    ("client_id", channel.client_id), ("branch_id", channel.branch_id))):
+                return False
+            creates.append(intent.reference)
+        else:
+            return False
+    return updates == wanted and len(creates) == (1 if history else 0)
+
+
+def _monotonic_player_activity(graph, intents):
+    """Keep receipt counters monotonic after waiting for the authoritative roots."""
+    from datetime import datetime, UTC
+    normalized = []
+    for intent in intents:
+        patch = dict(intent.patch)
+        current = graph.snapshot(intent.reference) if intent.action == "UPDATE" else None
+        for field in ("last_seen_at", "last_ping_at"):
+            if field not in patch or current is None:
+                continue
+            requested, previous = patch[field], current.get(field)
+            if not isinstance(requested, datetime):
+                raise conflict()
+            requested = requested.replace(tzinfo=UTC) if requested.tzinfo is None else requested.astimezone(UTC)
+            if isinstance(previous, datetime):
+                previous = previous.replace(tzinfo=UTC) if previous.tzinfo is None else previous.astimezone(UTC)
+                requested = max(requested, previous)
+            patch[field] = requested
+        normalized.append(MutationIntent(intent.action, intent.reference, tuple(patch.items())))
+    return tuple(normalized)
 
 
 @contextmanager
@@ -826,11 +952,22 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
         if (player_device.channel_id != channel.id or player_device.client_id != channel.client_id
                 or player_device.branch_id != channel.branch_id or not player_device.is_active):
             raise conflict()
-    graph = _WriteGraph(db)
+    telemetry = _player_telemetry_shape(channel, player_device, operation, intents)
+    exclusive = {RowRef("PlayerDevice", player_device.id)} if telemetry else set()
+    if telemetry and operation == "create_player_heartbeat":
+        exclusive.add(RowRef("Channel", channel.id))
+    graph = _PlayerTelemetryGraph(db, exclusive) if telemetry else _WriteGraph(db)
     context = _PlayerWriteScope(channel.client_id, channel.branch_id)
     graph.player_scope = context
     spec = next(o for o in OPERATIONS if o.function == operation)
     prepared = _prepared_row_versions(db, intents)
+    if telemetry:
+        identity_fields = {
+            "Channel": {"id", "client_id", "branch_id", "channel_code"},
+            "PlayerDevice": {"id", "client_id", "branch_id", "channel_id", "player_token_hash", "is_active"},
+        }
+        prepared = {ref: {key: value for key, value in row.items() if key in identity_fields[ref.model]}
+                    for ref, row in prepared.items()}
     channel_values = (channel.client_id, channel.branch_id, channel.channel_code)
     device_hash = player_device.player_token_hash if player_device else None
     if db.get_bind().dialect.name == "postgresql":
@@ -839,7 +976,8 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
             raise conflict()
         conn.execute(text("SET LOCAL lock_timeout = '10s'"))
     try:
-        with MutationGate(graph, context) as gate:
+        gate_type = _PlayerTelemetryGate if telemetry else MutationGate
+        with gate_type(graph, context) as gate:
             graph.snapshots.clear()
             graph.locking = True
             current = graph.snapshot(RowRef("Channel", channel.id))
@@ -862,6 +1000,9 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
                 current = graph.snapshot(ref)
                 if current is None or any(not _same_prepared_value(value, current.get(key)) for key, value in previous.items()):
                     raise conflict()
+            if telemetry:
+                intents = _monotonic_player_activity(graph, intents)
+                graph._bind_activity_history(gate, context, spec, intents)
             with _graph_validation_phase(graph, gate):
                 plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
             with ExitStack() as media_locks:
@@ -869,13 +1010,17 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
                 if paths:
                     from app.services.media_references import media_reference_operation, lock_media_paths
                     media_locks.enter_context(media_reference_operation(db))
-                    lock_media_paths(db, list(paths))
+                    if telemetry:
+                        lock_media_paths(db, list(paths), shared=True)
+                    else:
+                        lock_media_paths(db, list(paths))
                 graph.snapshots.clear()
                 graph.media_paths.clear()
                 graph.media_validation_locked = True
                 with _graph_validation_phase(graph, gate):
                     confirmed = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
                 if (plan.proposed != confirmed.proposed or plan.checked != confirmed.checked
+                        or plan.telemetry != confirmed.telemetry
                         or plan.dependencies != confirmed.dependencies or paths != frozenset(graph.media_paths)):
                     raise conflict()
                 confirmed.assert_usable(gate, context)
@@ -885,6 +1030,9 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
         if getattr(exc.orig, "sqlstate", None) not in {"40001", "40P01", "55P03"}:
             raise
         db.rollback()
+        if telemetry and getattr(exc.orig, "sqlstate", None) == "55P03":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail="Player operation temporarily unavailable") from exc
         raise conflict() from exc
 
 
@@ -925,6 +1073,38 @@ class _WriteGraph(_DeleteGraph):
             if not row.get("branch_id"):
                 return False
         return TenantGraph.row_shape_valid(self, ref, row)
+
+
+class _PlayerTelemetryGraph(_WriteGraph):
+    """Shared immutable authority; exclusive append anchors/activity write roots.
+
+    FOR SHARE conflicts with every parent UPDATE/DELETE, including non-key
+    ownership/status changes. Each incoming discovery anchor stays FOR UPDATE,
+    so FK KEY SHARE cannot insert new history between the two R5 passes.
+    """
+    def __init__(self, session, exclusive):
+        super().__init__(session)
+        self._exclusive = frozenset(exclusive)
+        self._activity_history_binding = None
+
+    def _row_lock_mode(self, ref):
+        return "update" if ref in self._exclusive or ref.model == "PlayerDevice" else "share"
+
+    def _bind_activity_history(self, gate, context, operation, intents):
+        # Called only after the exact activity whitelist and fresh locked scope
+        # checks, with the immutable normalized intents that both passes use.
+        self._activity_history_binding = (gate, gate.token, gate.transaction, context, operation, intents)
+
+    def _skip_prior_telemetry(self, gate, context, operation, intents):
+        binding = self._activity_history_binding
+        return (type(self) is _PlayerTelemetryGraph and type(binding) is tuple and len(binding) == 6
+                and binding[0] is gate and binding[1] is gate.token
+                and binding[2] is self.session.get_transaction()
+                and binding[2] is gate.transaction
+                and gate.active and gate.graph is self
+                and binding[3] is context and binding[4] is operation
+                and binding[5] is intents and operation.function in {
+                    "create_player_heartbeat", "create_player_playback_event", "get_runtime_config"})
 
 
 def _write_semantics(graph, ref, context, row):
@@ -1059,6 +1239,9 @@ def _write_semantics(graph, ref, context, row):
                          "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "User"}
 
 
+_TELEMETRY_WRITE_SEMANTICS = _write_semantics
+
+
 def _write_adapters():
     from app.services.tenant_relations import MODEL_SPECS
     return tuple(SemanticAdapter(spec.name, _write_semantics) for spec in MODEL_SPECS
@@ -1106,6 +1289,9 @@ def _delete_semantics(graph, ref, context, row):
                 return False
             graph.assert_integrity(target, context, profile="DELETE")
     return True
+
+
+_TELEMETRY_DELETE_SEMANTICS = _delete_semantics
 
 
 def _delete_adapters():
@@ -1177,6 +1363,7 @@ def _locked_delete_plan(gate, initial, operation, discovery_spec):
             confirmed = preflight_relationship_graph(gate, tuple(MutationIntent("DELETE", ref) for ref in rediscovered),
                                                       discovery_spec, semantic_adapters=_delete_adapters())
         if (plan.checked != confirmed.checked or plan.dependencies != confirmed.dependencies
+                or plan.telemetry != confirmed.telemetry
                 or plan.proposed != confirmed.proposed):
             raise conflict()
         confirmed.assert_usable(gate, gate.context)
@@ -1194,15 +1381,48 @@ class DeleteApproval:
     covered: frozenset
     transaction: object
 
+    @property
+    def telemetry(self):
+        return tuple(dependency for plan in self.plans for dependency in plan.telemetry)
+
+
+def _approved_telemetry_predicate(approval, model):
+    """Membership in locked, universally validated historical leaf scopes.
+
+    These certificates are backend-generated by both fresh preflight passes.
+    FK anchors prevent new members; every historical member is row-locked until
+    this transaction ends. They never approve a different model or parent.
+    """
+    from app.services.tenant_telemetry import telemetry_scope_predicate
+    for plan in approval.plans:
+        gate = plan._gate
+        if (not gate.active or gate.transaction is not approval.transaction
+                or gate.token is not plan._gate_token):
+            raise conflict()
+    return telemetry_scope_predicate(model, approval.telemetry)
+
 
 def require_delete_coverage(db, rows):
     """Nested explicit cleanup may consume, never expand, the approved batch."""
     approval = db.info.get(_DELETE_STATE)
     graph = TenantGraph(db)
     if (not isinstance(approval, DeleteApproval)
-            or approval.transaction is not db.get_transaction()
-            or any(graph.reference(row) not in approval.covered for row in rows)):
+            or approval.transaction is not db.get_transaction()):
         raise conflict()
+    from sqlalchemy import select
+    for row in rows:
+        ref = graph.reference(row)
+        if ref in approval.covered:
+            continue
+        if ref.model not in {"PlayerHeartbeat", "PlayerPlaybackEvent"}:
+            raise conflict()
+        cls = model_class(ref.model)
+        membership = _approved_telemetry_predicate(approval, ref.model)
+        with db.no_autoflush:
+            present = db.scalar(select(select(cls.id).where(
+                cls.id == ref.identity, membership).exists()))
+        if not present:
+            raise conflict()
     return approval
 
 
@@ -1210,8 +1430,9 @@ def require_delete_coverage(db, rows):
 def _approved_delete_execution(db, approval):
     """Explicit handlers execute; this boundary cannot expand their target set.
 
-    Bulk DELETE/UPDATE is checked and constrained to immutable approved IDs.
-    ORM cascades are checked before flush. FK anchors remain locked through
+    Bulk DELETE/UPDATE is checked and constrained to immutable approved IDs or
+    locked, exhaustively checked telemetry scopes. No history IDs are returned
+    to Python for scoped bulk statements. ORM cascades are checked before flush. FK anchors remain locked through
     commit, including for DB cascades/SET NULL that do not emit ORM statements.
     New playlist mirror INSERTs keep their existing contract (A8 write scope).
     """
@@ -1230,12 +1451,23 @@ def _approved_delete_execution(db, approval):
             raise conflict()
         cls = model_class(name)
         allowed = tuple(r.identity for r in approval.covered if r.model == name)
-        query = select(cls.id).where(*statement._where_criteria)
-        with db.no_autoflush:
-            actual = set(db.scalars(query, state.parameters or {}))
-        if not actual.issubset(allowed):
-            raise conflict()
-        state.statement = statement.where(cls.id.in_(allowed))
+        permitted = cls.id.in_(allowed)
+        if name in {"PlayerHeartbeat", "PlayerPlaybackEvent"} and approval.telemetry:
+            from sqlalchemy import or_
+            permitted = or_(permitted, _approved_telemetry_predicate(approval, name))
+            # Check the original complete statement, before adding its approval
+            # boundary. Silently narrowing an unauthorized statement is unsafe.
+            outside = select(cls.id).where(*statement._where_criteria, permitted.is_not(True)).exists()
+            with db.no_autoflush:
+                if db.scalar(select(outside), state.parameters or {}):
+                    raise conflict()
+        else:
+            query = select(cls.id).where(*statement._where_criteria)
+            with db.no_autoflush:
+                actual = set(db.scalars(query, state.parameters or {}))
+            if not actual.issubset(allowed):
+                raise conflict()
+        state.statement = statement.where(permitted)
 
     def flush(session, *_):
         if db.get_transaction() is not approval.transaction:

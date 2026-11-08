@@ -52,6 +52,7 @@ class _OwnershipValidationPhase:
         self.coordinator = (self.media_state or {}).get("connection")
         self.media_engine = (self.media_state or {}).get("engine")
         self.sqlite_coordinator = (self.media_state or {}).get("sqlite")
+        self.shared_coordinator = (self.media_state or {}).get("shared")
         self.coordinator_transaction = self.coordinator.get_transaction() if self.coordinator is not None else None
         self.indexes = {}
         self.invalidate_callbacks = []
@@ -92,6 +93,7 @@ class _OwnershipValidationPhase:
                 self.media_state.get("connection") is not self.coordinator
                 or self.media_state.get("engine") is not self.media_engine
                 or self.media_state.get("sqlite") != self.sqlite_coordinator
+                or self.media_state.get("shared") is not self.shared_coordinator
                 or frozenset(self.media_state.get("paths") or ()) != self.paths
                 or self.media_state.get("committed")):
             self.invalidate()
@@ -1454,6 +1456,7 @@ def media_reference_operation(db: Session):
         yield
         return
     state = {"paths": None, "connection": None, "engine": None, "sqlite": False, "committed": False,
+             "shared": False,
              "cleanup_paths": set()}
     db.info[_STATE] = state
 
@@ -1495,7 +1498,7 @@ def media_reference_operation(db: Session):
 
 def require_media_commit(db: Session) -> None:
     state = db.info.get(_STATE)
-    if not state or not state["committed"] or db.new or db.dirty or db.deleted:
+    if not state or state["shared"] or not state["committed"] or db.new or db.dirty or db.deleted:
         raise MediaPathError("MEDIA_CLEANUP_REQUIRES_COMMIT")
 
 
@@ -1513,7 +1516,7 @@ def approve_media_cleanup(db: Session, rows) -> list[Path]:
         return []
     require_delete_coverage(db, rows)
     state = db.info.get(_STATE)
-    if state is None or state["committed"]:
+    if state is None or state["shared"] or state["committed"]:
         raise MediaPathError("MEDIA_LOCK_REQUIRED")
     root = get_settings().MEDIA_ROOT
     graph = TenantGraph(db)
@@ -1545,13 +1548,22 @@ def approved_media_cleanup_paths(db: Session) -> frozenset[Path]:
     return frozenset(db.info[_STATE]["cleanup_paths"])
 
 
-def lock_media_paths(db: Session, paths: list[Path]) -> None:
+def lock_media_paths(db: Session, paths: list[Path], *, shared: bool = False) -> None:
+    """Coordinate the complete path batch; writers remain exclusive by default.
+
+    The reviewed Player telemetry path only reads ownership/media facts. Its
+    shared lock conflicts with every existing reference writer and cleanup, but
+    lets independent Players validate the same asset concurrently. A nested
+    writer cannot silently reuse or upgrade a read-only coordination batch.
+    """
     state = db.info.get(_STATE)
-    if state is None:
+    if state is None or type(shared) is not bool:
         raise MediaPathError("MEDIA_LOCK_REQUIRED")
     root = get_settings().MEDIA_ROOT
     canonical = {validate_media_file(root, path, must_exist=False) for path in paths}
     if state["paths"] is not None:
+        if state["shared"] and not shared:
+            raise MediaPathError("MEDIA_LOCK_MODE_CHANGED")
         if not canonical.issubset(state["paths"]):
             raise MediaPathError("MEDIA_LOCK_SCOPE_CHANGED")
         if state["connection"] is not None:
@@ -1572,12 +1584,15 @@ def lock_media_paths(db: Session, paths: list[Path]) -> None:
         state["connection"] = connection
         connection.execute(text("SET LOCAL lock_timeout = '10s'"))
         for key in sorted({media_lock_key(path) for path in canonical}):
-            connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+            statement = ("SELECT pg_advisory_xact_lock_shared(:key)" if shared
+                         else "SELECT pg_advisory_xact_lock(:key)")
+            connection.execute(text(statement), {"key": key})
     elif canonical and dialect == "sqlite":
         _SQLITE_LOCK.acquire()
         state["sqlite"] = True
     elif canonical:
         raise MediaPathError("MEDIA_LOCK_DATABASE_UNSUPPORTED")
+    state["shared"] = shared
     state["paths"] = canonical
 
 

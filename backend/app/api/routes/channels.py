@@ -39,6 +39,7 @@ from app.services.realtime import manager
 from app.services.tenancy import (
     channel_read_integrity,
     assert_related_clients,
+    assert_related_clients_query,
     safe_tenant_resource, require_active_channel_tenant,
     apply_client_filter,
     can_write_branch_scope,
@@ -150,8 +151,8 @@ def preflight_channel_delete(db: Session, channel: Channel) -> None:
                 select(model.client_id).where(model.channel_id == channel.id)))
         player_ids = select(PlayerDevice.id).where(PlayerDevice.channel_id == channel.id)
         for model in (PlayerHeartbeat, PlayerPlaybackEvent):
-            assert_related_clients(channel.client_id, db.scalars(select(model.client_id).where(or_(
-                model.channel_id == channel.id, model.player_device_id.in_(player_ids)))))
+            assert_related_clients_query(channel.client_id, db, select(model.client_id).where(or_(
+                model.channel_id == channel.id, model.player_device_id.in_(player_ids))))
         for model in (CampaignChannelAssignment, Schedule):
             assert_related_clients(channel.client_id, db.scalars(
                 select(Campaign.client_id).select_from(model)
