@@ -934,26 +934,24 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
 
 def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: str) -> dict[str, object]:
     """Read selection and retention under one PostgreSQL MVCC snapshot."""
-    expected_client_id, expected_branch_id = channel.client_id, channel.branch_id
+    channel_id, expected_client_id, expected_branch_id = channel.id, channel.client_id, channel.branch_id
 
     bind = db.get_bind()
     if bind.dialect.name != "postgresql":
         return build_player_runtime_config(channel, db, base_url)
     try:
-        with getattr(bind, "engine", bind).connect().execution_options(isolation_level="REPEATABLE READ") as connection:
-            from sqlalchemy import text
-            connection.execute(text("SET TRANSACTION READ ONLY"))
-            with Session(bind=connection, autoflush=False) as snapshot_db:
-                snapshot_db.info["a9_snapshot"] = True
-                snapshot_channel = snapshot_db.get(Channel, channel.id)
-                if snapshot_channel is None:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
-                if snapshot_channel.client_id != expected_client_id or snapshot_channel.branch_id != expected_branch_id:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
-                return build_player_runtime_config(snapshot_channel, snapshot_db, base_url, snapshot_coherent=True)
+        from app.services.db_snapshots import readonly_snapshot_session
+        with readonly_snapshot_session(db) as snapshot_db:
+            snapshot_db.info["a9_snapshot"] = True
+            snapshot_channel = snapshot_db.get(Channel, channel_id)
+            if snapshot_channel is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+            if snapshot_channel.client_id != expected_client_id or snapshot_channel.branch_id != expected_branch_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+            return build_player_runtime_config(snapshot_channel, snapshot_db, base_url, snapshot_coherent=True)
     except HTTPException:
         raise
     except Exception:
-        logger.exception("Could not create coherent runtime snapshot for channel %s", channel.id)
+        logger.exception("Could not create coherent runtime snapshot for channel %s", channel_id)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="Runtime snapshot unavailable")

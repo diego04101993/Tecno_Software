@@ -193,18 +193,17 @@ def playback_label_for_read(channel, db):
 def read_snapshot(*, response_model=None):
     """One read-only MVCC snapshot per administrative read, through serialization.
 
-    Authentication and route permissions remain explicit. A separate session
-    avoids changing a caller's transaction or accidentally flushing its ORM.
+    Authentication and route permissions remain explicit. Clean request reads
+    release their checkout before opening the independent read-only snapshot.
     The copied response is fully materialized before the snapshot is closed.
     """
     from functools import wraps
     from inspect import signature
-    from contextlib import ExitStack
     from sqlalchemy.orm import Session
-    from sqlalchemy import text
     from sqlalchemy import event
     from fastapi import HTTPException
     from pydantic import TypeAdapter
+    from app.services.db_snapshots import readonly_snapshot_session
 
     def decorate(function):
         sig = signature(function, eval_str=True)
@@ -214,17 +213,9 @@ def read_snapshot(*, response_model=None):
             source = bound.arguments.get("db")
             if not isinstance(source, Session):
                 raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
-            with ExitStack() as stack:
-                bind = source.get_bind()
-                if bind.dialect.name == "postgresql":
-                    # Engine and Connection callers both get an independent
-                    # connection; no isolation change to an active transaction.
-                    engine = getattr(bind, "engine", bind)
-                    connection = stack.enter_context(engine.connect().execution_options(
-                        isolation_level="REPEATABLE READ"))
-                    connection.execute(text("SET TRANSACTION READ ONLY"))
-                    bind = connection
-                db = stack.enter_context(Session(bind=bind, autoflush=False))
+            actor = bound.arguments.get("current_user")
+            actor_id = actor.id if actor is not None else None
+            with readonly_snapshot_session(source) as db:
                 db.info["a9_snapshot"] = True
                 def deny_write(*_args, **_kwargs):
                     raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
@@ -235,12 +226,11 @@ def read_snapshot(*, response_model=None):
                         deny_write()
                 event.listen(db, "do_orm_execute", read_statement)
                 bound.arguments["db"] = db
-                actor = bound.arguments.get("current_user")
                 if actor is not None:
                     from app.models.entities import User
                     from app.services.user_admin import assert_user_session_allowed
                     from app.services.tenancy import validate_authenticated_tenant_state
-                    actor = db.get(User, actor.id)
+                    actor = db.get(User, actor_id)
                     bound.arguments["current_user"] = validate_authenticated_tenant_state(
                         assert_user_session_allowed(actor, db), db)
                 result = function(*bound.args, **bound.kwargs)
