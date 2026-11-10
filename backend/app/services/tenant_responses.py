@@ -116,7 +116,7 @@ def tenant_safe_response(graph: TenantGraph, ref, context, projection, *, profil
     return output
 
 
-def safe_model_read(row, schema, db, *, client_id=None, profile="READ"):
+def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_playback=None):
     """Copy an already scoped row and neutralize approved optional relations.
 
     This is response integrity, not authorization. Query eligibility must have
@@ -143,7 +143,8 @@ def safe_model_read(row, schema, db, *, client_id=None, profile="READ"):
     if any(edge.key == "KioskButton.target_screen_id" for edge in invalid):
         changes.update(action_value=None, action_payload_json={})
     if model.__name__ == "Channel":
-        changes["current_playback"] = playback_label_for_read(row, db)
+        changes["current_playback"] = (playback_label_for_read(row, db) if channel_playback is None
+                                       else channel_playback.get(row.id))
         if "device_outputs" in schema.model_fields:
             from app.models.entities import DeviceOutput
             from app.schemas.domain import DeviceOutputRead
@@ -162,32 +163,98 @@ def safe_model_read(row, schema, db, *, client_id=None, profile="READ"):
     return schema.model_validate(row).model_copy(deep=True, update=changes)
 
 
-def playback_label_for_read(channel, db):
-    """Rebuild telemetry-derived names from current scoped references.
+def latest_heartbeats_query(channel_ids, *, dialect_name="postgresql"):
+    """One bounded latest-row lookup per visible channel, in one SQL statement.
 
-    Historical free text is not ownership evidence. A missing or corrupt latest
-    heartbeat has no trusted label; the stored Channel is never rewritten.
+    PostgreSQL can stop at the first entry in the channel/time/id index instead
+    of sorting a channel's complete telemetry history. The window fallback is
+    for SQLite tests; neither path materializes historical JSON or ORM rows.
     """
-    from sqlalchemy import select
-    from app.models.entities import PlayerHeartbeat, ContentItem, Campaign, Layout, PlayerDevice
-    from app.services.tenancy import safe_tenant_resource
-    heartbeat = db.scalar(select(PlayerHeartbeat).where(
-        PlayerHeartbeat.channel_id == channel.id).order_by(PlayerHeartbeat.received_at.desc()).limit(1))
-    if heartbeat is None or heartbeat.client_id != channel.client_id or heartbeat.branch_id != channel.branch_id:
-        return None
-    player = db.get(PlayerDevice, heartbeat.player_device_id)
-    if (player is None or player.client_id != channel.client_id or player.channel_id != channel.id
-            or player.branch_id != channel.branch_id):
-        return None
-    labels = []
-    for model, identity in ((ContentItem, heartbeat.current_content_id),
-                            (Campaign, heartbeat.current_campaign_id), (Layout, heartbeat.current_layout_id)):
-        if identity:
-            resource = safe_tenant_resource(db, model, identity, channel.client_id)
-            if resource is None:
-                return None
-            labels.append(resource.name)
-    return labels[0] if labels else None
+    from sqlalchemy import String, column, false, func, select, true, values
+    from app.models.entities import PlayerHeartbeat
+    fields = ("channel_id", "client_id", "branch_id", "player_device_id",
+              "current_content_id", "current_campaign_id", "current_layout_id")
+    columns = tuple(getattr(PlayerHeartbeat, name) for name in fields)
+    identities = tuple(dict.fromkeys(channel_ids))
+    if not identities:
+        return select(*columns).where(false())
+    order = (PlayerHeartbeat.received_at.desc(), PlayerHeartbeat.id.desc())
+    if dialect_name == "postgresql":
+        visible = values(column("channel_id", String(36)), name="visible_channels").data(
+            [(identity,) for identity in identities])
+        latest = select(*columns).where(
+            PlayerHeartbeat.channel_id == visible.c.channel_id).order_by(*order).limit(1).lateral(
+                "latest_heartbeat")
+        return select(*(latest.c[name] for name in fields)).select_from(visible.join(latest, true()))
+    ranked = select(*columns, func.row_number().over(
+        partition_by=PlayerHeartbeat.channel_id, order_by=order).label("heartbeat_rank")).where(
+            PlayerHeartbeat.channel_id.in_(identities)).subquery("ranked_heartbeats")
+    return select(*(ranked.c[name] for name in fields)).where(ranked.c.heartbeat_rank == 1)
+
+
+def playback_labels_for_read(channels, db):
+    """Rebuild trusted playback labels for an already authorized channel set.
+
+    Only the latest heartbeat for each supplied channel is materialized. Invalid
+    latest rows fail closed; they never fall back to an older valid heartbeat.
+    References are resolved in batches with the same RUNTIME eligibility used
+    by safe_tenant_resource, including media, relation and active-client guards.
+    Nothing is cached beyond this projection, including on write/detail paths.
+    """
+    from sqlalchemy import select, tuple_
+    from app.models.entities import ContentItem, Campaign, Layout, PlayerDevice
+    from app.services.tenant_queries import readable_query
+    channels = {channel.id: channel for channel in channels}
+    labels = dict.fromkeys(channels)
+    if not channels:
+        return labels
+    with db.no_autoflush:
+        latest = db.execute(latest_heartbeats_query(
+            channels, dialect_name=db.get_bind().dialect.name)).mappings()
+        heartbeats = {}
+        for heartbeat in latest:
+            channel = channels[heartbeat["channel_id"]]
+            if (heartbeat["client_id"] == channel.client_id
+                    and heartbeat["branch_id"] == channel.branch_id):
+                heartbeats[channel.id] = heartbeat
+        if not heartbeats:
+            return labels
+        player_keys = {(heartbeat["player_device_id"], channel_id, heartbeat["client_id"],
+                        heartbeat["branch_id"]) for channel_id, heartbeat in heartbeats.items()}
+        players = set(db.execute(select(PlayerDevice.id, PlayerDevice.channel_id,
+                                        PlayerDevice.client_id, PlayerDevice.branch_id).where(
+            tuple_(PlayerDevice.id, PlayerDevice.channel_id, PlayerDevice.client_id,
+                   PlayerDevice.branch_id).in_(player_keys))).tuples())
+        heartbeats = {channel_id: heartbeat for channel_id, heartbeat in heartbeats.items()
+                      if (heartbeat["player_device_id"], channel_id, heartbeat["client_id"],
+                          heartbeat["branch_id"]) in players}
+        resources = {}
+        for model, field in ((ContentItem, "current_content_id"),
+                             (Campaign, "current_campaign_id"), (Layout, "current_layout_id")):
+            keys = {(heartbeat["client_id"], heartbeat[field]) for heartbeat in heartbeats.values()
+                    if heartbeat[field]}
+            if not keys:
+                resources[field] = {}
+                continue
+            query = readable_query(select(model.id, model.client_id, model.name).where(
+                tuple_(model.client_id, model.id).in_(keys)), model, db=db, profile="RUNTIME")
+            resources[field] = {(row.client_id, row.id): row.name for row in db.execute(query)}
+        for channel_id, heartbeat in heartbeats.items():
+            names = []
+            for field in ("current_content_id", "current_campaign_id", "current_layout_id"):
+                if heartbeat[field]:
+                    key = (heartbeat["client_id"], heartbeat[field])
+                    if key not in resources[field]:
+                        break
+                    names.append(resources[field][key])
+            else:
+                labels[channel_id] = names[0] if names else None
+    return labels
+
+
+def playback_label_for_read(channel, db):
+    """Detail projection using the same trusted reconstruction as collections."""
+    return playback_labels_for_read((channel,), db)[channel.id]
 
 
 def read_snapshot(*, response_model=None):
@@ -239,12 +306,19 @@ def read_snapshot(*, response_model=None):
                 if response_model is not None:
                     from typing import get_args, get_origin
                     from sqlalchemy import inspect as orm_inspect
-                    def project(value, schema):
+                    def project(value, schema, playback=None):
                         if get_origin(schema) is list:
-                            return [project(item, get_args(schema)[0]) for item in value]
+                            item_schema = get_args(schema)[0]
+                            items = list(value)
+                            from app.models.entities import Channel
+                            channels = [item for item in items if type(item) is Channel
+                                        and (state := orm_inspect(item, raiseerr=False)) is not None
+                                        and state.persistent]
+                            playback = playback_labels_for_read(channels, db) if channels else None
+                            return [project(item, item_schema, playback) for item in items]
                         state = orm_inspect(value, raiseerr=False)
                         if state is not None and state.persistent:
-                            return safe_model_read(value, schema, db)
+                            return safe_model_read(value, schema, db, channel_playback=playback)
                         return value
                     result = project(result, response_model)
                     adapter = TypeAdapter(response_model)
