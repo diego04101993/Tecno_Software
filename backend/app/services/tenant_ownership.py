@@ -125,9 +125,34 @@ def enum_value(value):
 class TenantGraph:
     """Read-only snapshots. Never lazy-load ORM attributes or trigger autoflush."""
 
-    def __init__(self, session):
+    def __init__(self, session, *, snapshot_transaction=None):
         validate_registry()
         self.session = session
+        self._snapshot_rows = None
+        self._snapshot_scope = None
+        if snapshot_transaction is not None:
+            from sqlalchemy import Connection, event
+            bind = session.get_bind()
+            transaction = session.get_transaction()
+            # The projection caller supplies the transaction verified by
+            # readonly_snapshot_session. Standalone and mutation graphs never
+            # cache row facts. A nested or restarted transaction cannot reuse them.
+            if (isinstance(bind, Connection) and bind.dialect.name == "postgresql"
+                    and bind.get_transaction() is snapshot_transaction
+                    and transaction is not None and not session.in_nested_transaction()
+                    and not bind.in_nested_transaction()):
+                self._snapshot_rows = {}
+                self._snapshot_scope = (bind, snapshot_transaction, transaction)
+                event.listen(session, "after_transaction_end", self._end_snapshot_rows, once=True)
+
+    def _end_snapshot_rows(self, _session, _transaction):
+        self.discard_snapshot_rows()
+
+    def discard_snapshot_rows(self):
+        if self._snapshot_rows is not None:
+            self._snapshot_rows.clear()
+            self._snapshot_rows = None
+            self._snapshot_scope = None
 
     def reference(self, row):
         from sqlalchemy import inspect
@@ -145,6 +170,18 @@ class TenantGraph:
     def snapshot(self, row):
         from sqlalchemy import select
         ref = self.reference(row)
+        rows = self._snapshot_rows
+        if rows is not None:
+            bind, connection_transaction, session_transaction = self._snapshot_scope
+            if (self.session.get_bind() is not bind or bind.closed or bind.invalidated
+                    or bind.get_transaction() is not connection_transaction
+                    or self.session.get_transaction() is not session_transaction
+                    or not connection_transaction.is_active or not session_transaction.is_active
+                    or bind.in_nested_transaction() or self.session.in_nested_transaction()):
+                self.discard_snapshot_rows()
+                rows = None
+            elif ref in rows:
+                return rows[ref]
         cls = model_class(ref.model)
         spec = model_spec(ref.model)
         with self.session.no_autoflush:
@@ -152,7 +189,10 @@ class TenantGraph:
                 select(*(getattr(cls, key) for key in spec.columns))
                 .where(cls.id == ref.identity)
             ).mappings().one_or_none()
-        return freeze(dict(result)) if result is not None else None
+        snapshot = freeze(dict(result)) if result is not None else None
+        if rows is not None:
+            rows[ref] = snapshot
+        return snapshot
 
     def resolve_owner(self, row, expected_client=None, *, _visited=frozenset()):
         if isinstance(row, OwnerCandidates):

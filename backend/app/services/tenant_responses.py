@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from copy import deepcopy
 from collections.abc import Mapping
+from contextlib import contextmanager
 from enum import Enum
 
 from app.services.tenant_relations import GLOBAL_ROLES, conflict, model_spec, relations_for
@@ -134,7 +135,13 @@ def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_
             select(model.id), model, db=db, profile=profile, client_id=client_id)))
     if row.id not in cache[key]:
         raise HTTPException(status_code=404, detail="Resource not found")
-    graph = db.info.setdefault("a9_read_graph", TenantGraph(db)) if db.info.get("a9_snapshot") else TenantGraph(db)
+    if db.info.get("a9_snapshot"):
+        graph = db.info.get("a9_read_graph")
+        if graph is None:
+            graph = TenantGraph(db, snapshot_transaction=db.info.get("a9_graph_snapshot_transaction"))
+            db.info["a9_read_graph"] = graph
+    else:
+        graph = TenantGraph(db)
     invalid = graph.invalid_relations(graph.reference(row), profile=profile,
                                       context=SimpleNamespace(branch_id=None))
     changes = {edge.field: None for edge in invalid}
@@ -257,6 +264,23 @@ def playback_label_for_read(channel, db):
     return playback_labels_for_read((channel,), db)[channel.id]
 
 
+@contextmanager
+def _projection_graph_scope(db):
+    from sqlalchemy import Connection
+    bind = db.get_bind()
+    if isinstance(bind, Connection) and bind.dialect.name == "postgresql":
+        # readonly_snapshot_session established or verified READ ONLY and
+        # REPEATABLE READ before this scope receives the connection.
+        db.info["a9_graph_snapshot_transaction"] = bind.get_transaction()
+    try:
+        yield
+    finally:
+        graph = db.info.pop("a9_read_graph", None)
+        if graph is not None:
+            graph.discard_snapshot_rows()
+        db.info.pop("a9_graph_snapshot_transaction", None)
+
+
 def read_snapshot(*, response_model=None):
     """One read-only MVCC snapshot per administrative read, through serialization.
 
@@ -282,7 +306,7 @@ def read_snapshot(*, response_model=None):
                 raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
             actor = bound.arguments.get("current_user")
             actor_id = actor.id if actor is not None else None
-            with readonly_snapshot_session(source) as db:
+            with readonly_snapshot_session(source) as db, _projection_graph_scope(db):
                 db.info["a9_snapshot"] = True
                 def deny_write(*_args, **_kwargs):
                     raise HTTPException(status_code=409, detail="TENANT_RELATION_CONFLICT")
