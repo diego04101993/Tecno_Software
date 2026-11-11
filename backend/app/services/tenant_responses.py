@@ -244,7 +244,8 @@ def playback_labels_for_read(channels, db):
                 resources[field] = {}
                 continue
             query = readable_query(select(model.id, model.client_id, model.name).where(
-                tuple_(model.client_id, model.id).in_(keys)), model, db=db, profile="RUNTIME")
+                tuple_(model.client_id, model.id).in_(keys)), model, db=db, profile="RUNTIME",
+                content_keys=keys if model is ContentItem else None)
             resources[field] = {(row.client_id, row.id): row.name for row in db.execute(query)}
         for channel_id, heartbeat in heartbeats.items():
             names = []

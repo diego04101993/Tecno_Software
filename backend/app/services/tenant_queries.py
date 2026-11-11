@@ -361,21 +361,25 @@ def _read_projection_predicate(statement, cls, db, profile, client_id, branch_id
     return read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
 
 
-def readable_query(statement, model, *, db=None, profile="READ", client_id=None, branch_id=None):
+def readable_query(statement, model, *, db=None, profile="READ", client_id=None, branch_id=None,
+                   content_keys: set[tuple[str, str]] | None = None):
     """Add integrity and opaque-media eligibility before SQL pagination.
 
     Filesystem aliases cannot be compared safely as SQL strings. Their complete
     eligible ID set is computed before executing the result/count/page query.
+    Runtime playback can supply the exact content keys already in its query.
     This function grants no actor authorization and does not change write paths.
     """
     name = model if isinstance(model, str) else model.__name__
+    if content_keys is not None and (name != "ContentItem" or profile != "RUNTIME"):
+        raise conflict()
     cls = model_class(name)
     statement = statement.where(_read_projection_predicate(statement, cls, db, profile, client_id, branch_id))
     if name in {"ContentItem", "DatasetImport"}:
         if db is None:
             raise conflict()
         from app.services.media_references import readable_media_ids
-        statement = statement.where(cls.id.in_(readable_media_ids(db, name)))
+        statement = statement.where(cls.id.in_(readable_media_ids(db, name, content_keys=content_keys)))
     fields = model_spec(name).opaque_fields
     if name in {"VideowallPublication", "VideowallPublicationAsset"}:
         if db is None:

@@ -20,6 +20,7 @@ from app.models.entities import (
     PlayerDevice, PlayerHeartbeat, UserRole,
 )
 from app.schemas.domain import ChannelRead
+from app.services import media_references
 from app.services.tenant_responses import read_snapshot, safe_model_read
 
 
@@ -63,8 +64,9 @@ class ChannelPlaybackBatchTests(HistoricalRelationFixture):
         rows = self.listing(**kwargs)
         return next(row for row in rows if row['id'] == self.a['channel'].id)
 
-    def assert_untrusted_label_omitted(self):
-        rows = self.listing()
+    def assert_untrusted_label_omitted(self, rows=None):
+        if rows is None:
+            rows = self.listing()
         row = next(row for row in rows if row['id'] == self.a['channel'].id)
         self.assertIsNone(row['current_playback'])
         rendered = json.dumps(rows)
@@ -88,7 +90,38 @@ class ChannelPlaybackBatchTests(HistoricalRelationFixture):
         return [(sql, params) for sql, params in statements
                 if 'FROM player_heartbeats' in sql and sql.lstrip().upper().startswith(('SELECT', 'WITH'))]
 
-    def add_channels(self, count):
+    def assert_content_media_keys(self, statements, *pairs):
+        # The authority scan reads file paths only. The expensive query reads
+        # both payload columns and must bind only the exact playback pairs.
+        reads = [(sql, params) for sql, params in statements
+                 if 'contents.html_content' in sql and 'contents.text_content' in sql]
+        if not pairs:
+            self.assertEqual(reads, [])
+            return
+        self.assertEqual(len(reads), 1)
+        sql, params = reads[0]
+        self.assertIn('WHERE (contents.client_id, contents.id) IN', sql)
+        self.assertCountEqual(zip(params[::2], params[1::2], strict=True), pairs)
+
+    @contextmanager
+    def observed_html_views(self):
+        with patch.object(media_references, '_html_media_view',
+                          wraps=media_references._html_media_view) as parse:
+            yield parse.call_args_list
+
+    def set_content_html(self):
+        for side, fixtures in self.res.items():
+            for key in ('content', 'audio'):
+                fixtures[key].html_content = f'<p>Playback media fixture {side} {key}</p>'
+        self.db.commit()
+
+    def assert_content_html_views(self, views, *contents):
+        self.assertCountEqual(
+            [(call.args[0], call.kwargs['mode']) for call in views],
+            [(content.html_content, mode) for content in contents for mode in ('document', 'fragment')],
+        )
+
+    def add_channels(self, count, **heartbeat_changes):
         added = []
         for number in range(count):
             channel = self.add(Channel, client_id=self.tenants['A'].id,
@@ -96,7 +129,7 @@ class ChannelPlaybackBatchTests(HistoricalRelationFixture):
             player = self.add(PlayerDevice, client_id=channel.client_id, branch_id=channel.branch_id,
                               channel_id=channel.id, hardware_id='batch-' + uuid4().hex,
                               device_name='Synthetic batch player', player_token_hash=uuid4().hex)
-            self.heartbeat(channel_id=channel.id, player_device_id=player.id)
+            self.heartbeat(channel_id=channel.id, player_device_id=player.id, **heartbeat_changes)
             added.append(channel)
         self.db.commit()
         return added
@@ -114,18 +147,109 @@ class ChannelPlaybackBatchTests(HistoricalRelationFixture):
         self.db.expire_all()
 
     def test_one_channel_contract_is_identical_except_trusted_rebuilt_label(self):
+        self.set_content_html()
+        content = self.a['content']
         expected = ChannelRead.model_validate(self.a['channel']).model_dump(mode='json')
-        expected['current_playback'] = self.a['content'].name
-        self.assertEqual(self.listing(), [expected])
+        expected['current_playback'] = content.name
+        with self.observed_sql() as reads, self.observed_html_views() as views:
+            self.assertEqual(self.listing(), [expected])
+        self.assert_content_media_keys(reads, (content.client_id, content.id))
+        self.assert_content_html_views(views, content)
 
     def test_multiple_channels_contract_and_same_content_priority(self):
+        self.set_content_html()
         expected = {}
         for side in ('A', 'B'):
             row = ChannelRead.model_validate(self.res[side]['channel']).model_dump(mode='json')
             row['current_playback'] = self.res[side]['content'].name
             expected[row['id']] = row
-        actual = self.listing(who='A_super_admin')
+        with self.observed_sql() as reads, self.observed_html_views() as views:
+            actual = self.listing(who='A_super_admin')
         self.assertEqual({row['id']: row for row in actual}, expected)
+        contents = (self.a['content'], self.b['content'])
+        self.assert_content_media_keys(reads, *((item.client_id, item.id) for item in contents))
+        self.assert_content_html_views(views, *contents)
+
+    def test_multiple_content_pairs_within_one_client(self):
+        self.set_content_html()
+        first, second = self.a['content'], self.a['audio']
+        added, = self.add_channels(1, current_content_id=second.id)
+        with self.observed_sql() as reads, self.observed_html_views() as views:
+            actual = {row['id']: row['current_playback'] for row in self.listing()}
+        self.assertEqual(actual, {self.a['channel'].id: first.name, added.id: second.name})
+        self.assert_content_media_keys(reads, (first.client_id, first.id), (second.client_id, second.id))
+        self.assert_content_html_views(views, first, second)
+
+    def test_wrong_client_pair_cannot_mix_keys_from_other_visible_channels(self):
+        self.set_content_html()
+        wrong, right = self.b['audio'], self.b['content']
+        self.hb.current_content_id = wrong.id
+        self.db.commit()
+        with self.observed_sql() as reads, self.observed_html_views() as views:
+            actual = {row['id']: row['current_playback'] for row in self.listing(who='A_super_admin')}
+        self.assertEqual(actual, {self.a['channel'].id: None, self.b['channel'].id: right.name})
+        self.assert_content_media_keys(reads, (self.tenants['A'].id, wrong.id), (right.client_id, right.id))
+        self.assert_content_html_views(views, right)
+
+    def test_foreign_owner_outside_playback_still_vetoes_shared_path(self):
+        content = self.a['content']
+        foreign_owners = ((self.b['audio'], 'file_path'), (self.b['import_record'], 'storage_path'))
+        for row, field in foreign_owners:
+            with self.subTest(field=field):
+                original = getattr(row, field)
+                setattr(row, field, content.file_path)
+                self.db.commit()
+                with self.observed_sql() as reads:
+                    rows = self.listing()
+                self.assert_untrusted_label_omitted(rows)
+                self.assert_content_media_keys(reads, (content.client_id, content.id))
+                setattr(row, field, original)
+                self.db.commit()
+
+    def test_same_tenant_owner_outside_playback_keeps_shared_path_eligible(self):
+        content = self.a['content']
+        self.a['audio'].file_path = content.file_path
+        self.db.commit()
+        with self.observed_sql() as reads:
+            self.assertEqual(self.own_channel()['current_playback'], content.name)
+        self.assert_content_media_keys(reads, (content.client_id, content.id))
+
+    def test_ambiguous_selected_html_still_fails_closed_in_both_modes(self):
+        content = self.a['content']
+        content.html_content = '<img src="/m%2565dia/ambiguous.png">'
+        self.db.commit()
+        with self.observed_html_views() as views:
+            self.assert_untrusted_label_omitted()
+        self.assert_content_html_views(views, content)
+
+    def test_explicit_empty_content_media_scope_does_not_validate_any_payload(self):
+        self.set_content_html()
+        with self.observed_html_views() as views:
+            self.assertEqual(media_references.readable_media_ids(self.db, 'ContentItem', content_keys=set()), [])
+        self.assert_content_html_views(views)
+
+    def test_content_of_inactive_client_still_fails_runtime_integrity(self):
+        from app.services.tenant_responses import playback_labels_for_read
+        channel, content = self.a['channel'], self.a['content']
+        self.hb.current_campaign_id = None
+        self.hb.current_layout_id = None
+        self.db.commit()
+        self.assertEqual(playback_labels_for_read([channel], self.db), {channel.id: content.name})
+        self.tenants['A'].status = 'inactive'
+        self.db.commit()
+        self.assertEqual(playback_labels_for_read([channel], self.db), {channel.id: None})
+
+    def test_channel_payload_eligibility_still_precedes_playback(self):
+        content = self.a['content']
+        self.a['channel'].expanded_outputs = [{'poster': self.b['content'].file_path}]
+        self.db.commit()
+        with self.observed_sql() as reads:
+            self.assertEqual(self.listing(), [])
+        self.assert_content_media_keys(reads)
+
+        self.a['channel'].expanded_outputs = [{'poster': content.file_path}]
+        self.db.commit()
+        self.assertEqual(self.own_channel()['current_playback'], content.name)
 
     def test_heartbeat_query_count_is_one_for_one_and_many_channels(self):
         with self.observed_sql() as one:
@@ -225,14 +349,23 @@ class ChannelPlaybackBatchTests(HistoricalRelationFixture):
         for field in fields:
             with self.subTest(field=field):
                 self.corrupt_missing_reference(field)
-                self.assert_untrusted_label_omitted()
+                missing = self.hb.current_content_id
+                with self.observed_sql() as reads:
+                    rows = self.listing()
+                self.assert_untrusted_label_omitted(rows)
+                if field == 'current_content_id':
+                    self.assert_content_media_keys(reads, (self.tenants['A'].id, missing))
                 setattr(self.hb, field, originals[field])
                 self.db.commit()
 
     def test_latest_invalid_heartbeat_does_not_fall_back_to_older_valid(self):
-        self.heartbeat(received_at=self.received + timedelta(seconds=1), client_id=self.tenants['B'].id)
+        self.heartbeat(received_at=self.received + timedelta(seconds=1),
+                       client_id=self.tenants['B'].id, current_content_id=self.a['audio'].id)
         self.db.commit()
-        self.assert_untrusted_label_omitted()
+        with self.observed_sql() as reads:
+            rows = self.listing()
+        self.assert_untrusted_label_omitted(rows)
+        self.assert_content_media_keys(reads)
 
     def test_received_at_tie_uses_id_desc_deterministically(self):
         tied = self.received + timedelta(seconds=1)

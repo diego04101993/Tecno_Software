@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from threading import RLock
 
-from sqlalchemy import JSON, create_engine, event, select, text
+from sqlalchemy import JSON, create_engine, event, select, text, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -1338,26 +1338,31 @@ def _read_local_media_paths(value, *, context=None):
                 yield key
 
 
-def readable_media_ids(db: Session, model_name: str) -> list[str]:
+def readable_media_ids(db: Session, model_name: str, *,
+                       content_keys: set[tuple[str, str]] | None = None) -> list[str]:
     """Authoritative media ownership allowlist, built before a response query.
 
     Free URL/metadata references can disqualify a row; they never add an owner.
     Reads use column snapshots, not ORM setters or mutable response repair.
+    Content keys limit rows to validate. Other rows still establish ownership.
     """
     root = get_settings().MEDIA_ROOT
     references = media_reference_owners(db, root)
     if model_name == "ContentItem":
-        rows = db.execute(select(ContentItem.id, ContentItem.client_id, ContentItem.file_path,
-                                 ContentItem.source_url, ContentItem.metadata_json,
-                                 ContentItem.html_content, ContentItem.text_content))
-    elif model_name == "DatasetImport":
+        query = select(ContentItem.id, ContentItem.client_id, ContentItem.file_path,
+                       ContentItem.source_url, ContentItem.metadata_json,
+                       ContentItem.html_content, ContentItem.text_content)
+        if content_keys is not None:
+            query = query.where(tuple_(ContentItem.client_id, ContentItem.id).in_(content_keys))
+        rows = db.execute(query)
+    elif model_name == "DatasetImport" and content_keys is None:
         from sqlalchemy import literal
         rows = db.execute(select(DatasetImport.id, Dataset.client_id, DatasetImport.storage_path,
                                  DatasetImport.source_filename, DatasetImport.summary_json,
                                  literal(None), literal(None)).outerjoin(
                                      Dataset, Dataset.id == DatasetImport.dataset_id))
     else:
-        raise ValueError("Unsupported authoritative media model")
+        raise ValueError("Unsupported authoritative media model or content scope")
     allowed = []
     for identity, owner, stored, source, metadata, html_content, text_content in rows:
         try:
