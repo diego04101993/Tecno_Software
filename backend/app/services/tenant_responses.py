@@ -275,6 +275,7 @@ def _projection_graph_scope(db):
     try:
         yield
     finally:
+        db.info.pop("a9_read_predicates", None)
         graph = db.info.pop("a9_read_graph", None)
         if graph is not None:
             graph.discard_snapshot_rows()
@@ -344,6 +345,7 @@ def read_snapshot(*, response_model=None):
                         if state is not None and state.persistent:
                             return safe_model_read(value, schema, db, channel_playback=playback)
                         return value
+                    db.info["a9_read_predicates"] = {}
                     result = project(result, response_model)
                     adapter = TypeAdapter(response_model)
                     result = adapter.dump_python(adapter.validate_python(result, from_attributes=True))

@@ -321,6 +321,46 @@ def read_integrity_predicate(model, *, profile="READ", client_id=None, branch_id
     return and_(*conditions)
 
 
+def _is_canonical_projection(statement, cls):
+    from sqlalchemy import Select, select
+
+    if type(statement) is not Select or statement.get_execution_options():
+        return False
+    descriptions = statement.column_descriptions
+    if len(descriptions) != 1 or descriptions[0].get("entity") is not cls:
+        return False
+    expression = descriptions[0]["expr"]
+    if expression is not cls and expression is not cls.id:
+        return False
+    canonical = select(expression)
+    # Select.compare omits these options, including explicit correlate(None).
+    if (statement._auto_correlate != canonical._auto_correlate
+            or statement._compile_options is not canonical._compile_options):
+        return False
+    # ORM alias context can defeat SQLAlchemy's structural comparison.
+    # An unsupported comparison must take the existing construction path.
+    try:
+        return statement.compare(canonical, compare_annotations=True)
+    except AttributeError:
+        return False
+
+
+def _read_projection_predicate(statement, cls, db, profile, client_id, branch_id):
+    cache = getattr(db, "info", {}).get("a9_read_predicates")
+    # A fresh administrative response projection owns this cache. Only reuse
+    # integrity SQL for bare selects of the canonical table or its ID column.
+    # Actor authorization and statement-specific filters still run separately.
+    if (cache is not None and type(profile) is str and profile in ("READ", "RUNTIME")
+            and (client_id is None or type(client_id) is str)
+            and (branch_id is None or type(branch_id) is str)
+            and _is_canonical_projection(statement, cls)):
+        key = (cls, profile, client_id, branch_id)
+        if key not in cache:
+            cache[key] = read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
+        return cache[key]
+    return read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
+
+
 def readable_query(statement, model, *, db=None, profile="READ", client_id=None, branch_id=None):
     """Add integrity and opaque-media eligibility before SQL pagination.
 
@@ -330,8 +370,7 @@ def readable_query(statement, model, *, db=None, profile="READ", client_id=None,
     """
     name = model if isinstance(model, str) else model.__name__
     cls = model_class(name)
-    statement = statement.where(read_integrity_predicate(
-        cls, profile=profile, client_id=client_id, branch_id=branch_id))
+    statement = statement.where(_read_projection_predicate(statement, cls, db, profile, client_id, branch_id))
     if name in {"ContentItem", "DatasetImport"}:
         if db is None:
             raise conflict()
