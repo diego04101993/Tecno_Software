@@ -26,6 +26,7 @@ from app.core.config import get_settings
 from app.models.base import Base
 from app.models.entities import Client, ContentItem, Dataset, DatasetImport
 from app.services.media_storage import MediaPathError, StoredUpload, resolve_stored_media_path, validate_media_file
+from app.services.runtime_read import content_batches, runtime_reads
 
 
 logger = logging.getLogger(__name__)
@@ -396,6 +397,23 @@ def media_reference_owners(db: Session, root: Path, *, strict: bool = False) -> 
     return dict(references)
 
 
+def _runtime_media_reads(db: Session):
+    info = getattr(db, "info", {})
+    if _STATE in info or _OWNERSHIP_VALIDATION_PHASE in info:
+        return None
+    return runtime_reads(db)
+
+
+def read_media_reference_owners(db: Session, root: Path) -> dict[Path, set[str | None]]:
+    """Use the complete persisted owner map during a runtime read."""
+    scope = _runtime_media_reads(db)
+    if scope is None:
+        return media_reference_owners(db, root)
+    if root not in scope.owners:
+        scope.owners[root] = media_reference_owners(db, root)
+    return scope.owners[root]
+
+
 def media_protected_paths(db: Session, root: Path) -> set[Path]:
     """Valid non-authoritative references prevent deletion, never grant ownership."""
     paths = set(media_reference_owners(db, root, strict=True))
@@ -422,7 +440,7 @@ def media_owned_by(db: Session, root: Path, path: Path, client_id: str,
     if phase is not None:
         phase.check()
     refs = references if references is not None else (
-        phase.owners(root, path) if phase is not None else media_reference_owners(db, root))
+        phase.owners(root, path) if phase is not None else read_media_reference_owners(db, root))
     owners = set(refs.get(path, set()))
     # A directory can veto contradictory historical records, never establish ownership.
     parts = path.relative_to(root.resolve()).parts
@@ -436,12 +454,19 @@ def content_file_owned(db: Session, content: ContentItem) -> bool:
     if content.file_path is None:
         return True
     root = get_settings().MEDIA_ROOT
+    scope = _runtime_media_reads(db)
+    key = (root, content.client_id, content.id, content.file_path)
+    if scope is not None and key in scope.file_ownership:
+        return scope.file_ownership[key]
     try:
         path = resolve_stored_media_path(root, content.file_path, must_exist=False)
-        return path is not None and media_owned_by(db, root, path, content.client_id)
+        owned = path is not None and media_owned_by(db, root, path, content.client_id)
     except MediaPathError:
         logger.warning("INVALID_RUNTIME_MEDIA_REFERENCE")
-        return False
+        owned = False
+    if scope is not None:
+        scope.file_ownership[key] = owned
+    return owned
 
 
 # Security keys belong to URL READ projections only. Persisted file_path values
@@ -1024,7 +1049,7 @@ class EffectiveMediaReference:
 def resolve_effective_media_reference(db, client_id, value, *, context, references=None):
     """One terminal decision; parsers cannot manufacture authoritative owners."""
     root = get_settings().MEDIA_ROOT
-    owners = media_reference_owners(db, root) if references is None else references
+    owners = read_media_reference_owners(db, root) if references is None else references
     if not isinstance(context, MediaReadContext):
         return EffectiveMediaReference(value, context, value, None, None, (), MediaReadDecision.UNKNOWN)
     try:
@@ -1338,6 +1363,37 @@ def _read_local_media_paths(value, *, context=None):
                 yield key
 
 
+def _readable_media_row(db, model_name, row, root, references) -> bool:
+    _, owner, stored, source, metadata, html_content, text_content = row
+    try:
+        if not owner:
+            return False
+        source_context = (MediaReadContext.TYPED_URL if model_name == "ContentItem"
+                          else MediaReadContext.OPAQUE)
+        if not all(read_payload_media_owned(db, owner, value, context=context, references=references)
+                   for value, context in ((source, source_context), (metadata, MediaReadContext.STRUCTURED),
+                       (html_content, MediaReadContext.HTML), (text_content, MediaReadContext.OPAQUE))):
+            return False
+        if not stored:
+            return True
+        if model_name == "DatasetImport" and not stored.startswith(("/media/", "media/")):
+            stored = "/media/" + stored
+        return media_owned_by(db, root, resolve_stored_media_path(root, stored, must_exist=False),
+                              owner, references)
+    except (MediaPathError, ValueError, TypeError):
+        return False
+
+
+def _remember_runtime_content_media(db, scope, row, root, references) -> bool:
+    allowed = _readable_media_row(db, "ContentItem", row, root, references)
+    scope.content_media[(row.client_id, row.id)] = allowed
+    if allowed and row.file_path:
+        # The row validator already applied the same persisted-path ownership
+        # check. Empty paths still go through the stricter runtime file guard.
+        scope.file_ownership[(root, row.client_id, row.id, row.file_path)] = True
+    return allowed
+
+
 def readable_media_ids(db: Session, model_name: str, *,
                        content_keys: set[tuple[str, str]] | None = None) -> list[str]:
     """Authoritative media ownership allowlist, built before a response query.
@@ -1347,51 +1403,52 @@ def readable_media_ids(db: Session, model_name: str, *,
     Content keys limit rows to validate. Other rows still establish ownership.
     """
     root = get_settings().MEDIA_ROOT
-    references = media_reference_owners(db, root)
     if model_name == "ContentItem":
+        scope = _runtime_media_reads(db)
         query = select(ContentItem.id, ContentItem.client_id, ContentItem.file_path,
                        ContentItem.source_url, ContentItem.metadata_json,
                        ContentItem.html_content, ContentItem.text_content)
         if content_keys is not None:
+            if scope is not None:
+                pending = content_keys - scope.content_media.keys()
+                for batch in content_batches(pending):
+                    references = read_media_reference_owners(db, root)
+                    rows = db.execute(query.where(tuple_(ContentItem.client_id, ContentItem.id).in_(batch)))
+                    for row in rows:
+                        _remember_runtime_content_media(db, scope, row, root, references)
+                    for key in batch:
+                        scope.content_media.setdefault(key, False)
+                return [identity for client_id, identity in sorted(content_keys)
+                        if scope.content_media[(client_id, identity)]]
             query = query.where(tuple_(ContentItem.client_id, ContentItem.id).in_(content_keys))
+        references = read_media_reference_owners(db, root)
         rows = db.execute(query)
+        if scope is not None:
+            allowed = []
+            for row in rows:
+                key = (row.client_id, row.id)
+                if key not in scope.content_media:
+                    _remember_runtime_content_media(db, scope, row, root, references)
+                if scope.content_media[key]:
+                    allowed.append(row.id)
+            return allowed
     elif model_name == "DatasetImport" and content_keys is None:
         from sqlalchemy import literal
+        references = read_media_reference_owners(db, root)
         rows = db.execute(select(DatasetImport.id, Dataset.client_id, DatasetImport.storage_path,
                                  DatasetImport.source_filename, DatasetImport.summary_json,
                                  literal(None), literal(None)).outerjoin(
                                      Dataset, Dataset.id == DatasetImport.dataset_id))
     else:
         raise ValueError("Unsupported authoritative media model or content scope")
-    allowed = []
-    for identity, owner, stored, source, metadata, html_content, text_content in rows:
-        try:
-            if not owner:
-                continue
-            paths = []
-            if stored:
-                if model_name == "DatasetImport" and not stored.startswith(("/media/", "media/")):
-                    stored = "/media/" + stored
-                paths.append(stored)
-            source_context = (MediaReadContext.TYPED_URL if model_name == "ContentItem"
-                              else MediaReadContext.OPAQUE)
-            if not all(read_payload_media_owned(db, owner, value, context=context, references=references)
-                       for value, context in ((source, source_context), (metadata, MediaReadContext.STRUCTURED),
-                           (html_content, MediaReadContext.HTML), (text_content, MediaReadContext.OPAQUE))):
-                continue
-            if all(media_owned_by(db, root, resolve_stored_media_path(root, value, must_exist=False),
-                                  owner, references) for value in paths):
-                allowed.append(identity)
-        except (MediaPathError, ValueError, TypeError):
-            continue
-    return allowed
+    return [row[0] for row in rows if _readable_media_row(db, model_name, row, root, references)]
 
 
 def read_payload_media_decision(db: Session, client_id: str, value, *, context=None, references=None):
     """Terminal aggregate result: any uncertain/foreign candidate rejects all."""
     from urllib.parse import quote
     root = get_settings().MEDIA_ROOT
-    owners = media_reference_owners(db, root) if references is None else references
+    owners = read_media_reference_owners(db, root) if references is None else references
     if not isinstance(context, MediaReadContext):
         return MediaReadDecision.UNKNOWN
     found_local = False
@@ -1428,7 +1485,7 @@ def readable_payload_ids(db: Session, model_name: str, fields) -> list[str]:
     from app.services.tenant_queries import _owner
     from app.services.tenant_relations import model_class
     model = model_class(model_name)
-    owners = media_reference_owners(db, get_settings().MEDIA_ROOT)
+    owners = read_media_reference_owners(db, get_settings().MEDIA_ROOT)
     rows = db.connection().execute(select(model.id, _owner(model, model_name),
                                          *(getattr(model, field) for field in fields)))
     return [row[0] for row in rows if row[1] and all(read_payload_media_owned(

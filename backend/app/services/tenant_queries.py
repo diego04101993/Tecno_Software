@@ -347,7 +347,11 @@ def _is_canonical_projection(statement, cls):
 
 def _read_projection_predicate(statement, cls, db, profile, client_id, branch_id):
     cache = getattr(db, "info", {}).get("a9_read_predicates")
-    # A fresh administrative response projection owns this cache. Only reuse
+    from app.services.runtime_read import runtime_reads
+    scope = runtime_reads(db)
+    if scope is not None:
+        cache = scope.predicates
+    # A response projection or runtime snapshot owns this cache. Only reuse
     # integrity SQL for bare selects of the canonical table or its ID column.
     # Actor authorization and statement-specific filters still run separately.
     if (cache is not None and type(profile) is str and profile in ("READ", "RUNTIME")

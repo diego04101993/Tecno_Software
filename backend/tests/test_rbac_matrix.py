@@ -223,7 +223,7 @@ def run_phase_a_mutations(*, only=None):
         ("touch_target",tenancy.require_screen_target,"    target = require_same_client_resource","    return None\n    target = require_same_client_resource",relations+"test_touch_and_legacy_targets_same_tenant_and_experience"),
         ("layout_get_write",layouts.get_layout_editor_state,"persist=False","persist=True",relations+"test_operator_layout_gets_never_persist"),
         ("telemetry",player._sanitize_telemetry,"    updates = {}","    return payload\n    updates = {}",runtime+"test_player_invalid_telemetry_sanitizes_only_bad_fields"),
-        ("runtime_file",player_runtime._runtime_content,"content and content_file_owned(db, content)","content",r1+"test_foreign_file_omitted_without_repair"),
+        ("runtime_file",player_runtime._runtime_contents," and content_file_owned(db, content)","",r1+"test_foreign_file_omitted_without_repair"),
         ("revision_preview",layouts.list_layout_revisions,"return [safe_revision_payload(revision, layout, db) for revision in get_layout_revisions(db, layout)]","return get_layout_revisions(db, layout)",r1+"test_all_revision_reads_sanitize_historical_preview"),
         ("inactive_output",player_runtime._runtime_output_allowed,"    channel = safe_tenant_resource","    return True\n    channel = safe_tenant_resource",r1+"test_inactive_secondary_branch_output_omitted"),
         ("get_sequence_write",campaigns._read_sequence_items,"    sequence_items = get_ordered_sequence_items(campaign_id, db)","    sequence_items = resolve_effective_sequence_items(campaign_id, db)\n    db.commit()",r1+"test_all_gets_are_read_only_for_all_roles"),
@@ -492,8 +492,11 @@ def run_a9_read_mutations():
         A9ReadSurfaceTests, "test_audio_foreign_media_event_does_not_increase_report_count",
         'self.assertEqual(response.json()["music"], [], "A9 unsafe event contaminated count")')
 
-    add("runtime_foreign_content", player_runtime, "_runtime_content",
-        [('content = safe_tenant_resource(db, ContentItem, content_id, client_id)', 'content = db.get(ContentItem, content_id)')],
+    add("runtime_foreign_content", player_runtime, "_runtime_contents",
+        [('eligible = {content.id: content for content in db.scalars(statement.where(ContentItem.id.in_(sorted(batch))))\n'
+          '                    if content.client_id == client_id and content_file_owned(db, content)}',
+          'eligible = {identity: content for identity in batch\n'
+          '                    if (content := db.get(ContentItem, identity)) is not None and content_file_owned(db, content)}')],
         A9ReadSurfaceTests, "test_runtime_foreign_sequence_content_is_not_serialized",
         'self.assertNotIn(b["content"].id, response.text, "A9 runtime accepted foreign item")')
 
@@ -521,7 +524,9 @@ def run_a9_read_mutations():
         'self.assertEqual([row.id for row in self.db.scalars(query)], [self.res["A"]["channel"].id],')
 
     add("foreign_media_url_generated", media_refs, "readable_media_ids",
-        [('return allowed', 'return list(db.scalars(select(ContentItem.id))) if model_name == "ContentItem" else allowed')],
+        [('return [row[0] for row in rows if _readable_media_row(db, model_name, row, root, references)]',
+          'return list(db.scalars(select(ContentItem.id))) if model_name == "ContentItem" else '
+          '[row[0] for row in rows if _readable_media_row(db, model_name, row, root, references)]')],
         A9ReadHTTPTests, "test_audio_library_omits_foreign_authoritative_media_before_serialization",
         "self.assertNotIn(b['content'].file_path, response.text)")
 
@@ -547,7 +552,7 @@ def run_a9_read_mutations():
           'if context in {MediaReadContext.HTML, MediaReadContext.OPAQUE}:\n        return\n    if not isinstance(context, MediaReadContext):')],
         A9ReadSurfaceTests, "test_content_text_and_html_media_references_never_grant_ownership",
         'self.assertNotIn(b["content"].file_path, response.text, "A9 embedded content leaked foreign media")')
-    add("root_runtime_media_bypass", player_runtime, "build_player_runtime_config",
+    add("root_runtime_media_bypass", player_runtime, "_build_player_runtime_config",
         [('if not read_payload_media_owned(db, channel.client_id,', 'if False and not read_payload_media_owned(db, channel.client_id,')],
         A9ReadSurfaceTests, "test_player_root_channel_opaque_media_is_not_trusted",
         'self.assertEqual(response.status_code, 403, "A9 root channel bypassed media ownership")')

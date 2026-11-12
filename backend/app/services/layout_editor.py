@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.entities import ContentItem, Dataset, Layout, LayoutDataBinding, LayoutRevision, LayoutRevisionStatus, User
 from app.core.config import get_settings
-from app.services.media_references import content_file_owned, read_payload_media_owned, media_reference_owners, MediaReadContext
+from app.services.media_references import content_file_owned, read_payload_media_owned, read_media_reference_owners, MediaReadContext
 from app.services.tenancy import safe_tenant_resource
 from app.services.layout_bindings import build_layout_data_preview, normalize_layout_zones
 
@@ -331,7 +331,7 @@ def _build_safe_layout_states(layout: Layout, editor_state: dict, db: Session) -
 
     editor_widgets = []
     preview_widgets = []
-    references = media_reference_owners(db, get_settings().MEDIA_ROOT)
+    references = read_media_reference_owners(db, get_settings().MEDIA_ROOT)
     for widget in normalized["widgets"]:
         if not _widget_is_tenant_safe(widget, layout, db, references=references):
             continue

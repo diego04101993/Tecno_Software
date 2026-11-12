@@ -242,7 +242,12 @@ def publication_read_safe(db, identity, *, profile="READ"):
         if proof.state != ContextIntegrityState.CONSISTENT:
             return False
         from app.services.media_references import readable_media_ids
-        allowed_media = set(readable_media_ids(db, "ContentItem"))
+        from app.services.runtime_read import runtime_reads
+        content_keys = None
+        if runtime_reads(db) is not None:
+            content_keys = {(graph.snapshot(checked)["client_id"], checked.identity)
+                            for checked in proof.checked if checked.model == "ContentItem"}
+        allowed_media = set(readable_media_ids(db, "ContentItem", content_keys=content_keys))
         for checked in proof.checked:
             if checked.model == "ContentItem" and checked.identity not in allowed_media:
                 return False

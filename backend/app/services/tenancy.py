@@ -91,11 +91,18 @@ def safe_tenant_resource(db: Session, model, resource_id: str | None, client_id:
     if not resource_id:
         return None
     from app.services.tenant_queries import readable_query
+    from app.services.runtime_read import runtime_reads
     # Touch aggregates sanitize optional navigation targets and children
     # individually, preserving the valid remainder of a historical experience.
     profile = "READ" if model in {TouchExperience, KioskScreen} else "RUNTIME"
-    resource = db.scalar(readable_query(select(model).where(model.id == resource_id), model,
-                                        db=db, profile=profile, client_id=client_id))
+    if runtime_reads(db) is None:
+        statement = readable_query(select(model).where(model.id == resource_id), model,
+                                   db=db, profile=profile, client_id=client_id)
+    else:
+        content_keys = {(client_id, resource_id)} if model is ContentItem else None
+        statement = readable_query(select(model), model, db=db, profile=profile, client_id=client_id,
+                                   content_keys=content_keys).where(model.id == resource_id)
+    resource = db.scalar(statement)
     if resource is None or resource.client_id != client_id or getattr(resource, "is_active", True) is False:
         # No IDs, names, input or stored metadata in security diagnostics.
         logger.warning("TENANT_RELATION_OMITTED")

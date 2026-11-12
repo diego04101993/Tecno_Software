@@ -47,6 +47,7 @@ from app.services.layout_editor import build_layout_preview_state, get_current_d
 from app.services.media_retention import RetentionIncomplete, build_media_retention, incomplete_retention
 from app.services.output_mapping import normalize_output_mapping
 from app.services.presence import build_presence_snapshot
+from app.services.runtime_read import content_batches, runtime_read_scope, runtime_reads
 from app.services.videowall_geometry import compute_videowall_cell_by_row_col
 
 
@@ -267,6 +268,23 @@ def _runtime_content(db: Session, content_id: str, client_id: str):
     return content if content and content_file_owned(db, content) else None
 
 
+def _runtime_contents(db: Session, client_id: str, content_ids: set[str]) -> dict[str, ContentItem | None]:
+    scope = runtime_reads(db)
+    if scope is None:
+        return {identity: _runtime_content(db, identity, client_id) for identity in content_ids}
+
+    pending = {identity for identity in content_ids if (client_id, identity) not in scope.contents}
+    for batch in content_batches(pending):
+        keys = {(client_id, identity) for identity in batch}
+        statement = readable_query(select(ContentItem), ContentItem, db=db, profile="RUNTIME",
+                                   client_id=client_id, content_keys=keys)
+        eligible = {content.id: content for content in db.scalars(statement.where(ContentItem.id.in_(sorted(batch))))
+                    if content.client_id == client_id and content_file_owned(db, content)}
+        for identity in batch:
+            scope.contents[(client_id, identity)] = eligible.get(identity)
+    return {identity: scope.contents[(client_id, identity)] for identity in content_ids}
+
+
 def _runtime_output_allowed(db: Session, channel_id: str, client_id: str) -> bool:
     channel = safe_tenant_resource(db, Channel, channel_id, client_id)
     try:
@@ -277,6 +295,9 @@ def _runtime_output_allowed(db: Session, channel_id: str, client_id: str) -> boo
 
 
 def _runtime_sequence_items(campaign_id: str, db: Session) -> list[CampaignSequenceItem]:
+    scope = runtime_reads(db)
+    if scope is not None and campaign_id in scope.sequences:
+        return scope.sequences[campaign_id]
     # Legacy fallback is transient: runtime must never repair historical rows.
     items = list(db.scalars(select(CampaignSequenceItem).where(
         CampaignSequenceItem.campaign_id == campaign_id).order_by(
@@ -293,9 +314,14 @@ def _runtime_sequence_items(campaign_id: str, db: Session) -> list[CampaignSeque
     campaign = db.get(Campaign, campaign_id)
     if campaign is None or not campaign.is_active:
         return []
-    return [item for item in items if item.is_enabled
-            and (not item.content_id or _runtime_content(db, item.content_id, campaign.client_id))
-            and (not item.layout_id or safe_tenant_resource(db, Layout, item.layout_id, campaign.client_id))]
+    contents = _runtime_contents(db, campaign.client_id,
+                                 {item.content_id for item in items if item.is_enabled and item.content_id})
+    eligible = [item for item in items if item.is_enabled
+                and (not item.content_id or contents.get(item.content_id))
+                and (not item.layout_id or safe_tenant_resource(db, Layout, item.layout_id, campaign.client_id))]
+    if scope is not None:
+        scope.sequences[campaign_id] = eligible
+    return eligible
 
 
 def _safe_schedule(schedule: Schedule, channel: Channel, db: Session) -> bool:
@@ -399,7 +425,8 @@ def _build_sequence_runtime(
         return [], [], []
 
     sequence_items = _runtime_sequence_items(campaign.id, db)
-    contents = {item.content_id: _runtime_content(db, item.content_id, campaign.client_id) for item in sequence_items if item.content_id}
+    contents = _runtime_contents(db, campaign.client_id,
+                                 {item.content_id for item in sequence_items if item.content_id})
     layouts = {item.layout_id: safe_tenant_resource(db, Layout, item.layout_id, campaign.client_id) for item in sequence_items if item.layout_id}
     serialized_contents: list[dict[str, object]] = []
     seen_content_ids: set[str] = set()
@@ -595,7 +622,7 @@ def _build_audio_playlist_payload(playlist: AudioPlaylist | None, db: Session, b
             .order_by(AudioPlaylistItem.sort_order.asc())
         )
     )
-    contents = {item.content_id: _runtime_content(db, item.content_id, playlist.client_id) for item in items}
+    contents = _runtime_contents(db, playlist.client_id, {item.content_id for item in items})
 
     return {
         "id": playlist.id,
@@ -821,6 +848,11 @@ def build_campaign_sequence_preview_payload(
 
 
 def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *, snapshot_coherent: bool = False) -> dict[str, object]:
+    with runtime_read_scope(db):
+        return _build_player_runtime_config(channel, db, base_url, snapshot_coherent=snapshot_coherent)
+
+
+def _build_player_runtime_config(channel: Channel, db: Session, base_url: str, *, snapshot_coherent: bool) -> dict[str, object]:
     generated_at = now_utc()
     play_at_timestamp = int((generated_at + timedelta(milliseconds=SYNC_LEAD_MS)).timestamp() * 1000)
 
@@ -892,8 +924,9 @@ def build_player_runtime_config(channel: Channel, db: Session, base_url: str, *,
                 channel, db, base_url, primary_campaign, generated_at,
                 unknown_runtime_media=bool(audio_payload or touch_payload),
             )
-            if any(not _runtime_content(db, asset["content_id"], channel.client_id)
-                   for asset in media_retention["assets"]):
+            retained = _runtime_contents(db, channel.client_id,
+                                         {asset["content_id"] for asset in media_retention["assets"]})
+            if any(content is None for content in retained.values()):
                 media_retention = incomplete_retention(channel.id, generated_at, "unsafe_media_ownership")
         except RetentionIncomplete as error:
             media_retention = incomplete_retention(channel.id, generated_at, error.reason)
