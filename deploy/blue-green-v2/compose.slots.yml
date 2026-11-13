@@ -1,0 +1,101 @@
+x-api: &api
+  pull_policy: never
+  restart: unless-stopped
+  command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--workers", "1", "--lifespan", "off"]
+  environment:
+    APP_ENV: production
+    AUTO_SEED: "false"
+    DEBUG: "false"
+    WEB_CONCURRENCY: "1"
+    PYTHONDONTWRITEBYTECODE: "1"
+    MEDIA_ROOT: /app/storage/uploads
+    FORWARDED_ALLOW_IPS: "${BGV2_EDGE_IP:?set the dedicated proxy IP}"
+  volumes:
+    - uploads:/app/storage/uploads
+  healthcheck:
+    test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8000/', timeout=2).status == 200"]
+    interval: 5s
+    timeout: 3s
+    start_period: 10s
+    retries: 6
+
+x-frontend: &frontend
+  pull_policy: never
+  restart: unless-stopped
+  tmpfs:
+    - /config:ro
+    - /data:ro
+  command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.bgv2", "--adapter", "caddyfile"]
+  environment:
+    BGV2_API_HOST: "${BGV2_API_HOST:-api.tecnocontrolcloud.com}"
+  volumes:
+    - type: bind
+      source: ./Caddyfile.slot
+      target: /etc/caddy/Caddyfile.bgv2
+      read_only: true
+      bind:
+        create_host_path: false
+  healthcheck:
+    test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "80"]
+    interval: 5s
+    timeout: 3s
+    start_period: 5s
+    retries: 6
+
+services:
+  backend-blue:
+    <<: *api
+    image: "${BGV2_BLUE_BACKEND_IMAGE:?set the sealed BLUE backend image}"
+    env_file: "${BGV2_BLUE_BACKEND_ENV:?set the private BLUE backend env file}"
+    labels:
+      io.tecnocontrol.bgv2.slot: BLUE
+      io.tecnocontrol.bgv2.role: api
+    networks:
+      database:
+      proxy:
+        ipv4_address: "${BGV2_BLUE_BACKEND_IP:?set the BLUE backend IP}"
+
+  backend-green:
+    <<: *api
+    image: "${BGV2_GREEN_BACKEND_IMAGE:?set the sealed GREEN backend image}"
+    env_file: "${BGV2_GREEN_BACKEND_ENV:?set the private GREEN backend env file}"
+    labels:
+      io.tecnocontrol.bgv2.slot: GREEN
+      io.tecnocontrol.bgv2.role: api
+    networks:
+      database:
+      proxy:
+        ipv4_address: "${BGV2_GREEN_BACKEND_IP:?set the GREEN backend IP}"
+
+  frontend-blue:
+    <<: *frontend
+    image: "${BGV2_BLUE_FRONTEND_IMAGE:?set the sealed BLUE frontend image}"
+    labels:
+      io.tecnocontrol.bgv2.slot: BLUE
+      io.tecnocontrol.bgv2.role: frontend
+    networks:
+      proxy:
+        ipv4_address: "${BGV2_BLUE_FRONTEND_IP:?set the BLUE frontend IP}"
+
+  frontend-green:
+    <<: *frontend
+    image: "${BGV2_GREEN_FRONTEND_IMAGE:?set the sealed GREEN frontend image}"
+    labels:
+      io.tecnocontrol.bgv2.slot: GREEN
+      io.tecnocontrol.bgv2.role: frontend
+    networks:
+      proxy:
+        ipv4_address: "${BGV2_GREEN_FRONTEND_IP:?set the GREEN frontend IP}"
+
+volumes:
+  uploads:
+    external: true
+    name: "${BGV2_UPLOADS_VOLUME:?set the shared uploads volume}"
+
+networks:
+  database:
+    external: true
+    name: "${BGV2_DATABASE_NETWORK:?set the existing PostgreSQL network}"
+  proxy:
+    external: true
+    name: "${BGV2_PROXY_NETWORK:?set the private proxy network}"

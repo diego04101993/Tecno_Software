@@ -1,0 +1,17 @@
+[Unit]
+Description=Tecno Control Blue-Green V2 Edge ingress supervisor
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+EnvironmentFile=/etc/tecnocontrol-bgv2/edge-supervisor.env
+ExecStart=/usr/bin/python3 -B ${BGV2_TOOLING}/routectl.py --state-dir ${BGV2_STATE_DIR} --socket ${BGV2_SOCKET} --autosave ${BGV2_AUTOSAVE} --bindings ${BGV2_BINDINGS} --key ${BGV2_KEY} --edge-name ${BGV2_EDGE_NAME} --legacy-blue-manifest ${BGV2_LEGACY_MANIFEST} --legacy-blue-sha256 ${BGV2_LEGACY_SHA256} supervise-ingress
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

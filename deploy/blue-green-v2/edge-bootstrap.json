@@ -1,0 +1,1 @@
+{"admin":{"config":{"persist":false},"listen":"unix//run/bgv2/admin.sock|0600"}}

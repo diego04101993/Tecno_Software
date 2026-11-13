@@ -1,0 +1,50 @@
+services:
+  edge:
+    image: caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    pull_policy: never
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/bgv2/edge-entrypoint.sh"]
+    ports:
+      - "${BGV2_EDGE_BIND:-127.0.0.1}:${BGV2_EDGE_HTTP_PORT:?set host HTTP port}:80/tcp"
+      - "${BGV2_EDGE_BIND:-127.0.0.1}:${BGV2_EDGE_HTTPS_PORT:?set host HTTPS port}:443/tcp"
+    volumes:
+      - type: bind
+        source: ./edge-entrypoint.sh
+        target: /opt/bgv2/edge-entrypoint.sh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./edge-bootstrap.json
+        target: /opt/bgv2/edge-bootstrap.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${BGV2_EDGE_CONFIG_DIR:?set a private Edge config directory}"
+        target: /config
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${BGV2_EDGE_SOCKET_DIR:?set a private Edge socket directory}"
+        target: /run/bgv2
+        bind:
+          create_host_path: false
+      - edge_tls:/data
+    networks:
+      ingress:
+      proxy:
+        ipv4_address: "${BGV2_EDGE_IP:?set the dedicated proxy IP}"
+
+volumes:
+  edge_tls:
+    external: true
+    name: "${BGV2_EDGE_TLS_VOLUME:?set the Edge-only TLS volume}"
+
+networks:
+  ingress:
+    external: true
+    name: "${BGV2_EDGE_NETWORK:?set the ingress network}"
+  proxy:
+    external: true
+    name: "${BGV2_PROXY_NETWORK:?set the private proxy network}"
