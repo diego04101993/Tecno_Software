@@ -5,7 +5,6 @@ and database rows are volatile inputs. Persist the HMAC receipt and the
 already sanitized Docker logs in separate private evidence files.
 """
 
-import argparse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import os
@@ -17,7 +16,8 @@ from time import time_ns
 
 from docker_logs import collect_docker_logs
 from gates import PlayerGate, attribute_heartbeats, device_ref, identifier, legacy_blue_endpoint, sign_receipt, utc, verified_payload
-from release_state import Stop, StateStore, canonical, decode, read_private, require, require_private, sync_dir
+from player_observer_diagnostics import InvalidObserverArguments, ObserverArgumentParser, ObserverDiagnostics
+from release_state import StateStore, canonical, decode, read_private, require, require_private, sync_dir
 from routectl import BLUE_PAIR, CaddyEdge, Controller
 
 
@@ -161,7 +161,7 @@ def sanitized_edge_rows(lines, generation, started, finished):
     return rows
 
 
-def adjudicate(capture, logs, query, baseline, transition, key, started, finished):
+def adjudicate(capture, logs, query, baseline, transition, key, started, finished, *, diagnostics=None):
     """Return an exact receipt or fail closed on incomplete attribution.
 
     `query` accepts a list of sanitized `(channel_id, received_at)` tuples
@@ -181,6 +181,9 @@ def adjudicate(capture, logs, query, baseline, transition, key, started, finishe
     baseline_data = verified_payload("BASELINE", baseline, key, baseline_context, {"baseline_at", "baseline_refs"})
     require(PlayerGate.baseline_hash(baseline_data) == transition["baseline_hash"]
             and baseline_context["previous_generation"] < generation, "BASELINE_DOES_NOT_MATCH_SWITCH")
+    if diagnostics is not None:
+        diagnostics.record_baseline_count(baseline_data)
+        diagnostics.set_window(started_at=start, finished_at=end)
     evidence = observed_evidence(capture, logs, query, key, slot, generation, f"backend-{slot.lower()}:8000", start, end)
     return sign_receipt("PLAYER", {
         **transition, "baseline_at": baseline_data["baseline_at"], "baseline_refs": baseline_data["baseline_refs"],
@@ -245,10 +248,13 @@ def observed_evidence(capture, logs, query, key, slot, generation, upstream, sta
     }
 
 
-def decide_phase3(capture, logs, query, baseline, context, key, started, finished, opened_at):
+def decide_phase3(capture, logs, query, baseline, context, key, started, finished, opened_at, *, diagnostics=None):
     data = verified_payload("PHASE3_BASELINE", baseline, key, context, {"baseline_at", "baseline_refs"})
     baseline_hash = PlayerGate.baseline_hash(data)
     start, end, opened, before = map(utc, (started, finished, opened_at, data["baseline_at"]))
+    if diagnostics is not None:
+        diagnostics.record_baseline_count(data)
+        diagnostics.set_window(started_at=start, finished_at=end, opened_at=opened, baseline_at=before)
     require(opened - timedelta(seconds=120) <= before <= opened <= start and end - start >= timedelta(seconds=120),
             "INVALID_PHASE3_OBSERVATION_WINDOW")
     evidence = observed_evidence(capture, logs, query, key, context["slot"], context["generation"], context["upstream"],
@@ -263,9 +269,9 @@ def decide_phase3(capture, logs, query, baseline, context, key, started, finishe
     }, key), accepted
 
 
-def decide(capture, logs, query, baseline, transition, key, started, finished):
+def decide(capture, logs, query, baseline, transition, key, started, finished, *, diagnostics=None):
     """Adjudicate and return the receipt alongside the existing gate decision."""
-    receipt = adjudicate(capture, logs, query, baseline, transition, key, started, finished)
+    receipt = adjudicate(capture, logs, query, baseline, transition, key, started, finished, diagnostics=diagnostics)
     return receipt, PlayerGate(key)(receipt, transition)
 
 
@@ -331,13 +337,21 @@ def capture_input(stream):
     return captured
 
 
-def edge_logs(edge_id, started, receipt_path):
+def edge_logs(edge_id, started, receipt_path, *, diagnostics=None):
     since = (utc(started) - timedelta(seconds=2)).isoformat()
     receipt = Path(receipt_path)
     evidence = receipt.with_name(receipt.name + ".docker-logs.json")
+    def preserve(logs):
+        if diagnostics is not None:
+            diagnostics.record_edge_streams(logs)
+            diagnostics.advance("write_edge_log_evidence")
+        save_receipt(evidence, logs.evidence())
+        if diagnostics is not None:
+            diagnostics.advance("collect_edge_logs")
+
     capture = collect_docker_logs(lambda *args: local_docker(*args, check=False),
                                   edge_id, since=since, until=from_ns(time_ns()).isoformat(),
-                                  preserve=lambda logs: save_receipt(evidence, logs.evidence()))
+                                  preserve=preserve)
     return capture.lines(edge_id)
 
 
@@ -352,9 +366,8 @@ def verify_phase3_ingress(edge, state, context):
     return edge.boot_token(), marker.st_dev, marker.st_ino, marker.st_mtime_ns
 
 
-def main():
-    """Seal stdin from a supervised collector, using live local read-only inputs."""
-    parser = argparse.ArgumentParser(description=__doc__)
+def _parser():
+    parser = ObserverArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--postgres-id", required=True)
     parser.add_argument("--key", required=True)
@@ -371,11 +384,21 @@ def main():
     observe.add_argument("--socket", required=True)
     observe.add_argument("--autosave", required=True)
     observe.add_argument("--opened-at", required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    """Seal stdin from a supervised collector, using live local read-only inputs."""
+    diagnostic = ObserverDiagnostics()
     try:
+        args = _parser().parse_args(argv)
+        diagnostic.action = args.action
+        diagnostic.destination = Path(args.receipt)
+        diagnostic.advance("validate_scope")
         ids = (args.postgres_id, args.edge_id) if hasattr(args, "edge_id") else (args.postgres_id,)
         require(sys.platform.startswith("linux") and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in ids),
                 "OBSERVER_REQUIRES_EXACT_LOCAL_IDENTITIES")
+        diagnostic.advance("load_state_and_key")
         store = StateStore(args.state_dir)
         state = store.load()
         key = read_private(args.key)
@@ -405,43 +428,72 @@ def main():
                         for item in sorted(values, key=lambda item: item["Id"])]
             return [(item, identity[item]["Pid"], identity[item]["StartedAt"]) for item in ids]
 
+        diagnostic.advance("inspect_endpoints")
         before = identities()
         if args.action in ("baseline", "phase3-baseline"):
+            diagnostic.advance("capture_baseline")
             receipt = (capture_phase3_baseline(read, state, key, args.postgres_id) if phase3
                        else capture_baseline(read, state, key))
+            diagnostic.record_baseline_count(receipt["payload"])
+            diagnostic.advance("recheck_endpoints_and_state")
             require(before == identities() and store.load() == state, "OBSERVER_IDENTITY_OR_ROUTING_CHANGED")
+            diagnostic.advance("write_baseline_receipt")
             save_receipt(args.receipt, receipt)
+            diagnostic.advance("report_baseline")
             print("PLAYER_BASELINE_RECEIPT_WRITTEN")
             return 0
+        diagnostic.advance("load_baseline")
         baseline = decode(read_private(args.baseline))
         def query(pairs):
             return read_only_query(read, pairs)
 
         if phase3:
+            diagnostic.advance("verify_initial_ingress")
             edge = CaddyEdge(args.socket, args.autosave)
             token = verify_phase3_ingress(edge, state, context)
-            require(from_ns(token[-1]) <= utc(args.opened_at) <= utc(args.started_at), "PHASE3_INGRESS_TIME_INVALID")
+            marker_at, opened_at, started_at = from_ns(token[-1]), utc(args.opened_at), utc(args.started_at)
+            diagnostic.set_window(marker_at=marker_at, opened_at=opened_at, started_at=started_at)
+            require(marker_at <= opened_at <= started_at, "PHASE3_INGRESS_TIME_INVALID")
+            diagnostic.advance("read_capture")
             capture = capture_input(sys.stdin.buffer)
-            receipt, accepted = decide_phase3(capture, edge_logs(args.edge_id, args.started_at, args.receipt), query, baseline,
-                                              context, key, args.started_at, args.finished_at, args.opened_at)
+            diagnostic.counts["capture_records"] = len(capture)
+            diagnostic.advance("collect_edge_logs")
+            logs = edge_logs(args.edge_id, args.started_at, args.receipt, diagnostics=diagnostic)
+            diagnostic.advance("adjudicate")
+            receipt, accepted = decide_phase3(capture, logs, query, baseline, context, key,
+                                              args.started_at, args.finished_at, args.opened_at, diagnostics=diagnostic)
+            diagnostic.record_adjudication(receipt)
+            diagnostic.advance("recheck_ingress")
             require(verify_phase3_ingress(edge, state, context) == token, "PHASE3_INGRESS_CHANGED")
         else:
+            diagnostic.advance("validate_transition")
             transition = state["routing"]["api_transition"]
             require(state["pending"] is None and transition is not None
                     and state["routing"]["generation"] == transition["generation"]
                     and state["routing"]["active"]["frontend"] == transition["prior_slot"], "OBSERVER_REQUIRES_API_ONLY_SWITCH")
+            diagnostic.advance("read_capture")
             capture = capture_input(sys.stdin.buffer)
-            receipt, accepted = decide(capture, edge_logs(args.edge_id, args.started_at, args.receipt), query, baseline,
-                                       transition, key, args.started_at, args.finished_at)
+            diagnostic.counts["capture_records"] = len(capture)
+            diagnostic.advance("collect_edge_logs")
+            logs = edge_logs(args.edge_id, args.started_at, args.receipt, diagnostics=diagnostic)
+            diagnostic.advance("adjudicate")
+            receipt, accepted = decide(capture, logs, query, baseline, transition, key, args.started_at, args.finished_at,
+                                       diagnostics=diagnostic)
+            diagnostic.record_adjudication(receipt)
+        diagnostic.advance("recheck_endpoints_and_state")
         require(before == identities() and store.load() == state, "OBSERVER_IDENTITY_OR_ROUTING_CHANGED")
+        diagnostic.advance("verify_window_end")
         require(utc(args.finished_at) <= from_ns(time_ns()), "OBSERVER_WINDOW_END_IN_FUTURE")
+        diagnostic.advance("write_player_receipt")
         save_receipt(args.receipt, receipt)
+        diagnostic.advance("report_player_result")
         print("PLAYER_OBSERVATION=PASS" if accepted else "PLAYER_OBSERVATION=FAIL")
         if not accepted:
-            return 2
-    except (Stop, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
-        print("PLAYER_OBSERVATION_STOP", file=sys.stderr)
-        return 1
+            return diagnostic.fail(2)
+    except InvalidObserverArguments as error:
+        return diagnostic.fail(2, error)
+    except (Exception, KeyboardInterrupt) as error:
+        return diagnostic.fail(1, error)
     return 0
 
 
