@@ -94,9 +94,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
 
 
 def logs(topology):
-    result = topology.docker.invoke("logs", topology.edge)
-    assert result.returncode == 0
-    return (result.stdout + result.stderr).splitlines()
+    return topology.docker.logs(topology.edge).lines(topology.edge)
 
 
 def heartbeat(http, token, status=200):

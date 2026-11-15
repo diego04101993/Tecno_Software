@@ -1,7 +1,8 @@
 """Produce a PlayerGate receipt from passive Edge evidence and a read-only DB.
 
 Neither this module nor player_capture.py sends a Player request. Wire events
-and database rows are volatile inputs. Persist only the returned HMAC receipt.
+and database rows are volatile inputs. Persist the HMAC receipt and the
+already sanitized Docker logs in separate private evidence files.
 """
 
 import argparse
@@ -14,6 +15,7 @@ import subprocess
 import sys
 from time import time_ns
 
+from docker_logs import collect_docker_logs
 from gates import PlayerGate, attribute_heartbeats, device_ref, identifier, legacy_blue_endpoint, sign_receipt, utc, verified_payload
 from release_state import Stop, StateStore, canonical, decode, read_private, require, require_private, sync_dir
 from routectl import BLUE_PAIR, CaddyEdge, Controller
@@ -287,11 +289,12 @@ def read_only_query(read, pairs):
     return [decode(row) for row in result]
 
 
-def local_docker(*args, input=None):
+def local_docker(*args, input=None, check=True):
     command = ["docker", "--host", "unix:///var/run/docker.sock", *args]
     env = {key: value for key, value in os.environ.items() if not key.startswith("DOCKER_")}
     result = subprocess.run(command, input=input, env=env, capture_output=True, timeout=30, check=False)
-    require(result.returncode == 0, "LOCAL_DOCKER_OBSERVER_FAILED")
+    if check:
+        require(result.returncode == 0, "LOCAL_DOCKER_OBSERVER_FAILED")
     return result
 
 
@@ -328,11 +331,14 @@ def capture_input(stream):
     return captured
 
 
-def edge_logs(edge_id, started):
+def edge_logs(edge_id, started, receipt_path):
     since = (utc(started) - timedelta(seconds=2)).isoformat()
-    edge = local_docker("logs", "--since", since, "--until", from_ns(time_ns()).isoformat(), edge_id)
-    require(len(edge.stdout) + len(edge.stderr) <= 64 * 1024 * 1024, "EDGE_LOG_BOUNDS_EXCEEDED")
-    return (edge.stdout + edge.stderr).splitlines()
+    receipt = Path(receipt_path)
+    evidence = receipt.with_name(receipt.name + ".docker-logs.json")
+    capture = collect_docker_logs(lambda *args: local_docker(*args, check=False),
+                                  edge_id, since=since, until=from_ns(time_ns()).isoformat(),
+                                  preserve=lambda logs: save_receipt(evidence, logs.evidence()))
+    return capture.lines(edge_id)
 
 
 def verify_phase3_ingress(edge, state, context):
@@ -416,7 +422,7 @@ def main():
             token = verify_phase3_ingress(edge, state, context)
             require(from_ns(token[-1]) <= utc(args.opened_at) <= utc(args.started_at), "PHASE3_INGRESS_TIME_INVALID")
             capture = capture_input(sys.stdin.buffer)
-            receipt, accepted = decide_phase3(capture, edge_logs(args.edge_id, args.started_at), query, baseline,
+            receipt, accepted = decide_phase3(capture, edge_logs(args.edge_id, args.started_at, args.receipt), query, baseline,
                                               context, key, args.started_at, args.finished_at, args.opened_at)
             require(verify_phase3_ingress(edge, state, context) == token, "PHASE3_INGRESS_CHANGED")
         else:
@@ -425,7 +431,7 @@ def main():
                     and state["routing"]["generation"] == transition["generation"]
                     and state["routing"]["active"]["frontend"] == transition["prior_slot"], "OBSERVER_REQUIRES_API_ONLY_SWITCH")
             capture = capture_input(sys.stdin.buffer)
-            receipt, accepted = decide(capture, edge_logs(args.edge_id, args.started_at), query, baseline,
+            receipt, accepted = decide(capture, edge_logs(args.edge_id, args.started_at, args.receipt), query, baseline,
                                        transition, key, args.started_at, args.finished_at)
         require(before == identities() and store.load() == state, "OBSERVER_IDENTITY_OR_ROUTING_CHANGED")
         require(utc(args.finished_at) <= from_ns(time_ns()), "OBSERVER_WINDOW_END_IN_FUTURE")

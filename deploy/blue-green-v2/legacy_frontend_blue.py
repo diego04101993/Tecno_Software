@@ -15,6 +15,7 @@ import sys
 
 from docker_config import parse_optional_config
 from docker_mounts import canonicalize_mounts
+from docker_networks import canonicalize_network_attachment
 from release_state import Stop, canonical, decode, digest, read_private, require, write_private_atomic
 
 
@@ -367,6 +368,112 @@ def classify_historical(item, image, read, manifest, expected_sha256, *, policy=
             raise
         raise Stop("LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED") from None
     return LEGACY_FRONTEND_IMAGE_EXACT
+
+
+def attest_reconnected_historical(item, image, read, manifest, expected_sha256, *, reconnect, policy=R3_POLICY,
+                                  read_host=None):
+    """Compare observed endpoints to the approved contract after a deliberate reconnect."""
+    payload = verify_manifest(manifest, expected_sha256, policy=policy)
+    actual = historical_evidence(item, image, read, policy=policy, read_host=read_host)
+    expected = {key: payload[key] for key in ("historical", "image", "content")}
+    return attest_reconnected_projection(expected, actual, reconnect=reconnect,
+                                          configured_mac=item["Config"].get("MacAddress"))
+
+
+def attest_reconnected_projection(expected, actual, *, reconnect, configured_mac=None):
+    """Compare measured projections without modifying the sealed or observed data."""
+    before, after = deepcopy(expected), deepcopy(actual)
+    before["historical"]["mounts"] = canonicalize_mounts(before["historical"]["mounts"])
+    after["historical"]["mounts"] = canonicalize_mounts(after["historical"]["mounts"])
+    expected_networks = before["historical"].pop("networks")
+    actual_networks = after["historical"].pop("networks")
+    require(canonical(before) == canonical(after),
+            "LEGACY_FRONTEND_RECONNECTED_NON_NETWORK_DRIFT")
+    return attest_reconnected_networks(expected_networks, actual_networks, reconnect=reconnect,
+                                        configured_mac=configured_mac)
+
+
+def historical_reconnect_policy(expected, compose_proof, reconnected_ipv4):
+    """Use the proven original Compose intent to qualify each deliberate reconnect."""
+    require(type(compose_proof) is dict and compose_proof.get("compose_files_match_prestage") is True
+            and compose_proof.get("compose_hash_matches_container") is True
+            and hex_hash(compose_proof.get("container_create_hash"))
+            and "container_declared_mac" in compose_proof
+            and (compose_proof["container_declared_mac"] is None or type(compose_proof["container_declared_mac"]) is str)
+            and type(compose_proof.get("container_network_mode")) is str and bool(compose_proof["container_network_mode"])
+            and type(compose_proof.get("endpoints")) is list,
+            "LEGACY_FRONTEND_RECONNECT_COMPOSE_UNPROVEN")
+    fields = {"name", "service_mac", "endpoint_mac", "endpoint_driver_opts", "ipv4_address", "ipv6_address", "link_local_ips"}
+    endpoints = compose_proof["endpoints"]
+    require(all(type(row) is dict and set(row) == fields and type(row["name"]) is str for row in endpoints),
+            "LEGACY_FRONTEND_RECONNECT_COMPOSE_ENDPOINT_INVALID")
+    declarations = {row["name"]: row for row in endpoints}
+    require(len(declarations) == len(endpoints) and set(declarations) == set(expected)
+            and type(reconnected_ipv4) is dict and 0 < len(reconnected_ipv4) and set(reconnected_ipv4) <= set(expected),
+            "LEGACY_FRONTEND_RECONNECT_COMPOSE_NETWORK_SET_DRIFT")
+    rules = {}
+    for name, requested in reconnected_ipv4.items():
+        declaration = declarations[name]
+        approved = expected[name]
+        configured = approved.get("IPAMConfig") or {}
+        link_local = declaration["link_local_ips"]
+        require(all(declaration[field] is None or type(declaration[field]) is str
+                    for field in ("service_mac", "endpoint_mac", "ipv4_address", "ipv6_address"))
+                and (link_local is None or type(link_local) is list and all(type(ip) is str for ip in link_local)),
+                "LEGACY_FRONTEND_RECONNECT_COMPOSE_ENDPOINT_INVALID")
+        require(type(requested) is str and requested == approved["IPAddress"]
+                and declaration["ipv4_address"] in (None, "", requested)
+                and (declaration["ipv6_address"] or "") == (configured.get("IPv6Address") or "")
+                and sorted(link_local or []) == sorted(configured.get("LinkLocalIPs") or []),
+                "LEGACY_FRONTEND_RECONNECT_ADDRESS_INTENT_DRIFT")
+        opts = declaration["endpoint_driver_opts"]
+        require(opts is None or type(opts) is dict, "LEGACY_FRONTEND_RECONNECT_DRIVER_INTENT_INVALID")
+        require(not opts or canonical(opts) == canonical(approved.get("DriverOpts")),
+                "LEGACY_FRONTEND_RECONNECT_DRIVER_INTENT_DRIFT")
+        macs = {value for value in (compose_proof["container_declared_mac"], declaration["service_mac"],
+                                     declaration["endpoint_mac"]) if value not in (None, "")}
+        require(not macs or macs == {approved.get("MacAddress")}, "LEGACY_FRONTEND_RECONNECT_MAC_INTENT_DRIFT")
+        rules[name] = {"reconnected_ipv4": requested, "allow_generated_mac": not macs, "allow_empty_driver_opts": not opts}
+    return rules
+
+
+def require_historical_ownership(historical, membership, port_owner, tls_writer):
+    """Reject a partial restored attachment or a conflicting ingress/storage owner."""
+    require(type(membership) is dict and set(membership) == set(historical["networks"])
+            and all(type(count) is int and count == 1 for count in membership.values()),
+            "LEGACY_FRONTEND_RECONNECTED_MEMBERSHIP_DRIFT")
+    require(port_owner == historical["name"], "LEGACY_FRONTEND_RECONNECTED_PORT_OWNER_DRIFT")
+    require(tls_writer == historical["name"], "LEGACY_FRONTEND_RECONNECTED_TLS_WRITER_DRIFT")
+
+
+def attest_reconnected_networks(expected, actual, *, reconnect, configured_mac=None):
+    """Return a stable attachment hash and both original endpoint observations."""
+    require(type(expected) is dict and type(actual) is dict and set(expected) == set(actual)
+            and type(reconnect) is dict and 0 < len(reconnect) and set(reconnect) <= set(expected),
+            "LEGACY_FRONTEND_RECONNECTED_NETWORK_SET_DRIFT")
+    stable = {}
+    volatile = {}
+    for name, observed in actual.items():
+        approved = expected[name]
+        if name not in reconnect:
+            require(canonical(observed) == canonical(approved), "LEGACY_FRONTEND_UNCHANGED_ENDPOINT_DRIFT")
+            stable[name] = deepcopy(approved)
+            continue
+        rule = reconnect[name]
+        require(type(rule) is dict and set(rule) == {"allow_generated_mac", "allow_empty_driver_opts", "reconnected_ipv4"}
+                and type(rule["allow_generated_mac"]) is bool and type(rule["allow_empty_driver_opts"]) is bool
+                and type(rule["reconnected_ipv4"]) is str and rule["reconnected_ipv4"] == approved["IPAddress"],
+                "LEGACY_FRONTEND_RECONNECT_POLICY_INVALID")
+        require(not rule["allow_generated_mac"] or configured_mac in (None, ""),
+                "LEGACY_FRONTEND_RECONNECT_CONFIGURED_MAC")
+        before, volatile_before = canonicalize_network_attachment(name, approved, **rule)
+        after, volatile_after = canonicalize_network_attachment(name, observed, **rule)
+        require(canonical(before) == canonical(after), "LEGACY_FRONTEND_RECONNECTED_NETWORK_DRIFT")
+        stable[name] = after
+        volatile[name] = {"approved": volatile_before, "observed": volatile_after}
+    return {"stable_network_contract": stable, "stable_network_sha256": digest(stable),
+            "raw_expected_network_settings": deepcopy(expected), "raw_observed_network_settings": deepcopy(actual),
+            "volatile_endpoint_evidence": volatile}
 
 
 def verify_private_frontend(item, image, network, read, payload, binding, *, policy=R3_POLICY):

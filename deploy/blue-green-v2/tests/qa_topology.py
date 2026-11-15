@@ -233,3 +233,6 @@ class QAEdge(CaddyEdge):
 
     def ingress_open(self):
         return self._relay("INGRESS_STATUS")["open"]
+
+    def require_closed(self):
+        self._relay("INGRESS_REQUIRE_CLOSED")

@@ -25,7 +25,7 @@ from qa_proxy_headers import verify_proxy_headers
 from qa_topology import Topology
 
 from gates import PlayerGate, ReadyGate, attribute_heartbeats, device_ref, digest, sign_receipt
-from release_state import StateStore, Stop
+from release_state import StateStore, Stop, decode
 from routectl import Controller
 
 
@@ -124,15 +124,14 @@ def baseline_receipt(controller, database, key):
 
 
 def access_logs(topology):
-    result = topology.docker.invoke("logs", topology.edge)
-    assert result.returncode == 0
+    capture = topology.docker.logs(topology.edge)
     entries = []
-    for line in (result.stdout + result.stderr).splitlines():
+    for line in capture.lines(topology.edge):
         try:
-            value = json.loads(line)
-        except ValueError:
+            value = decode(line)
+        except Stop:
             continue
-        if value.get("logger", "").startswith("http.log.access"):
+        if isinstance(value, dict) and str(value.get("logger", "")).startswith("http.log.access"):
             entries.append(value)
     return entries
 
@@ -262,10 +261,10 @@ def check_log_privacy(qa):
     response = qa.read("/?token=" + marker, headers={"Authorization": "Bearer " + marker,
                        "Cookie": "qa=" + marker, "X-Request-ID": marker}).require(200)
     assert response.headers["x-request-id"] != marker
-    result = qa.topology.docker.invoke("logs", qa.topology.edge)
-    raw = result.stdout + result.stderr
-    assert marker.encode() not in raw and qa.token.encode() not in raw
-    assert all(token.encode() not in raw for token in qa.database.player_tokens)
+    capture = qa.topology.docker.logs(qa.topology.edge)
+    for raw in (capture.stdout, capture.stderr):
+        assert marker.encode() not in raw and qa.token.encode() not in raw
+        assert all(token.encode() not in raw for token in qa.database.player_tokens)
     return True
 
 

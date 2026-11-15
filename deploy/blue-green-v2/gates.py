@@ -20,8 +20,9 @@ from uuid import UUID
 from docker_config import parse_optional_config
 from docker_mounts import canonicalize_mounts, mount_evidence
 from legacy_frontend_blue import (
-    LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION, classify_historical, verify_manifest,
-    verify_private_frontend,
+    LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION, attest_reconnected_historical,
+    classify_historical, historical_reconnect_policy, measure_static_content, require_historical_ownership,
+    verify_manifest, verify_private_frontend,
 )
 from release_state import EPOCH_IDENTITY_FIELDS, IDENTITY_FIELDS, Stop, canonical, digest, now, same_runtime_epoch, validate_runtime_epoch
 
@@ -553,6 +554,13 @@ class DockerProbe:
 
     def verify_initial_legacy_frontend_source(self):
         """Require the original R3 ingress to be present before first adoption."""
+        self._verify_historical_frontend_source()
+
+    def verify_reconnected_legacy_frontend_source(self, *, compose_proof, reconnected_ipv4):
+        """Read-only rollback source attestation for explicitly reattached endpoints."""
+        return self._verify_historical_frontend_source(compose_proof=compose_proof, reconnected_ipv4=reconnected_ipv4)
+
+    def _verify_historical_frontend_source(self, *, compose_proof=None, reconnected_ipv4=None):
         require(self.legacy_frontend_blue is not None, "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
         payload = self.legacy_frontend_blue
         try:
@@ -563,9 +571,24 @@ class DockerProbe:
             require(item["Name"] == "/" + self.edge_name and item["State"]["Running"] is True,
                     "LEGACY_FRONTEND_HISTORICAL_SOURCE_NOT_ACTIVE")
             pin = self.legacy_frontend_blue_sha256
-            require(classify_historical(item, image, self._run, {"sha256": pin, "payload": payload}, pin,
-                                        policy=self.legacy_frontend_policy) == LEGACY_FRONTEND_IMAGE_EXACT,
-                    "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+            manifest = {"sha256": pin, "payload": payload}
+            evidence = None
+            if compose_proof is None and reconnected_ipv4 is None:
+                require(classify_historical(item, image, self._run, manifest, pin, policy=self.legacy_frontend_policy)
+                        == LEGACY_FRONTEND_IMAGE_EXACT, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+            else:
+                historical = payload["historical"]
+                reconnect = historical_reconnect_policy(historical["networks"], compose_proof, reconnected_ipv4)
+                require(compose_proof["container_create_hash"] == item["Config"]["Labels"].get("com.docker.compose.config-hash")
+                        and compose_proof["container_declared_mac"] == item["Config"].get("MacAddress")
+                        and compose_proof.get("container_network_mode") == item["HostConfig"]["NetworkMode"],
+                        "LEGACY_FRONTEND_RECONNECT_COMPOSE_CONTAINER_DRIFT")
+                evidence = attest_reconnected_historical(item, image, self._run, manifest, pin, reconnect=reconnect,
+                                                         policy=self.legacy_frontend_policy)
+                self._verify_reconnected_ownership(item, historical)
+                require(self.classify_legacy_blue()[0] == LEGACY_BLUE_CLASS, "LEGACY_FRONTEND_RECONNECTED_PROXY_DRIFT")
+                address, port = self.legacy_blue_endpoint.split(":")
+                self._run("exec", historical_id, "nc", "-z", "-w", "2", address, port)
             after, = self._json("container", "inspect", historical_id)
             self._observe_mounts("historical_frontend_after", after)
             require(all(after[field] == item[field] for field in ("Id", "Image", "Config", "HostConfig", "NetworkSettings"))
@@ -573,10 +596,44 @@ class DockerProbe:
                     and after["State"]["Running"] is True
                     and all(after["State"][field] == item["State"][field] for field in ("Pid", "StartedAt")),
                     "LEGACY_FRONTEND_CHANGED_DURING_INSPECTION")
+            return evidence
         except (Stop, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
                 raise
             raise GateError("LEGACY_FRONTEND_HISTORICAL_SOURCE_UNKNOWN_OR_DRIFTED") from None
+
+    def _verify_reconnected_ownership(self, frontend, historical):
+        members = {}
+        for name, endpoint in frontend["NetworkSettings"]["Networks"].items():
+            row, = self._json("network", "inspect", name)
+            attached = row["Containers"] or {}
+            current = attached.get(frontend["Id"], {})
+            ipv6 = endpoint["GlobalIPv6Address"]
+            require(row["Name"] == name and row["Id"] == endpoint["NetworkID"]
+                    and current.get("Name") == historical["name"]
+                    and current.get("EndpointID") == endpoint["EndpointID"]
+                    and current.get("MacAddress") == endpoint["MacAddress"]
+                    and current.get("IPv4Address") == f'{endpoint["IPAddress"]}/{endpoint["IPPrefixLen"]}'
+                    and current.get("IPv6Address") == (f'{ipv6}/{endpoint["GlobalIPv6PrefixLen"]}' if ipv6 else ""),
+                    "LEGACY_FRONTEND_RECONNECTED_DOCKER_MEMBERSHIP_DRIFT")
+            members[name] = sum(item["Name"] == historical["name"] for item in attached.values())
+        containers = self._run("ps", "--quiet", "--no-trunc").decode().splitlines()
+        require(containers and all(hex_digest(item) for item in containers) and len(containers) == len(set(containers)),
+                "LEGACY_FRONTEND_RECONNECTED_OWNERS_INVALID")
+        running = self._json("container", "inspect", *containers)
+        require(len(running) == len(containers) and {item["Id"] for item in running} == set(containers)
+                and all(item["State"]["Running"] is True for item in running), "LEGACY_FRONTEND_RECONNECTED_OWNERS_CHANGED")
+        port_owners = {item["Name"].lstrip("/") for item in running
+                       if any(row["HostPort"] in ("80", "443") for rows in item["NetworkSettings"]["Ports"].values()
+                              for row in (rows or []))}
+        tls, = [mount for mount in historical["mounts"] if mount["Destination"] == "/data"]
+        require(tls["Type"] == "volume" and type(tls["Name"]) is str and bool(tls["Name"])
+                and tls["RW"] is True, "LEGACY_FRONTEND_RECONNECTED_TLS_MOUNT_UNPROVEN")
+        tls_writers = {item["Name"].lstrip("/") for item in running
+                       if any(mount["RW"] is True and (mount.get("Name") == tls["Name"] or mount["Source"] == tls["Source"])
+                              for mount in item["Mounts"])}
+        require_historical_ownership(historical, members, next(iter(port_owners)) if len(port_owners) == 1 else None,
+                                     next(iter(tls_writers)) if len(tls_writers) == 1 else None)
 
     def legacy_postgres_id(self):
         try:
@@ -608,6 +665,39 @@ class DockerProbe:
                         and state["Health"]["Status"] == "healthy", "LEGACY_BLUE_DRIFT")
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise GateError("LEGACY_BLUE_DRIFT") from None
+
+    def verify_handoff_sources(self, state, topology):
+        """Tie the compact Docker snapshot to the approved live files and BLUE epoch."""
+        roles = topology["roles"]
+        ready = state["slots"]["BLUE"]["ready"]
+        legacy = state["legacy_blue"]
+        for role, service in (("api", "backend"), ("frontend", "frontend")):
+            approved = ready[role]["identity"]
+            observed = roles[service]["process"]
+            require(all(observed[field] == approved[pinned] for field, pinned in (
+                ("id", "container_id"), ("image", "image_id"), ("pid", "pid"),
+                ("started_at", "started_at"), ("restart_count", "restart_count"),
+            )), "INVALIDATE_HANDOFF_PREPARED_BLUE_IDENTITY")
+        historical = roles["historical"]["process"]
+        require(historical["name"] == "/" + self.edge_name
+                and roles["postgres"]["process"]["id"] == legacy["postgres_id"]
+                and self.legacy_engine_boot_id() == legacy["runtime_epochs"]["api"]["boot_id"],
+                "INVALIDATE_HANDOFF_PREPARED_RUNTIME_SCOPE")
+        frontend = roles["frontend"]["process"]["id"]
+        binding = self.bindings["frontend:BLUE"]
+        manifest = self.legacy_frontend_blue
+        if manifest is None:
+            raw = self._run("exec", frontend, "sha256sum", FRONTEND_CONFIG)
+            expected = f'{binding["frontend_config_sha256"]}  {FRONTEND_CONFIG}\n'.encode()
+            require(raw == expected, "INVALIDATE_HANDOFF_PREPARED_FRONTEND_CONFIG")
+        else:
+            require(historical["id"] == manifest["historical"]["container_id"],
+                    "INVALIDATE_HANDOFF_PREPARED_HISTORICAL_IDENTITY")
+            content = measure_static_content(self._run, frontend, private=True)
+            config = content.pop("slot_caddyfile_sha256")
+            require(config == binding["frontend_config_sha256"] and content == manifest["content"]
+                    and measure_static_content(self._run, historical["id"]) == manifest["content"],
+                    "INVALIDATE_HANDOFF_PREPARED_FRONTEND_CONTENT")
 
     def require_legacy_reboot_health_ready(self, ready, postgres_id):
         expected = {entry["identity"]["container_id"]: entry["identity"]["image_id"] for entry in ready.values()}

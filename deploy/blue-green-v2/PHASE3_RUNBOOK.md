@@ -1,10 +1,10 @@
-# Phase 3 de Blue-Green V2.5
+# Phase 3 de Blue-Green V2.6
 
 **El pre-stage y el handoff requieren autorizaciones separadas.** El pre-stage termina en `READY_FOR_DOWNTIME_WINDOW=YES` con Edge cerrado. Sólo el handoff autorizado puede trasladar 80/443, la escritura TLS o la IP de confianza. Phase 3 termina con `ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`. El backend R3 conserva su contenedor y redes. El frontend BLUE sirve la imagen R3 exacta. El frontend histórico se conserva para reversión. Phase 4 y Videowall GREEN quedan fuera de esta intervención.
 
 ## 1. Precheck y calificación de imágenes en solo lectura
 
-Verificar los hashes aprobados del tooling V2.5. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.5`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
+Verificar los hashes aprobados del tooling V2.6. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.6`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
 
 Registrar el ID y la configuración completa del frontend histórico, sus dos redes, IDs de red, aliases, IPs y todos los `HostIp/HostPort` publicados. Fijar el backend y los volúmenes `tecnocontrol_backend_uploads`, `tecnocontrol_caddy_data`, `tecnocontrol_caddy_config` y `tecnocontrol_postgres_data`. La identidad de proxy observada debe seguir siendo `172.30.250.2`. Medir el endpoint privado del backend desde Docker, con expectativa histórica `172.30.250.3:8000`, y exigir que sólo ese contenedor lo posea. No confiar en una IP histórica que discrepe de la medición. Conservar el frontend histórico, los manifests y los recursos de reversión intactos.
 
@@ -155,11 +155,13 @@ Registrar la salida como `GEN0_SHA256`. Las funciones `routectl_pre` y `routectl
 
 ```sh
 routectl_as() {
-  peer=$1; shift
-  /usr/bin/python3 -B "$TOOL/routectl.py" --state-dir "$STATE_DIR" \
+  local peer=$1; shift
+  local -a command=(/usr/bin/python3 -B "$TOOL/routectl.py" --state-dir "$STATE_DIR" \
     --socket "$EDGE_RUN/admin.sock" --autosave "$EDGE_CFG/caddy/autosave.json" \
     --bindings "$BINDINGS" --key "$KEY_FILE" --edge-name "$peer" \
-    --legacy-blue-manifest "$WORK/legacy-blue-manifest.json" --legacy-blue-sha256 "$LEGACY_PIN" "$@"
+    --legacy-blue-manifest "$WORK/legacy-blue-manifest.json" --legacy-blue-sha256 "$LEGACY_PIN")
+  if [[ ${ROUTECTL_HANDOFF_CHILD:-0} == 1 ]]; then exec "${command[@]}" "$@"; fi
+  "${command[@]}" "$@"
 }
 routectl_pre() { routectl_as "$OLD_FRONTEND_NAME" "$@"; }
 routectl_live() { routectl_as "$EDGE_NAME" "$@"; }
@@ -179,7 +181,7 @@ routectl_pre initialize "$R3_RELEASE" "$WORK/blue-ready.json" "$GEN0_SHA256" \
   --sealed-config "$WORK/sealed-edge.json" > "$WORK/blue-committed-closed.json"
 ```
 
-El signer abre un prompt oculto para un JWT administrativo existente. No pegarlo en shell, logs ni archivos. Verifica API privada, `/api/channels/` ≤3.000 s, runtime 36+16 con cuatro clientes y timeout 10 s, frontend un GET raíz, assets y estabilidad de ambos procesos. No genera login ni tráfico Player. `initialize` confirma generación 0 `BLUE/BLUE` con ingreso cerrado. Probar que el público sigue en R3, el TLS histórico mantiene su huella y ningún listener público de Edge acepta la aplicación. Registrar `T_BLUE_BLUE_COMMITTED` ahora, fuera de la ventana de indisponibilidad. Revalidar la evidencia de reversión. La entrada a la ventana requiere los 10 ensayos y las 10 reversiones calificados con máximos ≤30 s.
+El signer abre un prompt oculto para un JWT administrativo existente. No pegarlo en shell, logs ni archivos. Verifica API privada, `/api/channels/` ≤3.000 s, runtime 36+16 con cuatro clientes y timeout 10 s, frontend un GET raíz, assets y estabilidad de ambos procesos. No genera login ni tráfico Player. `initialize` confirma generación 0 `BLUE/BLUE` con ingreso cerrado. Probar que el público sigue en R3, el TLS histórico mantiene su huella y ningún listener público de Edge acepta la aplicación. Registrar `T_BLUE_BLUE_COMMITTED` ahora, fuera de la ventana de indisponibilidad. Revalidar la evidencia de reversión. La calificación local del handoff preparado exige 30 intentos, al menos 20 entradas a la ventana y todas las entradas y reversiones correctas dentro de sus límites de 30 s.
 
 Preparar el colector con permisos mínimos y comprobar su entorno en el namespace de Edge. El filtro se armará en el endpoint final `.2` durante el handoff autorizado. Conservar la preparación dentro de la vida del colector y comprobar otra vez su disponibilidad antes de la ventana. El pre-stage no captura un baseline, no abre una ventana de observación y no genera tráfico Player. [Operación del observador](PLAYER_OBSERVER.md)
 
@@ -229,7 +231,21 @@ PY
 )
 ```
 
-Después de verificar el backup y justo antes de detener el histórico, capturar `BASELINE_ACTIVE` fresco mediante `player_devices.id`. El recibo liga PostgreSQL y el backend exactos a generación 0. Arrancar la captura en el endpoint final dentro del namespace de Edge con filtro bloqueado por IP/puerto, permisos mínimos y un pipe privado. El colector debe emitir `ready` antes de abrir ingreso. Si se supera el presupuesto de handoff, revertir.
+Mientras R3 sigue atendiendo, preparar `HANDOFF_PREPARED`. El recibo privado y su SHA-256 fijan generación 0, estado exacto sin intención pendiente, identidades BLUE y Edge, ETag y preview, autosave, payload público y evidencia de restauración con sus hashes. La preparación no carga configuración ni abre ingreso. Conservar el SHA-256 devuelto en el mismo shell Bash.
+
+```bash
+FRONTEND_BLUE_ID=$(docker_local container inspect --format '{{.Id}}' "$FRONTEND_BLUE_NAME")
+HANDOFF_ARGS=(--historical-id "$OLD_FRONTEND_ID" --backend-id "$BACKEND_ID" \
+  --frontend-id "$FRONTEND_BLUE_ID" --edge-id "$EDGE_ID" --postgres-id "$PG_ID" \
+  --proxy-network "$PROXY_NET" --ingress-network "$INGRESS_NET" --tls-volume "$TLS_DATA_VOLUME" \
+  --timeline "$WORK/phase3-timeline.jsonl")
+HANDOFF_PREPARED_SHA256=$(
+  routectl_pre prepare-handoff "$WORK/handoff-prepared.json" "${HANDOFF_ARGS[@]}" |
+    /usr/bin/python3 -I -B -c 'import json,re,sys; row=json.load(sys.stdin); assert row["status"]=="HANDOFF_PREPARED" and re.fullmatch(r"[0-9a-f]{64}",row["sha256"]); print(row["sha256"])'
+)
+```
+
+Justo antes de detener el histórico, capturar `BASELINE_ACTIVE` fresco mediante `player_devices.id`. El recibo liga PostgreSQL y el backend exactos a generación 0. Arrancar la captura en el endpoint final dentro del namespace de Edge con filtro bloqueado por IP/puerto, permisos mínimos y un pipe privado. El colector debe emitir `ready` antes de abrir ingreso. Si se supera el presupuesto de handoff, revertir.
 
 ```sh
 /usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
@@ -238,13 +254,11 @@ Después de verificar el backup y justo antes de detener el histórico, capturar
 
 El único cambio de dueño es frontend histórico → Edge. Mantener backend, PostgreSQL, uploads, frontend-blue y el proceso Edge ya validado. Congelar los comandos en la intervención y registrar eventos UTC y monotónicos. Si falta una comprobación o excede el presupuesto de 30 s hasta el primer HTTP válido, pasar inmediatamente a la sección 6. No ocultar fallos ni recalcular el inicio. No ejecutar `compose up`, `restart` de Edge ni ningún smoke largo dentro de la ventana.
 
-1. Confirmar identidad histórica final y registrar `T_R3_STOP_COMMAND` justo antes de `docker_local stop --time 3 "$OLD_FRONTEND_ID"`. El supervisor V2 aún está detenido.
-2. Confirmar que el frontend histórico está detenido. Si Docker todavía lista sus endpoints, desconectarlo de `$PROXY_NET` y `$INGRESS_NET`, sólo con ese ID. Verificar 80/443 libres, endpoints antiguos sin dueño y cero escritores TLS. Registrar `T_80_443_RELEASED`.
-3. Soltar el endpoint proxy temporal del mismo `$EDGE_ID`. Ejecutar `docker_local network connect --ip 172.30.250.2 "$PROXY_NET" "$EDGE_ID"`. Verificar peer exacto `.2`, backend en su endpoint y PID/StartedAt de Edge sin cambio. Registrar `T_PROXY_IDENTITY_READY`.
-4. Ejecutar `docker_local network connect --ip "$OLD_INGRESS_IP" "$INGRESS_NET" "$EDGE_ID"` con la IP histórica fresca. Docker activa los bindings 80/443 ya fijados. Verificar IPs/familias/puertos equivalentes y ningún otro publicador. Registrar `T_EDGE_OWNS_PORTS`.
-5. Confirmar que el histórico no está running, que sólo el mismo Edge tiene derecho de escritura en `/data` y que el storage de configuración antiguo sigue separado. Registrar `T_TLS_WRITER_READY`. Armar el colector ya preparado con la interfaz proxy final. El tiempo hasta la señal `ready` forma parte de la ventana y se mide como `T_PLAYER_CAPTURE_READY`.
-6. Ejecutar `routectl_live recover-ingress`. Con el marcador cerrado, descarta el preview temporal cuando corresponde, preserva el proceso Caddy y reconcilia la configuración pública sellada con el nuevo peer. Verifica state BLUE/BLUE, configuración efectiva exacta y autosave persistido. Registrar `T_BLUE_BLUE_RECONCILED`, `T_INGRESS_READY` y `OPENED_AT` UTC tras la apertura. Conservar el recibo. La generación confirmada sigue en `0`.
-7. Hacer un único GET público HTTPS `/` en la API, con Host/SNI canónicos y verificación real de certificado. Usar el origen autorizado, la IP pública observada y el comando de abajo. Registrar `T_FIRST_PUBLIC_HTTP_200` sólo al obtener HTTP 200 válido. Si el primer intento falla, revertir. Guardar diferencia desde `T_R3_STOP_COMMAND`.
+1. Iniciar el writer de handoff con el SHA-256 preparado. Esperar la confirmación sólo después de la revalidación de estado, ETag, procesos, PostgreSQL, red, puertos y TLS. Ante una diferencia registrar `PRE_DOWNTIME_STOP` y dejar R3 atendiendo. El writer conserva los locks de Edge y estado hasta confirmar el ingreso.
+2. Registrar `T_FRONTEND_STOP` justo antes de `docker_local stop --time 3 "$OLD_FRONTEND_ID"`. Confirmar que el histórico está detenido. Liberar sólo sus endpoints y exigir 80/443 libres y ambas IPs sin dueño. Registrar `T_PORTS_FREE`.
+3. Transferir `.2` al mismo Edge, conservar las épocas del Edge y del backend y registrar `T_PROXY_READY`. Conectar Edge a la IP histórica de ingreso y comprobar los bindings de 80/443.
+4. Registrar `T_TLS_READY` tras la transferencia y armar el colector preparado en el endpoint final. Enviar al writer la confirmación de transferencia y captura. El writer valida propiedad real de puertos/TLS, peer y procesos y aplica ambos payloads preparados con CAS, primero bootstrap para retirar la CA temporal y después el público con el ETag obtenido. Verifica config efectiva y autosave, mantiene generación 0 y registra `T_INGRESS_READY`.
+5. Hacer un único GET público HTTPS `/` en la API con Host/SNI canónicos, certificado válido y presupuesto restante. Registrar `T_FIRST_HTTP_200` sólo al obtener HTTP 200 válido. Ante error, muerte del writer o exceso de 30 s desde `T_FRONTEND_STOP`, usar la sección 6 desde la sesión de reversión preparada.
 
 Los nombres de red históricos esperados son `tecnocontrol_proxy_net` y `tecnocontrol_edge`. Los aliases del histórico se conservan para reconectar en rollback. Para Edge, el ingreso utiliza la IP antigua sólo después de demostrar que quedó libre. Los dos contenedores de ingreso deben mantener sus propios IDs, aun cuando los endpoints de red del frontend histórico se vuelvan a conectar.
 
@@ -295,10 +309,62 @@ first_public_200() {
   test "$status" = 200
 }
 
+handoff_budget() {
+  /usr/bin/python3 -I -B - "$WORK/phase3-timeline.jsonl" "$1" <<'PY'
+import json
+import sys
+from time import monotonic_ns
+
+with open(sys.argv[1], encoding="utf-8") as log:
+    rows = [json.loads(line) for line in log]
+started = [row["monotonic_ns"] for row in rows if row["event"] == "T_FRONTEND_STOP"]
+finished = [row["monotonic_ns"] for row in rows if row["event"] == "T_FIRST_HTTP_200"]
+if len(started) != 1 or len(finished) > 1:
+    raise SystemExit("HANDOFF_TIMELINE_INVALID")
+if finished:
+    if not 0 <= finished[0] - started[0] <= 30_000_000_000:
+        raise SystemExit("HANDOFF_DOWNTIME_LIMIT_EXCEEDED")
+else:
+    milliseconds = min(int(sys.argv[2]) * 1000, (started[0] + 30_000_000_000 - monotonic_ns()) // 1000000)
+    if milliseconds <= 0:
+        raise SystemExit("HANDOFF_DOWNTIME_LIMIT_EXCEEDED")
+    print(f"{milliseconds / 1000:.3f}")
+PY
+}
+
 test "$(port_bindings "$OLD_FRONTEND_ID")" = "$OLD_PORTS"
 test "$(process_identity "$EDGE_ID")" = "$EDGE_PROCESS"
 test "$(process_identity "$BACKEND_ID")" = "$BACKEND_PROCESS"
-mark_phase3 T_R3_STOP_COMMAND
+HANDOFF_TRANSFER_STARTED=0
+abort_handoff_writer() {
+  if [[ -n ${HANDOFF_IN:-} ]]; then exec {HANDOFF_IN}>&-; fi
+  if [[ -n ${HANDOFF_OUT:-} ]]; then exec {HANDOFF_OUT}<&-; fi
+  if [[ -n ${HANDOFF_ROUTING_CHILD:-} ]]; then
+    kill -TERM "$HANDOFF_ROUTING_CHILD" 2>/dev/null || true
+    wait "$HANDOFF_ROUTING_CHILD" 2>/dev/null || true
+  fi
+  if [[ $HANDOFF_TRANSFER_STARTED == 1 ]]; then
+    printf '%s\n' PHASE3_ROLLBACK_REQUIRED >&2
+  else
+    mark_phase3 PRE_DOWNTIME_STOP
+  fi
+}
+trap abort_handoff_writer EXIT
+trap 'exit 1' HUP INT TERM
+coproc HANDOFF_ROUTING {
+  ROUTECTL_HANDOFF_CHILD=1 routectl_pre execute-handoff \
+    "$WORK/handoff-prepared.json" "$HANDOFF_PREPARED_SHA256" "${HANDOFF_ARGS[@]}"
+}
+HANDOFF_ROUTING_CHILD=$HANDOFF_ROUTING_PID
+HANDOFF_SOURCE_OUT=${HANDOFF_ROUTING[0]}
+HANDOFF_SOURCE_IN=${HANDOFF_ROUTING[1]}
+exec {HANDOFF_OUT}<&"$HANDOFF_SOURCE_OUT" {HANDOFF_IN}>&"$HANDOFF_SOURCE_IN"
+exec {HANDOFF_SOURCE_OUT}<&- {HANDOFF_SOURCE_IN}>&-
+IFS= read -r HANDOFF_READY <&"$HANDOFF_OUT"
+test "$HANDOFF_READY" = HANDOFF_PREPARED_VALIDATED
+kill -0 "$HANDOFF_ROUTING_CHILD"
+mark_phase3 T_FRONTEND_STOP
+HANDOFF_TRANSFER_STARTED=1
 docker_local stop --time 3 "$OLD_FRONTEND_ID"
 test "$(docker_local container inspect --format '{{.State.Running}}' "$OLD_FRONTEND_ID")" = false
 release_endpoint "$PROXY_NET" "$OLD_FRONTEND_ID"
@@ -306,22 +372,22 @@ release_endpoint "$INGRESS_NET" "$OLD_FRONTEND_ID"
 require_free_ip "$PROXY_NET" 172.30.250.2
 require_free_ip "$INGRESS_NET" "$OLD_INGRESS_IP"
 test -z "$(ss -H -ltn '( sport = :80 or sport = :443 )')"
-mark_phase3 T_80_443_RELEASED
+mark_phase3 T_PORTS_FREE
 docker_local network disconnect "$PROXY_NET" "$EDGE_ID"
 docker_local network connect --ip 172.30.250.2 "$PROXY_NET" "$EDGE_ID"
 test "$(docker_local container inspect --format "{{(index .NetworkSettings.Networks \"$PROXY_NET\").IPAddress}}" "$EDGE_ID")" = 172.30.250.2
 test "$(process_identity "$EDGE_ID")" = "$EDGE_PROCESS"
 test "$(process_identity "$BACKEND_ID")" = "$BACKEND_PROCESS"
-mark_phase3 T_PROXY_IDENTITY_READY
+mark_phase3 T_PROXY_READY
 docker_local network connect --ip "$OLD_INGRESS_IP" "$INGRESS_NET" "$EDGE_ID"
 test "$(port_bindings "$EDGE_ID")" = "$OLD_PORTS"
 mark_phase3 T_EDGE_OWNS_PORTS
 ```
 
-Comprobar los peers y el dueño TLS contra el snapshot. Continuar con el mismo shell Bash root, sin xtrace.
+Continuar de inmediato en el mismo shell Bash root, sin xtrace. El cierre anormal del shell cancela y espera al writer de este intento. La sesión independiente vigila `T_FRONTEND_STOP` y los 30 s aunque el shell de transferencia esté bloqueado. Si aparece `PHASE3_ROLLBACK_REQUIRED`, muere el writer o se agota el plazo tras T0, iniciar la sección 6. Conservar el recibo preparado y la línea temporal.
 
 ```bash
-mark_phase3 T_TLS_WRITER_READY
+mark_phase3 T_TLS_READY
 # Dentro del mismo shell Bash root, sin xtrace. Encontrar la interfaz por la
 # IP exacta desde el namespace del colector. Rechazar una coincidencia ambigua.
 EDGE_PROXY_IF=$(docker_local exec -i "$COLLECTOR_ID" python -I -B - <<'PY'
@@ -344,6 +410,7 @@ print(matches[0])
 PY
 )
 coproc PHASE3_CAPTURE {
+  exec {HANDOFF_IN}>&- {HANDOFF_OUT}<&-
   docker_local exec "$COLLECTOR_ID" python -I -B /observe.py \
     "$EDGE_PROXY_IF" 172.30.250.2 "$BACKEND_PROXY_IP" 165
 }
@@ -353,19 +420,40 @@ IFS= read -r -t 5 CAPTURE_READY <&3
 printf '%s\n' "$CAPTURE_READY" | /usr/bin/python3 -I -B -c \
   'import json,sys; event=json.load(sys.stdin); sys.exit(not (set(event)=={"type","started_ns"} and event["type"]=="ready" and type(event["started_ns"]) is int and event["started_ns"]>0))'
 mark_phase3 T_PLAYER_CAPTURE_READY
-routectl_live recover-ingress > "$WORK/ingress-recovery.json"
+HANDOFF_BUDGET=$(handoff_budget 30)
+printf '%s\n' TRANSFER_AND_CAPTURE_READY >&"$HANDOFF_IN"
+exec {HANDOFF_IN}>&-
+unset HANDOFF_IN
+HANDOFF_BUDGET=$(handoff_budget 30)
+IFS= read -r -t "$HANDOFF_BUDGET" HANDOFF_RESULT <&"$HANDOFF_OUT"
+exec {HANDOFF_OUT}<&-
+unset HANDOFF_OUT
+wait "$HANDOFF_ROUTING_CHILD"
+unset HANDOFF_ROUTING_CHILD
+printf '%s\n' "$HANDOFF_RESULT" > "$WORK/ingress-recovery.json"
 OPENED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-mark_phase3 T_BLUE_BLUE_RECONCILED
-mark_phase3 T_INGRESS_READY
 STARTED_AT=$OPENED_AT
 FINISHED_AT=$(date -u -d "$STARTED_AT + 120 seconds" +%Y-%m-%dT%H:%M:%S.%NZ)
-first_public_200
-mark_phase3 T_FIRST_PUBLIC_HTTP_200
+PUBLIC_HTTP_BUDGET=$(handoff_budget 10)
+first_public_200 "$PUBLIC_HTTP_BUDGET"
+mark_phase3 T_FIRST_HTTP_200
+handoff_budget 30
+trap - EXIT HUP INT TERM
 ```
 
 ## 5. Verificación después del primer HTTP
 
 Comprobar público 80→443, TLS/Host/SNI, app/índice/assets, API y media de lectura. Verificar IP cliente real y sanitización, cotejar los fingerprints públicos de ambos hosts con los previos, y confirmar `routectl_live status` en generación 0 BLUE/BLUE. Verificar otra vez la imagen R3 exacta del frontend privado y la identidad estable/época del backend R3. Revisar media, PostgreSQL, índice y recursos de rollback. Los smokes largos y la observación no forman parte del tiempo hasta el primer HTTP válido. Si aparecen fallos, presión inesperada de recursos o discontinuidad de Players, revertir según sección 6.
+
+Para comprobar los headers, usar un GET de solo lectura a `/api/player/time?bgv2_probe=<marca>` desde el origen aprobado y verificar que Edge reemplaza el ID enviado. Conservar el ID de la respuesta del probe, su marca hexadecimal de 32 caracteres y la ventana RFC3339Nano que contiene sus registros. Fijar previamente la IP cliente esperada según el mismo origen. El helper sellado exige una única línea de Edge del ID exacto, generación 0, ingreso público, upstream R3 y HTTP 200. También exige el GET correlacionado con la IP real en el backend. Conserva ambos streams raw en archivos privados con ID, ventana y hash del comando. Guarda los datos de correlación del probe en `public-proxy-probe.json` privado antes de buscar coincidencias. La vista temporal se ordena por timestamp de Docker y conserva el nombre del stream.
+
+```sh
+/usr/bin/python3 -B "$TOOL/phase3_evidence.py" \
+  --edge-id "$EDGE_ID" --backend-id "$BACKEND_ID" \
+  --since "$PROBE_SINCE" --until "$PROBE_UNTIL" \
+  --request-id "$PROBE_REQUEST_ID" --marker "$PROBE_MARKER" \
+  --expected-client "$PROBE_EXPECTED_CLIENT" --evidence-dir "$WORK"
+```
 
 `PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. El padre confiable entrega al adjudicador el pipe privado completo y la ventana de al menos 120 segundos, iniciada después de `OPENED_AT` y de la señal `ready`. Usar `--opened-at` en UTC de la misma máquina, posterior al mtime del marcador. El baseline debe tener menos de 120 s al abrir. `FINISHED_AT` queda cubierto por el último registro del colector. Los IDs y la captura sin redacción no salen del pipe. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. `2` o `1` obligan a ejecutar de inmediato la reversión de infraestructura de la sección 6 desde la sesión preparada. No continuar los controles de handoff tras ese resultado. Guardar `phase3-player.json` privado y hash.
 
@@ -419,6 +507,10 @@ Ejecutar `mark_phase3 T_ROLLBACK_DECISION` antes de toda acción. Si el supervis
 
 Reconectar `$OLD_FRONTEND_ID` a `$INGRESS_NET` con su IP y aliases del snapshot inicial y a `$PROXY_NET` con `--ip 172.30.250.2` y sus aliases históricos. Confirmar que el contenedor sigue fijado al mismo digest, Caddyfile, `/config` histórico y volumen TLS `/data`. Arrancar el mismo contenedor con `docker_local start "$OLD_FRONTEND_ID"`. Registrar `T_R3_START_RETURN` y verificar las publicaciones exactas. Esperar el listener local TCP 443 del frontend histórico mediante `nc -z`, dentro de los 30 s medidos desde la decisión. Usar el presupuesto restante, con un máximo de 10 s, para un único GET público de la API con el mismo Host/SNI y certificado válido. Registrar `T_FIRST_R3_HTTP_200` sólo con HTTP 200. Verificar app, TLS, propiedad única del storage y puertos, `.2`, IP cliente real, backend original y PostgreSQL/media intactos. Comparar imágenes, red, aliases, hash canónico de `Mounts` y configuración del frontend restaurado con el snapshot. Su nuevo PID/`StartedAt` por stop/start es esperado. No recrear contenedores ni restaurar DB en la reversión normal. Retener Edge cerrado, el frontend-blue privado, estado y recibos para análisis. Escribir un recibo de rollback con los tiempos desde la decisión y el resultado real.
 
+Para las reconexiones deliberadas de esta sección, conservar en el precheck `historical-frontend-compose-proof.json` en `$WORK` con modo `0600` y su SHA-256. Obtener el registro del Compose original y sus labels. Comprobar los hashes de los archivos histórico y overlays contra el precheck y cotejar `docker compose config --hash frontend` con el label de creación del contenedor. Registrar `compose_files_match_prestage` y `compose_hash_matches_container` a partir de esas verificaciones, `container_create_hash` del label y `container_declared_mac` y `container_network_mode` del inspect. En `endpoints`, incluir para cada red `name` con el nombre efectivo, `service_mac`, `endpoint_mac`, `endpoint_driver_opts`, `ipv4_address`, `ipv6_address` y `link_local_ips` del Compose resuelto. Usar `null` si el ajuste no está declarado. Excluir el resto del Compose resuelto y sus credenciales. Fijar `HISTORICAL_FRONTEND_COMPOSE_PROOF_SHA256` al hash registrado antes del handoff.
+
+El contrato estable exige las redes e IDs, direcciones efectivas, prefijos, gateways, aliases y pertenencia del contenedor exactos. Conserva ajustes explícitos y campos desconocidos. En la reconexión declarada, `EndpointID` puede renovarse. Una MAC generada y `DriverOpts` ausente, nulo o vacío sólo admiten sus equivalencias cuando el Compose verificado demuestra la ausencia del ajuste. `IPAMConfig` puede incorporar la IPv4 pasada a `--ip` si coincide con la intención y con la IP efectiva. Conservar los cuatro campos raw. Para la admisión inicial y las comparaciones de una misma época se mantiene el guard de identidad correspondiente.
+
 ```bash
 # OLD_INGRESS_ALIASES y OLD_PROXY_ALIASES son arrays del snapshot aprobado.
 # Ejecutar después de bloquear la reapertura del supervisor y del Edge.
@@ -469,6 +561,35 @@ PY
 )
 first_public_200 "$ROLLBACK_HTTP_BUDGET"
 mark_phase3 T_FIRST_R3_HTTP_200
+```
+
+Después del primer HTTP 200, atestar la red reatada y la identidad histórica con los bindings y manifiestos sellados. El comando escribe únicamente `rollback-network.json` privado en el directorio del intento. Completar también las verificaciones públicas de TLS/Host/SNI y proxy antes de registrar el resultado final de rollback.
+
+```bash
+/usr/bin/python3 -I -B - "$TOOL" "$WORK" "$BINDINGS" "$LEGACY_PIN" "$LEGACY_FRONTEND_PIN" \
+  "$OLD_FRONTEND_NAME" "$INGRESS_NET" "$OLD_INGRESS_IP" "$PROXY_NET" \
+  "$HISTORICAL_FRONTEND_COMPOSE_PROOF_SHA256" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+tool, work, bindings, backend_pin, frontend_pin, frontend_name, ingress, ingress_ip, proxy, proof_pin = sys.argv[1:]
+sys.path.insert(0, str(Path(tool).resolve()))
+from gates import DockerProbe
+from release_state import canonical, decode, read_private, require, write_private_atomic
+
+work = Path(work)
+compose_proof = read_private(work / "historical-frontend-compose-proof.json")
+require(sha256(compose_proof).hexdigest() == proof_pin, "LEGACY_FRONTEND_RECONNECT_COMPOSE_PROOF_DRIFT")
+probe = DockerProbe(decode(read_private(Path(bindings))), edge_name=frontend_name,
+                    legacy_blue=decode(read_private(work / "legacy-blue-manifest.json")),
+                    legacy_blue_sha256=backend_pin)
+require(probe.legacy_frontend_blue_sha256 == frontend_pin, "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
+evidence = probe.verify_reconnected_legacy_frontend_source(
+    compose_proof=decode(compose_proof), reconnected_ipv4={ingress: ingress_ip, proxy: "172.30.250.2"})
+write_private_atomic(work / "rollback-network.json", canonical(evidence) + b"\n", replace=False)
+print("ROLLBACK_NETWORK_ATTACHMENT_CONTRACT=PASS")
+PY
 ```
 
 Si no se recupera R3 dentro de 30 s, registrar el tiempo real y escalar conforme al plan de recuperación aprobado. El timeout no autoriza reintentos automáticos, cambios de producto, restauraciones de datos ni el uso de Phase 4.

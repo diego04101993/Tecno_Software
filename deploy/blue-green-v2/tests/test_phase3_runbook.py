@@ -32,29 +32,31 @@ class Phase3RunbookTest(unittest.TestCase):
         self.assert_order(RUNBOOK, "R3_EXACT_IMAGE_QUALIFICATION", "verify_index(package)",
                           'docker_local start "$FRONTEND_BLUE_NAME"', 'docker_local start "$EDGE_ID"',
                           "routectl_pre preview", "phase3_ready.py", "routectl_pre initialize",
-                          "deployment_phases.py backup", "phase3-baseline", "T_R3_STOP_COMMAND",
-                          "T_80_443_RELEASED", "T_PROXY_IDENTITY_READY", "T_EDGE_OWNS_PORTS",
-                          "T_TLS_WRITER_READY", "T_PLAYER_CAPTURE_READY", "routectl_live recover-ingress",
-                          "T_FIRST_PUBLIC_HTTP_200", "phase3-observe", "systemctl enable --now",
+                          "deployment_phases.py backup", "routectl_pre prepare-handoff", "phase3-baseline",
+                          "T_FRONTEND_STOP", "T_PORTS_FREE", "T_PROXY_READY", "T_TLS_READY",
+                          "T_INGRESS_READY", "T_FIRST_HTTP_200", "phase3-observe", "systemctl enable --now",
                           "phase3-final.json", "T_ROLLBACK_DECISION", "systemctl disable --now",
                           "routectl_live close-ingress", "T_EDGE_RELEASED",
                           'docker_local start "$OLD_FRONTEND_ID"', "T_FIRST_R3_HTTP_200")
         self.assertIn("`ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`", RUNBOOK)
         commands = "\n".join(BLOCKS)
-        self.assert_order(commands, "mark_phase3 T_R3_STOP_COMMAND",
+        self.assert_order(commands, "routectl_pre prepare-handoff", "phase3-baseline",
+                          "routectl_pre execute-handoff", 'test "$HANDOFF_READY" = HANDOFF_PREPARED_VALIDATED',
+                          "mark_phase3 T_FRONTEND_STOP",
                           'docker_local stop --time 3 "$OLD_FRONTEND_ID"',
-                          "mark_phase3 T_80_443_RELEASED",
+                          "mark_phase3 T_PORTS_FREE",
                           'docker_local network connect --ip 172.30.250.2 "$PROXY_NET" "$EDGE_ID"',
                           'docker_local network connect --ip "$OLD_INGRESS_IP" "$INGRESS_NET" "$EDGE_ID"',
-                          "mark_phase3 T_EDGE_OWNS_PORTS", "mark_phase3 T_TLS_WRITER_READY",
-                          "coproc PHASE3_CAPTURE", "mark_phase3 T_PLAYER_CAPTURE_READY",
-                          "routectl_live recover-ingress", "mark_phase3 T_INGRESS_READY",
-                          "\nfirst_public_200\n", "mark_phase3 T_FIRST_PUBLIC_HTTP_200", "phase3-observe",
+                          "mark_phase3 T_EDGE_OWNS_PORTS", "mark_phase3 T_TLS_READY",
+                          "coproc PHASE3_CAPTURE", 'exec {HANDOFF_IN}>&- {HANDOFF_OUT}<&-',
+                          "mark_phase3 T_PLAYER_CAPTURE_READY", "HANDOFF_BUDGET=$(handoff_budget 30)",
+                          "TRANSFER_AND_CAPTURE_READY", 'wait "$HANDOFF_ROUTING_CHILD"',
+                          'first_public_200 "$PUBLIC_HTTP_BUDGET"', "mark_phase3 T_FIRST_HTTP_200", "phase3-observe",
                           'connect_historical_endpoint "$INGRESS_NET"', 'connect_historical_endpoint "$PROXY_NET"',
                           'docker_local start "$OLD_FRONTEND_ID"', 'test "$(port_bindings "$OLD_FRONTEND_ID")" = "$OLD_PORTS"',
                           '"nc", "-z", "-w", "1", "127.0.0.1", "443"',
                           'first_public_200 "$ROLLBACK_HTTP_BUDGET"', "mark_phase3 T_FIRST_R3_HTTP_200")
-        for forbidden in ("docker compose", "switch-api", "switch-frontend", "apply019", "ssh ",
+        for forbidden in ("docker compose", "switch-api", "switch-frontend", "apply019", "ssh ", "recover-ingress",
                           'docker_local stop "$BACKEND_ID"', 'docker_local stop "$PG_ID"'):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, commands)
@@ -67,7 +69,7 @@ class Phase3RunbookTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertNotIn(command, prestage)
         self.assert_order(handoff, "deployment_phases.py backup", "check_backup(state, payload, verify_bytes=True)",
-                          "phase3-baseline", "T_R3_STOP_COMMAND", "PHASE3_REAL_PLAYER_CONTINUITY_GATE",
+                          "prepare-handoff", "phase3-baseline", "T_FRONTEND_STOP", "PHASE3_REAL_PLAYER_CONTINUITY_GATE",
                           "ALL_BASELINE_CONTINUOUS")
 
     @unittest.skipUnless(bash(), "Bash is required for shell snippet validation")
@@ -77,6 +79,47 @@ class Phase3RunbookTest(unittest.TestCase):
             with self.subTest(block=block.splitlines()[0]):
                 result = subprocess.run([bash(), "-n"], input=block, text=True, capture_output=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(bash(), "Bash is required for command simulation")
+    def test_writer_must_authorize_before_t0_and_wait_for_transfer(self):
+        commands = "\n".join(BLOCKS)
+        start = commands.index("coproc HANDOFF_ROUTING {")
+        stop = commands.index('docker_local stop --time 3 "$OLD_FRONTEND_ID"', start)
+        validate_before_stop = commands[start:stop]
+        for approved in (True, False):
+            with self.subTest(approved=approved):
+                setup = f"set -euo pipefail\nAPPROVED={int(approved)}\n"
+                mocks = r"""
+WORK=/unused
+HANDOFF_PREPARED_SHA256=pin
+HANDOFF_ARGS=(--historical-id exact)
+mark_phase3() { printf '%s\n' "$1"; }
+routectl_pre() {
+  [[ "$*" == 'execute-handoff /unused/handoff-prepared.json pin --historical-id exact' ]]
+  [[ $ROUTECTL_HANDOFF_CHILD == 1 ]]
+  if [[ $APPROVED == 0 ]]; then exit 1; fi
+  printf '%s\n' HANDOFF_PREPARED_VALIDATED
+  IFS= read -r ack
+  [[ $ack == TRANSFER_AND_CAPTURE_READY ]]
+  printf '%s\n' INGRESS_READY
+}
+"""
+                after_stop = r"""
+printf '%s\n' TRANSFER_AND_CAPTURE_READY >&"$HANDOFF_IN"
+exec {HANDOFF_IN}>&-
+IFS= read -r result <&"$HANDOFF_OUT"
+exec {HANDOFF_OUT}<&-
+wait "$HANDOFF_ROUTING_CHILD"
+test "$result" = INGRESS_READY
+"""
+                result = subprocess.run([bash()], input=setup + mocks + validate_before_stop + after_stop,
+                                        text=True, capture_output=True, timeout=15)
+                if approved:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "T_FRONTEND_STOP")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("T_FRONTEND_STOP", result.stdout)
 
     @unittest.skipUnless(bash(), "Bash is required for command simulation")
     def test_first_public_http_rejects_redirect_and_transport_failure(self):

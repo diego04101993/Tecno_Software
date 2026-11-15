@@ -130,7 +130,7 @@ def trusted_headers(docker, http, backend, client_ip, slot=None):
         "Forwarded": f"for={spoof};host=invalid.test;proto=http",
         "X-Forwarded-Host": "invalid.test", "X-Forwarded-Proto": "http",
     }, slot=slot).require(200)
-    tagged = [line for line in docker.run("logs", backend).splitlines() if marker in line]
+    tagged = [line.decode() for line in docker.logs(backend).lines(backend) if marker.encode() in line]
     assert len(tagged) == 1 and re.search(r"\b" + re.escape(client_ip) + r":\d+\s+-\s+", tagged[0])
     assert spoof not in tagged[0]
 

@@ -84,6 +84,11 @@ class LocalDocker:
         value, = json.loads(self.run("inspect", "--type", kind, identity))
         return value
 
+    def logs(self, container, *, since=None, until=None):
+        from docker_logs import collect_docker_logs
+
+        return collect_docker_logs(self.invoke, container, since=since, until=until)
+
     def verify_inputs(self):
         from docker_config import parse_optional_config
 

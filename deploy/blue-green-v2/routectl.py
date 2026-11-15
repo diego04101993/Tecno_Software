@@ -10,6 +10,7 @@ import re
 import socket
 import stat
 from pathlib import Path
+from time import monotonic_ns
 
 from gates import legacy_blue_endpoint, utc, verify_legacy_blue_manifest
 from legacy_frontend_blue import READY_ADOPTION
@@ -267,12 +268,14 @@ class CaddyEdge:
         marker.unlink(missing_ok=True)
         sync_dir(marker.parent)
 
-    def open_ingress(self, config_hash):
+    def open_ingress(self, config_hash, *, before_write=None):
         from edge_boot import validate_ingress_guard
 
         effective, _ = self.effective()
         validate_ingress_guard(effective.config)
         require(effective.hash == self.persisted().hash == config_hash, "STOP_AMBIGUOUS")
+        if before_write is not None:
+            before_write()
         write_private_atomic(self.ingress_marker, (config_hash + "\n").encode(), replace=False)
 
     def ingress_open(self):
@@ -283,6 +286,15 @@ class CaddyEdge:
             return re.fullmatch(rb"[0-9a-f]{64}\n", read_private(marker)) is not None
         except OSError:
             return False
+
+    def require_closed(self):
+        marker = self.ingress_marker
+        require_private(marker.parent, directory=True)
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            return
+        raise Stop("INVALIDATE_HANDOFF_PREPARED_INGRESS")
 
     def boot_token(self):
         return read_private(self.ingress_marker.with_name("boot-id"))
@@ -749,6 +761,57 @@ def _json(path):
     return decode(read_private(path))
 
 
+def _handoff_command(controller, args):
+    from handoff_topology import HandoffTopology
+    from prepared_handoff import PreparedHandoff
+
+    probe = controller.probe
+    topology = HandoffTopology(
+        probe._json, list_running=lambda: probe._run("ps", "-q", "--no-trunc").decode().splitlines(),
+        **{name: getattr(args, name) for name in ("historical_id", "backend_id", "frontend_id", "edge_id",
+                                                 "postgres_id", "proxy_network", "ingress_network", "tls_volume")},
+    )
+    timeline = Path(args.timeline)
+    require_private(timeline.parent, directory=True)
+
+    def mark(event):
+        fd = os.open(timeline, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "ab") as stream:
+            info = os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                    and stat.S_IMODE(info.st_mode) == 0o600, "HANDOFF_TIMELINE_PERMISSIONS")
+            stream.write(canonical({"event": event, "utc": now(), "monotonic_ns": monotonic_ns()}) + b"\n")
+
+    handoff = PreparedHandoff(controller, topology)
+    if args.action == "prepare-handoff":
+        prepared = handoff.prepare(mark=mark)
+        write_private_atomic(args.receipt, canonical(prepared) + b"\n", replace=False)
+        return {"status": "HANDOFF_PREPARED", "sha256": prepared["sha256"]}
+
+    deadline = None
+
+    def ensure_budget():
+        require(deadline is not None and monotonic_ns() < deadline, "HANDOFF_DOWNTIME_LIMIT_EXCEEDED")
+
+    def await_transfer():
+        # The trusted caller moves the existing containers and retains the
+        # Player capture pipe. It receives permission only after revalidation.
+        import sys
+
+        nonlocal deadline
+        print("HANDOFF_PREPARED_VALIDATED", flush=True)
+        require(sys.stdin.buffer.readline(64) == b"TRANSFER_AND_CAPTURE_READY\n", "HANDOFF_TRANSFER_NOT_CONFIRMED")
+        entries = (decode(entry) for entry in read_private(timeline).splitlines())
+        stops = [entry["monotonic_ns"] for entry in entries if entry["event"] == "T_FRONTEND_STOP"]
+        require(len(stops) == 1 and type(stops[0]) is int and 0 < stops[0] <= monotonic_ns(),
+                "HANDOFF_TIMELINE_INVALID")
+        deadline = stops[0] + 30_000_000_000
+        ensure_budget()
+
+    return handoff.execute(_json(args.receipt), expected_sha256=args.sha256,
+                           move=await_transfer, mark=mark, ensure_budget=ensure_budget)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", required=True)
@@ -768,6 +831,14 @@ def main():
     initialize.add_argument("baseline_hash")
     initialize.add_argument("--sealed-config", required=True)
     subparsers.add_parser("preview").add_argument("sealed_config")
+    for action in ("prepare-handoff", "execute-handoff"):
+        handoff = subparsers.add_parser(action)
+        handoff.add_argument("receipt")
+        if action == "execute-handoff":
+            handoff.add_argument("sha256")
+        for option in ("historical-id", "backend-id", "frontend-id", "edge-id", "postgres-id",
+                       "proxy-network", "ingress-network", "tls-volume", "timeline"):
+            handoff.add_argument("--" + option, required=True)
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("slot", choices=SLOTS)
     prepare.add_argument("release")
@@ -808,6 +879,8 @@ def main():
                                                       _json(args.receipts), args.baseline_hash)
         elif action == "preview":
             result = ColdStart(controller).preview(_json(args.sealed_config))
+        elif action in ("prepare-handoff", "execute-handoff"):
+            result = _handoff_command(controller, args)
         elif action == "recover-ingress":
             result = ColdStart(controller).recover()
         elif action == "close-ingress":
@@ -827,7 +900,7 @@ def main():
             result = getattr(controller, action.replace("-", "_"))(args.slot)
         else:
             result = getattr(controller, action)()
-        print(json.dumps(result, indent=2, sort_keys=True))
+        print(json.dumps(result, indent=None if action == "execute-handoff" else 2, sort_keys=True))
     except (Stop, OSError, ValueError) as exc:
         # Never expose exception bodies from Docker, the admin socket or input files.
         print(str(exc) if isinstance(exc, Stop) else "ROUTECTL_LOCAL_IO_OR_INPUT_FAILED", file=os.sys.stderr)

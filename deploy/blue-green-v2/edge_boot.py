@@ -66,10 +66,12 @@ class ColdStart:
         require(baseline.generation == 0 and baseline.active == BLUE_PAIR, "BASELINE_CONFIG_MISMATCH")
         return baseline
 
-    def _load(self, config, etag):
+    def _load(self, config, etag, *, on_patch=None):
         status = self.edge.patch(config, etag)
         require(status != 412, "EDGE_ETAG_COLLISION")
         require(200 <= status < 300, "EDGE_BOOT_LOAD_REJECTED")
+        if on_patch is not None:
+            on_patch()
         effective, new_etag = self.edge.raw_effective()
         require(effective == config, "EDGE_BOOT_EFFECTIVE_MISMATCH")
         return new_etag
@@ -109,6 +111,11 @@ class ColdStart:
         try:
             raw = self.edge.read_autosave()
         except FileNotFoundError:
+            return None
+        return self._parse_autosave(raw)
+
+    def _parse_autosave(self, raw):
+        if raw is None:
             return None
         try:
             saved = decode(raw)

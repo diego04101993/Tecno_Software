@@ -25,6 +25,9 @@ def run():
         print("{}")
     elif request["method"] == "INGRESS_STATUS":
         print(json.dumps({"open": edge.ingress_open()}))
+    elif request["method"] == "INGRESS_REQUIRE_CLOSED":
+        edge.require_closed()
+        print("{}")
     else:
         status, etag, raw = edge.request(request["method"], request["etag"], request["config"])
         print(json.dumps({"status": status, "etag": etag, "body": base64.b64encode(raw).decode()}))
