@@ -132,6 +132,19 @@ class ReceiptTests(unittest.TestCase):
         payload["checks"]["dual_slot_capacity"] = 1
         self.assertFalse(gate(sign_receipt("READY", payload, KEY), self.context))
 
+    def test_phase4_green_requires_all_three_sealed_product_contracts(self):
+        gate = ReadyGate(KEY, NOW)
+        for contract in ("windows_legacy", "android_normal", "android_node_slice"):
+            with self.subTest(contract=contract):
+                payload = self.ready()
+                del payload["checks"]["contracts"][contract]
+                self.assertFalse(gate(sign_receipt("READY", payload, KEY), self.context))
+        payload = self.ready()
+        del payload["checks"]["contracts"]
+        payload["checks"].update(phase3_product_contracts="UNCHANGED_PRODUCT_NOT_REQUALIFIED",
+                                 phase3_real_player_continuity_gate="REQUIRED_AFTER_HANDOFF")
+        self.assertFalse(gate(sign_receipt("READY", payload, KEY), self.context))
+
     def test_readiness_not_reusable_across_processes_or_with_forged_signature(self):
         receipt = sign_receipt("READY", self.ready(), KEY)
         gate = ReadyGate(KEY, NOW)

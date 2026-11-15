@@ -10,6 +10,8 @@ import re
 import subprocess
 import sys
 
+from docker_config import parse_optional_config
+from docker_mounts import canonicalize_mounts, mount_evidence
 from gates import BACKEND_ARGV, REVISION_LABEL, TREE_LABEL, hex_digest, utc
 from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT, classify_historical, historical_evidence, verify_manifest
 from release_state import Stop, decode, digest, read_private, require, validate_release
@@ -41,7 +43,7 @@ def runtime_snapshot(container):
             "started_at": state["StartedAt"], "restart_count": container["RestartCount"],
             "oom_killed": state["OOMKilled"], "health": (state.get("Health") or {}).get("Status"),
             "container_config_sha256": digest(container["Config"]), "host_config_sha256": digest(container["HostConfig"]),
-            "mounts_sha256": digest(container["Mounts"]),
+            "mounts_sha256": digest(canonicalize_mounts(container["Mounts"])),
             "networks_sha256": digest(container["NetworkSettings"]["Networks"])}
 
 
@@ -73,10 +75,12 @@ def qualify_role(role, release, expected_container, before, after, image, raw_ar
                 and final["Image"] == after["Image"] and final["Path"] == after["Path"]
                 and final["Args"] == after["Args"], "R3_RUNTIME_IDENTITY_CHANGED_OR_UNHEALTHY")
 
-    config = image["Config"]
+    config = image.get("Config")
     container_config = after["Config"]
-    labels = config.get("Labels") or {}
-    container_labels = container_config.get("Labels") or {}
+    image_options = parse_optional_config(config)
+    container_options = parse_optional_config(container_config)
+    labels = image_options["Labels"]
+    container_labels = container_options["Labels"]
     require(container_labels.get("com.docker.compose.project") == "tecnocontrol"
             and container_labels.get("com.docker.compose.service") == service, "R3_COMPOSE_IDENTITY_MISMATCH")
     for key, field in ((REVISION_LABEL, "revision"), (TREE_LABEL, "tree")):
@@ -102,8 +106,8 @@ def qualify_role(role, release, expected_container, before, after, image, raw_ar
     image_commands = [command]
     if role == "api":
         image_commands.extend([command[:-2], [command[0], "app.main", *command[2:-2]]])
-    require(config.get("Entrypoint") in (None, []) and config["Cmd"] in image_commands
-            and container_config.get("Entrypoint") in (None, []) and container_config["Cmd"] == command
+    require(image_options["Entrypoint"] == [] and image_options["Cmd"] in image_commands
+            and container_options["Entrypoint"] == [] and container_options["Cmd"] == command
             and [after["Path"], *after["Args"]] == command, "R3_COMMAND_MISMATCH")
     if role == "api" and raw_argv[:2] in (["/usr/local/bin/python", "/usr/local/bin/uvicorn"],
                                          ["/usr/local/bin/python3.12", "/usr/local/bin/uvicorn"]):
@@ -112,14 +116,16 @@ def qualify_role(role, release, expected_container, before, after, image, raw_ar
     if role == "frontend":
         require(hashlib.sha256(caddyfile).hexdigest() == R3_CADDYFILE_SHA256, "R3_CADDYFILE_MISMATCH")
         runtime["historical_caddyfile_sha256"] = R3_CADDYFILE_SHA256
+    mounts = {"before": mount_evidence(before["Mounts"]), "after": mount_evidence(after["Mounts"])}
     result = {"image_id": image["Id"], "os": image["Os"], "architecture": image["Architecture"],
             "repo_digests": sorted(repo_digests), "container_image_reference": image_reference,
             "image_oci_revision": labels.get(REVISION_LABEL), "image_oci_tree": labels.get(TREE_LABEL),
             "image_labels_sha256": digest(labels), "image_config_sha256": digest(config),
-            "entrypoint": config.get("Entrypoint"), "cmd": config["Cmd"], "rootfs_layers": rootfs["Layers"],
+            "entrypoint": config.get("Entrypoint"), "cmd": image_options["Cmd"], "rootfs_layers": rootfs["Layers"],
             "runtime_command": command, "compose_project": "tecnocontrol", "compose_service": service,
-            "runtime": runtime}
+            "runtime": runtime, "mount_evidence": mounts}
     if legacy:
+        mounts["final"] = mount_evidence(final["Mounts"])
         result.update(frontend_classifier=LEGACY_FRONTEND_IMAGE_EXACT,
                       provenance="PASS_LEGACY_MANIFEST", legacy_frontend_manifest_sha256=legacy_frontend_sha256,
                       frontend_blue_feasibility="PASS", frontend_blue_create_image_id=image["Id"])
@@ -231,7 +237,7 @@ def main(argv=None):
     except (Stop, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         print(str(exc) if isinstance(exc, Stop) else "R3_QUALIFICATION_INPUT_OR_INSPECTION_INVALID", file=sys.stderr)
         return 1
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2))
     return 0
 
 

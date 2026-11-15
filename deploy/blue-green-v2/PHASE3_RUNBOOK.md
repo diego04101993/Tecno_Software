@@ -1,10 +1,10 @@
-# Phase 3 de Blue-Green V2.2
+# Phase 3 de Blue-Green V2.5
 
-**Plan de operación para una autorización posterior.** Prepararlo o aprobar V2.2 localmente no autoriza acceso, transferencia ni ejecución en producción. Phase 3 termina con `ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`. El backend R3 conserva su contenedor y redes. El frontend BLUE sirve la imagen R3 exacta. El frontend histórico se conserva para reversión. Phase 4 y Videowall GREEN quedan fuera de esta intervención.
+**El pre-stage y el handoff requieren autorizaciones separadas.** El pre-stage termina en `READY_FOR_DOWNTIME_WINDOW=YES` con Edge cerrado. Sólo el handoff autorizado puede trasladar 80/443, la escritura TLS o la IP de confianza. Phase 3 termina con `ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`. El backend R3 conserva su contenedor y redes. El frontend BLUE sirve la imagen R3 exacta. El frontend histórico se conserva para reversión. Phase 4 y Videowall GREEN quedan fuera de esta intervención.
 
 ## 1. Precheck y calificación de imágenes en solo lectura
 
-Verificar el paquete V2.2 y su hash aprobado en un directorio de tooling separado de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
+Verificar los hashes aprobados del tooling V2.5. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.5`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
 
 Registrar el ID y la configuración completa del frontend histórico, sus dos redes, IDs de red, aliases, IPs y todos los `HostIp/HostPort` publicados. Fijar el backend y los volúmenes `tecnocontrol_backend_uploads`, `tecnocontrol_caddy_data`, `tecnocontrol_caddy_config` y `tecnocontrol_postgres_data`. La identidad de proxy observada debe seguir siendo `172.30.250.2`. Medir el endpoint privado del backend desde Docker, con expectativa histórica `172.30.250.3:8000`, y exigir que sólo ese contenedor lo posea. No confiar en una IP histórica que discrepe de la medición. Conservar el frontend histórico, los manifests y los recursos de reversión intactos.
 
@@ -43,10 +43,13 @@ test ! -L /opt/tecnocontrol/backup_pre_013_20260904_182804.dump
 sha256sum /opt/tecnocontrol/backup_pre_013_20260904_182804.dump > "$WORK/r3-dump-sha256.txt"
 /usr/bin/python3 -B "$TOOL/qualify_r3.py" \
   --approved-release "$R3_RELEASE" --backend-id "$BACKEND_ID" --frontend-id "$OLD_FRONTEND_ID" \
+  --legacy-frontend-manifest "$LEGACY_FRONTEND_MANIFEST" --legacy-frontend-sha256 "$LEGACY_FRONTEND_PIN" \
   > "$WORK/r3-qualification.json"
 ```
 
-Esperar `R3_EXACT_IMAGE_QUALIFICATION`, `PASS`. Backend esperado `sha256:951cd0b55ce3b461c361cb9b9d83c29d08e32f938cff4eefbbfb842f58ab0832`. Frontend esperado `sha256:b2a1ae4a8515e9d1db4cb14744bba356311317c819a3a16b37c791d0257e905a`. El comando vuelve a leer los dos IDs vivos y registra `RepoDigests` si existen, labels OCI, plataforma, `Entrypoint`, `Cmd`, capas `RootFS`, referencia del contenedor, hashes de configuración y runtime. No imprime env values. El frontend privado requiere los labels OCI `org.opencontainers.image.revision` e `io.tecnocontrol.git.tree` que coincidan con el pin de release. Si los labels, la provenance, el `Cmd` vivo, el Caddyfile o cualquiera de los IDs no califican, **STOP antes del handoff**. El comando de backend esperado del guard incluye `app.main:app`, un worker y `--lifespan off`. Cualquier diferencia requiere revisión, sin corregirla recreando el backend. La ausencia de las imágenes R3 exactas en QA local no reemplaza esta etapa productiva.
+Esperar `R3_EXACT_IMAGE_QUALIFICATION`, `PASS`. Backend esperado `sha256:951cd0b55ce3b461c361cb9b9d83c29d08e32f938cff4eefbbfb842f58ab0832`. Frontend esperado `sha256:b2a1ae4a8515e9d1db4cb14744bba356311317c819a3a16b37c791d0257e905a`. El comando vuelve a leer los dos IDs vivos y registra `RepoDigests` si existen, labels OCI, plataforma, `Entrypoint`, `Cmd`, capas `RootFS`, referencia del contenedor, hashes de configuración y runtime. No imprime env values. El frontend nativo requiere los labels OCI `org.opencontainers.image.revision` e `io.tecnocontrol.git.tree` que coincidan con el pin de release. Para esta adopción inicial del frontend histórico, fijar `LEGACY_FRONTEND_MANIFEST` y el pin del payload `LEGACY_FRONTEND_PIN` a la aprobación independiente. El manifiesto verifica imagen, bytes estáticos, frontend histórico y contrato privado, incluidos los labels si existen. Cualquier label contradictorio, diferencia de provenance, `Cmd` vivo, Caddyfile o ID implica **STOP**. El comando de backend esperado del guard incluye `app.main:app`, un worker y `--lifespan off`. Cualquier diferencia requiere revisión, sin corregirla recreando el backend. La ausencia de las imágenes R3 exactas en QA local no reemplaza esta etapa productiva.
+
+Antes de preparar infraestructura, inspeccionar el frontend R3 exacto al menos 20 veces consecutivas en sólo lectura. Conservar en evidencia privada `raw_mounts`, `canonical_mounts` y `canonical_mounts_sha256`, además del orden observado por destino en cada muestra. Exigir el mismo hash canónico que el pin histórico y repetir la calificación del frontend. El orden exterior de `Mounts` puede variar. Todos los campos y tipos JSON de cada objeto se comparan completos y dos destinos iguales producen `DUPLICATE_MOUNT_DESTINATION`. Conservar el JSON de calificación con su evidencia por inspección y los archivos privados `legacy-blue-manifest.mounts.json` y `blue-ready.mounts.json`. Los manifiestos sellados y los recibos de READY mantienen su formato.
 
 Calificar en solo lectura cualquier MAC que se vaya a declarar como generada por Docker. Para el backend, tomar del contenedor exacto los labels `com.docker.compose.project.working_dir`, `com.docker.compose.project.config_files` y, cuando exista, `com.docker.compose.project.environment_file`. Usar el directorio histórico, los archivos en su orden y el entorno de creación aprobado para resolver `docker compose --project-name tecnocontrol --project-directory "$COMPOSE_WORKDIR" … config --format json`. El directorio Git sigue siendo `/opt/tecnocontrol`. Comprobar los hashes de los overlays y env contra la evidencia aprobada. Inspeccionar el JSON en memoria y conservar sólo hashes, nombres de red y el dictamen sobre MAC. No guardar ni mostrar el JSON completo, ya que puede contener credenciales.
 
@@ -54,11 +57,13 @@ Para cada endpoint que se pretenda declarar generado, cotejar el nombre de red e
 
 Docker puede regenerar una MAC asignada por el bridge al recrear el endpoint. La API de inspección no expone por separado la MAC configurada de cada endpoint en ejecución. [Implementación de bridge en Moby 29.6.0](https://github.com/moby/moby/blob/docker-v29.6.0/daemon/libnetwork/drivers/bridge/bridge_linux.go#L1101-L1111), [contrato de inspección de Moby](https://github.com/moby/moby/pull/51203).
 
-## 2. Evidencia protegida y backup antes de crear Edge
+## 2. Evidencia protegida y verificaciones de sólo lectura
 
 Conservar `WORK/r3-qualification.json`, modo `0600`. Nunca reutilizar un STATE anterior. Registrar las definiciones de red, nombres/IDs de contenedores y configuración efectiva aprobada, con secretos excluidos. Mantener una referencia al snapshot DigitalOcean aprobado y a los backups y recibos previos. No sobrescribir o limpiar esos artefactos. El snapshot y los backups se conservan para recuperación excepcional. La reversión de esta intervención actúa sobre el ingreso.
 
-Usar exclusivamente `preflight` y `backup` del paquete OBS6.4 sellado aprobado, con `BACKUP_STATE` nuevo y absoluto. El SHA-256 local de su `SHA256SUMS` es `17d5d403305a0aaf734a8365d355b07a57e12da62c0826fb7dba543842336d5d`. Fijar `OBS64_SHA256SUMS_SHA256` a la aprobación independiente y verificarla antes de invocar el paquete. Estas fases validan R3/PG, disco, consistencia DB/media y el dump usando un descriptor fresco para cada operación. Conservar el recibo privado `backup-pass.json` y hashes, revisar su vigencia antes del handoff. Si el paquete o la verificación no están disponibles, STOP. `candidate`, `apply019`, `verify019` de la cadena de deployment y `cutover` quedan fuera de Phase 3. El índice se comprueba con la función read-only independiente `verify_index`, que vuelve a verificar PostgreSQL y el índice después de ejecutar el SQL sellado.
+Preservar el backup y los recibos anteriores como evidencia. El pre-stage califica en sólo lectura R3, esquema y media y no crea un backup completo. La sección 4 exige un backup fresco para el handoff autorizado.
+
+Verificar el paquete OBS6.4 sellado aprobado antes de invocar su verificador. Su `SHA256SUMS` tiene SHA-256 aprobado `17d5d403305a0aaf734a8365d355b07a57e12da62c0826fb7dba543842336d5d`. Fijar `OBS64_SHA256SUMS_SHA256` a esa aprobación. Si el paquete o la verificación no están disponibles, STOP. `candidate`, `apply019`, `verify019` de la cadena de deployment y `cutover` quedan fuera de Phase 3. La función independiente `verify_index` comprueba índice y PostgreSQL en sólo lectura antes y después del SQL sellado.
 
 ```sh
 (
@@ -76,8 +81,6 @@ from deployment_phases import verify_index
 
 print(json.dumps(verify_index(package), sort_keys=True))
 PY
-  /usr/bin/python3 -I -B deployment_phases.py preflight "$BACKUP_STATE"
-  /usr/bin/python3 -I -B deployment_phases.py backup "$BACKUP_STATE"
 )
 ```
 
@@ -87,14 +90,14 @@ Medir huella actual sin carga artificial. Registrar RAM y CPU del host, conexion
 
 Mantener el frontend histórico atendiendo 80/443 durante todo este apartado. Preparar `EDGE_CFG` y `EDGE_RUN` separados del `/config` histórico, propiedad root `0700`, con `EDGE_CFG/caddy` también `0700`. Los mounts aprobados de Edge son `/config` propio, `/run/bgv2` privado y los dos archivos de bootstrap en solo lectura. Montar el TLS persistente de R3 en `/data`. No seleccionar ese storage en la configuración privada. La función `preview_config()` utiliza sólo `/config/preview-tls` con CA local desechable, sin servidores públicos ni escritura en el TLS histórico. Verificar fingerprints de certificados existentes por medio del antiguo propietario y conservar la huella antes de transferir. La configuración pública usa la política TLS aprobada y el storage persistente `/data`, sin `tls internal`. Comparar ambos dominios y la cadena pública antes de detener R3. Fijar `BACKEND_PROXY_IP` al valor leído de `NetworkSettings.Networks` del backend exacto, `PROXY_NET` e `INGRESS_NET` a los dos nombres de red verificados y `TLS_DATA_VOLUME` al nombre de volumen observado. Registrar el ID y los aliases de cada endpoint histórico para poder restaurarlo.
 
-Crear `frontend-blue` sólo desde `$R3_FRONTEND_IMAGE`, el ID completo calificado, con los labels V2 requeridos, IP privada verificada libre y alias exclusivo. Permanece vivo hasta el final. `R3_FRONTEND_IMAGE` se obtiene del resultado PASS, nunca de `latest`. `EDGE_IMAGE` se fija a la imagen Caddy 2.11.4 sellada, local y aprobada. Las rutas de frontend son `/srv` con `Caddyfile.slot`, `admin off`, tmpfs de sólo lectura para `/data` y `/config`, sin publish ni red de base de datos.
+Crear `frontend-blue` sólo desde `$R3_FRONTEND_IMAGE`, el ID completo calificado, con los labels V2 requeridos, IP privada verificada libre y alias exclusivo. Permanece vivo hasta el final. `R3_FRONTEND_IMAGE` se obtiene del resultado PASS, nunca de `latest`. `EDGE_IMAGE` se fija a la imagen Caddy 2.11.4 sellada, local y aprobada. Las rutas de frontend son `/srv` con `Caddyfile.slot`, `admin off`, tmpfs de sólo lectura para `/data` y `/config`, sin publish ni red de base de datos. Para el manifiesto legacy ya sellado, fijar `SLOT_CADDYFILE` a su `slot_caddyfile_source`, `/opt/tecnocontrol-bgv2/v2.3/Caddyfile.slot`. Instalar allí únicamente los bytes versionados de `$TOOL/Caddyfile.slot` cuando el archivo esté ausente. Exigir archivo regular de root modo `0444`, sin enlaces simbólicos, y cotejar el SHA-256 exacto con el manifiesto antes de montar. Conservar el manifiesto y el pin tal como fueron aprobados y detenerse ante un archivo existente distinto. La calificación nativa usa `$TOOL/Caddyfile.slot`.
 
 ```sh
 docker_local create --pull=never --name "$FRONTEND_BLUE_NAME" --restart unless-stopped \
   --network "$PROXY_NET" --ip "$FRONTEND_BLUE_IP" --network-alias frontend-blue \
   --label io.tecnocontrol.bgv2.slot=BLUE --label io.tecnocontrol.bgv2.role=frontend \
   --tmpfs /config:ro --tmpfs /data:ro \
-  --mount "type=bind,source=$TOOL/Caddyfile.slot,target=/etc/caddy/Caddyfile.bgv2,readonly" \
+  --mount "type=bind,source=$SLOT_CADDYFILE,target=/etc/caddy/Caddyfile.bgv2,readonly" \
   --health-cmd 'nc -z -w 2 127.0.0.1 80' --health-interval 5s --health-timeout 3s \
   --health-start-period 5s --health-retries 6 "$R3_FRONTEND_IMAGE" \
   caddy run --config /etc/caddy/Caddyfile.bgv2 --adapter caddyfile
@@ -118,12 +121,12 @@ EDGE_ID=$(docker_local create --pull=never --name "$EDGE_NAME" --restart unless-
 docker_local start "$EDGE_ID"
 ```
 
-El supervisor host sigue detenido en la preparación. Capturar la adopción legacy con el nombre del frontend histórico como único peer de confianza de `.2`, `postgres_id` igual a `PG_ID` en `api:BLUE` y el backend exacto como endpoint. `BINDINGS` es privado, con las dos entradas `api:BLUE` y `frontend:BLUE`. Cada una lleva `name`, `network`, `ip`, `upstream`, `image_id`, `revision` y `tree`. La API lleva también `proxy_ip`, `uploads_volume` y `postgres_id`. El frontend lleva `frontend_config_sha256` del archivo `Caddyfile.slot`. Mantener `LEGACY_PIN` como el SHA256 del payload del manifiesto, revisado y aprobado por un canal separado. El SHA de los bytes del fichero puede registrarse por separado. La fase de handoff nunca reconecta el backend.
+El supervisor host sigue detenido en la preparación. Capturar la adopción legacy con el nombre del frontend histórico como único peer de confianza de `.2`, `postgres_id` igual a `PG_ID` en `api:BLUE` y el backend exacto como endpoint. `BINDINGS` es privado, con las dos entradas `api:BLUE` y `frontend:BLUE`. Cada una lleva `name`, `network`, `ip`, `upstream`, `image_id`, `revision` y `tree`. La API lleva también `proxy_ip`, `uploads_volume` y `postgres_id`. El frontend lleva `frontend_config_sha256` del archivo `Caddyfile.slot` y, para esta adopción, `legacy_frontend_adoption` con el objeto `manifest` íntegro y su pin `sha256`. Preparar `BACKEND_BINDINGS` privado con la misma entrada `api:BLUE` que el definitivo. La captura inicial del backend usa ese archivo porque todavía no tiene el pin backend que exige el binding del frontend legacy. Mantener `LEGACY_PIN` como el SHA-256 del payload del manifiesto de backend, revisado y aprobado por un canal separado. El SHA de los bytes del fichero puede registrarse por separado. La fase de handoff nunca reconecta el backend.
 
 `generated_mac_networks` es opcional por rol. Contiene una lista JSON ordenada y sin duplicados con los nombres Docker exactos de las redes cuya MAC generada quedó demostrada. En `api:BLUE`, incluir sólo los endpoints aprobados en el precheck. En `frontend:BLUE`, el único nombre elegible es el de `$PROXY_NET`, si la creación y conexión aprobadas arriba se ejecutaron sin una opción MAC. Omitir el campo si la lista queda vacía. Fijar esas listas antes de capturar el manifiesto y confirmar BLUE/BLUE. La identidad estable vincula la lista y mantiene el resto de los campos de cada red. La época conserva también la MAC operativa observada. Así, con el mismo boot una MAC cambiada sigue siendo deriva y después de un reboot sólo se puede readmitir una MAC regenerada para un endpoint aprobado expresamente. Una MAC fija permanece fijada al valor original.
 
 ```sh
-/usr/bin/python3 -B "$TOOL/legacy_blue.py" --bindings "$BINDINGS" \
+/usr/bin/python3 -B "$TOOL/legacy_blue.py" --bindings "$BACKEND_BINDINGS" \
   --trusted-proxy-name "$OLD_FRONTEND_NAME" --project tecnocontrol \
   --manifest "$WORK/legacy-blue-manifest.json"
 ```
@@ -163,7 +166,7 @@ routectl_live() { routectl_as "$EDGE_NAME" "$@"; }
 routectl_pre preview "$WORK/sealed-edge.json"
 ```
 
-Verificar Host/SNI privados a través del mismo Edge y de la CA de `/config/preview-tls`. La IP temporal del Edge no amplía `FORWARDED_ALLOW_IPS`. Antes del handoff comprobar la política de sanitización del proxy y que el antiguo propietario mantiene la identidad de confianza. En la primera validación pública comprobar el cliente real mediante el nuevo propietario `.2`. Seleccionar en PostgreSQL mediante transacción read-only uno o más canales normales, modo de dispositivo SINGLE, una salida habilitada, fuera de videowall y sin autoridad `hardware-single-input`. Escribir sólo los UUID en `channels.json` privado y no incluirlos en recibos finales. `reviewed-checks.json` fija `qualification_sha256` (SHA256 de JSON canónico), `schema_unchanged=true`, `media_unchanged=true`, `phase3_infra_capacity=true`, `pool=ISOLATED_NOT_APPLICABLE` y `contracts` con `windows_legacy=true`, `android_normal=true`. Cada valor se sustenta con el backup/precheck o la evidencia aprobada de plataforma existente de la release R3 exacta. Si falta esa evidencia, STOP. No requerir node-slice ni instrumentar el pool productivo.
+Verificar Host/SNI privados a través del mismo Edge y de la CA de `/config/preview-tls`. La IP temporal del Edge no amplía `FORWARDED_ALLOW_IPS`. Antes del handoff comprobar la política de sanitización del proxy y que el antiguo propietario mantiene la identidad de confianza. En la primera validación pública comprobar el cliente real mediante el nuevo propietario `.2`. Seleccionar en PostgreSQL mediante transacción read-only uno o más canales normales, modo de dispositivo SINGLE, una salida habilitada, fuera de videowall y sin autoridad `hardware-single-input`. Escribir sólo los UUID en `channels.json` privado y no incluirlos en recibos finales. `reviewed-checks.json` fija `qualification_sha256` (SHA-256 de JSON canónico), `schema_unchanged=true`, `media_unchanged=true`, `phase3_infra_capacity=true` y `pool=ISOLATED_NOT_APPLICABLE`. Sustentar esquema, media y capacidad con el precheck de sólo lectura. Fijar también `phase3_product_contracts="UNCHANGED_PRODUCT_NOT_REQUALIFIED"` y `phase3_real_player_continuity_gate="REQUIRED_AFTER_HANDOFF"`. La política `PHASE3_PRODUCT_CONTRACTS=UNCHANGED_PRODUCT_NOT_REQUALIFIED` aplica exclusivamente al R3 exacto que conserva imagen, código de API y proceso. Cualquier cambio de imagen del backend bloquea esta adopción. La evidencia histórica de Windows y Android queda informativa. Phase 4 exige los contratos sellados Windows legacy, Android normal y Android node_slice/Videowall antes de promover GREEN.
 
 ```sh
 /usr/bin/python3 -B "$TOOL/phase3_ready.py" \
@@ -176,9 +179,9 @@ routectl_pre initialize "$R3_RELEASE" "$WORK/blue-ready.json" "$GEN0_SHA256" \
   --sealed-config "$WORK/sealed-edge.json" > "$WORK/blue-committed-closed.json"
 ```
 
-El signer abre un prompt oculto para un JWT administrativo existente. No pegarlo en shell, logs ni archivos. Verifica API privada, `/api/channels/` ≤3.000 s, runtime 36+16 con cuatro clientes y timeout 10 s, frontend un GET raíz, assets y estabilidad de ambos procesos. No genera login ni tráfico Player. `initialize` confirma generación 0 `BLUE/BLUE` con ingreso cerrado. Probar que el público sigue en R3, el TLS histórico mantiene su huella y ningún listener público de Edge acepta la aplicación. Registrar `T_BLUE_BLUE_COMMITTED` ahora, fuera de la ventana de indisponibilidad. Revalidar backup y evidencia de reversión. Autorizar la entrada a ventana sólo cuando los 10 ensayos y las 10 reversiones estén calificados con máximos ≤30 s.
+El signer abre un prompt oculto para un JWT administrativo existente. No pegarlo en shell, logs ni archivos. Verifica API privada, `/api/channels/` ≤3.000 s, runtime 36+16 con cuatro clientes y timeout 10 s, frontend un GET raíz, assets y estabilidad de ambos procesos. No genera login ni tráfico Player. `initialize` confirma generación 0 `BLUE/BLUE` con ingreso cerrado. Probar que el público sigue en R3, el TLS histórico mantiene su huella y ningún listener público de Edge acepta la aplicación. Registrar `T_BLUE_BLUE_COMMITTED` ahora, fuera de la ventana de indisponibilidad. Revalidar la evidencia de reversión. La entrada a la ventana requiere los 10 ensayos y las 10 reversiones calificados con máximos ≤30 s.
 
-Tomar baseline poco antes de detener el histórico. El recibo liga el PostgreSQL y backend exactos y la generación 0. El controlador de observación inicia el colector antes de habilitar ingreso para observar los SYN. El colector está aislado en el namespace de Edge con filtro bloqueado por IP/puerto, permisos mínimos y un pipe privado, sin log ni spool del contenido. Durante el intercambio de red Edge recibe una interfaz/epoch de endpoint nueva. El padre debe arrancar o vincular el colector al endpoint `.2` final y comprobar su señal `ready` antes de abrir el marcador. Si eso no puede sostener el máximo calificado, STOP y revertir. Mantener esta preparación acotada y no fabricar tráfico de prueba. [Operación del observador](PLAYER_OBSERVER.md)
+Preparar el colector con permisos mínimos y comprobar su entorno en el namespace de Edge. El filtro se armará en el endpoint final `.2` durante el handoff autorizado. Conservar la preparación dentro de la vida del colector y comprobar otra vez su disponibilidad antes de la ventana. El pre-stage no captura un baseline, no abre una ventana de observación y no genera tráfico Player. [Operación del observador](PLAYER_OBSERVER.md)
 
 ```sh
 # Imagen Python ya cacheada y calificada localmente. El backend R3 es apto
@@ -190,15 +193,52 @@ COLLECTOR_ID=$(docker_local create --pull=never --name "$COLLECTOR_NAME" \
   --entrypoint /bin/sh "$CAPTURE_IMAGE" -ec 'exec sleep 900')
 docker_local start "$COLLECTOR_ID"
 docker_local exec "$COLLECTOR_ID" python -I -B -c 'import fcntl, socket, struct'
+```
+
+Cerrar el pre-stage con R3 sano, frontend histórico como dueño de 80/443 y escritor TLS, Edge con `INGRESS_READY=NO`, smokes privados en PASS, colector preparado y capacidad aprobada. Registrar `READY_FOR_DOWNTIME_WINDOW=YES` en un recibo privado y STOP. Guardar las identidades y la evidencia de reversión para la autorización posterior.
+
+## 4. Ventana de traspaso con autorización independiente
+
+Antes del handoff autorizado, crear un backup fresco bajo un `BACKUP_STATE` absoluto y nuevo con las fases `preflight` y `backup` del paquete OBS6.4 sellado. El paquete valida R3 y PostgreSQL, espacio y consistencia de la copia de DB/media. Conserva `backup-pass.json` privado, confirma PGDMP y TOC con descriptores frescos y registra hashes. Si ese recibo no existe, no pertenece al nuevo intento o no supera la validación de actualidad e integridad, STOP. El backup previo permanece preservado.
+
+```sh
+(
+  cd "$OBS64_BACKUP_TOOL"
+  printf '%s  SHA256SUMS\n' "$OBS64_SHA256SUMS_SHA256" | sha256sum -c -
+  sha256sum -c SHA256SUMS
+  /usr/bin/python3 -I -B deployment_phases.py preflight "$BACKUP_STATE"
+  /usr/bin/python3 -I -B deployment_phases.py backup "$BACKUP_STATE"
+  /usr/bin/python3 -I -B - "$BACKUP_STATE" <<'PY' > "$WORK/handoff-backup-check.json"
+import json
+from pathlib import Path
+import sys
+
+package = Path.cwd()
+sys.path.insert(0, str(package))
+from deployment_phases import check_backup, require_baseline
+from release_guard import load_release, open_state, read_receipt
+
+release = load_release(package)
+state = open_state(sys.argv[1], release)
+payload = read_receipt(state, "backup")
+require_baseline(state, release, read_receipt(state, "preflight"))
+check_backup(state, payload, verify_bytes=True)
+print(json.dumps({"database_sha256": payload["database_archive"]["sha256"],
+                  "media_sha256": payload["media_archive"]["sha256"]}, sort_keys=True))
+PY
+)
+```
+
+Después de verificar el backup y justo antes de detener el histórico, capturar `BASELINE_ACTIVE` fresco mediante `player_devices.id`. El recibo liga PostgreSQL y el backend exactos a generación 0. Arrancar la captura en el endpoint final dentro del namespace de Edge con filtro bloqueado por IP/puerto, permisos mínimos y un pipe privado. El colector debe emitir `ready` antes de abrir ingreso. Si se supera el presupuesto de handoff, revertir.
+
+```sh
 /usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
   --postgres-id "$PG_ID" --key "$KEY_FILE" --receipt "$WORK/phase3-baseline.json" phase3-baseline
 ```
 
-## 4. Ventana de traspaso
-
 El único cambio de dueño es frontend histórico → Edge. Mantener backend, PostgreSQL, uploads, frontend-blue y el proceso Edge ya validado. Congelar los comandos en la intervención y registrar eventos UTC y monotónicos. Si falta una comprobación o excede el presupuesto de 30 s hasta el primer HTTP válido, pasar inmediatamente a la sección 6. No ocultar fallos ni recalcular el inicio. No ejecutar `compose up`, `restart` de Edge ni ningún smoke largo dentro de la ventana.
 
-1. Confirmar identidad histórica final y registrar `T_R3_STOP_COMMAND` justo antes de `docker_local stop --time 3 "$OLD_FRONTEND_ID"`. El supervisor V2.2 aún está detenido.
+1. Confirmar identidad histórica final y registrar `T_R3_STOP_COMMAND` justo antes de `docker_local stop --time 3 "$OLD_FRONTEND_ID"`. El supervisor V2 aún está detenido.
 2. Confirmar que el frontend histórico está detenido. Si Docker todavía lista sus endpoints, desconectarlo de `$PROXY_NET` y `$INGRESS_NET`, sólo con ese ID. Verificar 80/443 libres, endpoints antiguos sin dueño y cero escritores TLS. Registrar `T_80_443_RELEASED`.
 3. Soltar el endpoint proxy temporal del mismo `$EDGE_ID`. Ejecutar `docker_local network connect --ip 172.30.250.2 "$PROXY_NET" "$EDGE_ID"`. Verificar peer exacto `.2`, backend en su endpoint y PID/StartedAt de Edge sin cambio. Registrar `T_PROXY_IDENTITY_READY`.
 4. Ejecutar `docker_local network connect --ip "$OLD_INGRESS_IP" "$INGRESS_NET" "$EDGE_ID"` con la IP histórica fresca. Docker activa los bindings 80/443 ya fijados. Verificar IPs/familias/puertos equivalentes y ningún otro publicador. Registrar `T_EDGE_OWNS_PORTS`.
@@ -327,7 +367,7 @@ mark_phase3 T_FIRST_PUBLIC_HTTP_200
 
 Comprobar público 80→443, TLS/Host/SNI, app/índice/assets, API y media de lectura. Verificar IP cliente real y sanitización, cotejar los fingerprints públicos de ambos hosts con los previos, y confirmar `routectl_live status` en generación 0 BLUE/BLUE. Verificar otra vez la imagen R3 exacta del frontend privado y la identidad estable/época del backend R3. Revisar media, PostgreSQL, índice y recursos de rollback. Los smokes largos y la observación no forman parte del tiempo hasta el primer HTTP válido. Si aparecen fallos, presión inesperada de recursos o discontinuidad de Players, revertir según sección 6.
 
-El padre confiable entrega al adjudicador el pipe privado completo y la ventana de al menos 120 segundos, iniciada después de `OPENED_AT` y de la señal `ready`. Usar `--opened-at` en UTC de la misma máquina, posterior al mtime del marcador. El baseline debe tener menos de 120 s al abrir. `FINISHED_AT` queda cubierto por el último registro del colector. Los IDs y la captura sin redacción no salen del pipe. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. `2` o `1` implican rollback del ingreso. No hay cambio a GREEN. Guardar `phase3-player.json` privado y hash.
+`PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. El padre confiable entrega al adjudicador el pipe privado completo y la ventana de al menos 120 segundos, iniciada después de `OPENED_AT` y de la señal `ready`. Usar `--opened-at` en UTC de la misma máquina, posterior al mtime del marcador. El baseline debe tener menos de 120 s al abrir. `FINISHED_AT` queda cubierto por el último registro del colector. Los IDs y la captura sin redacción no salen del pipe. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. `2` o `1` obligan a ejecutar de inmediato la reversión de infraestructura de la sección 6 desde la sesión preparada. No continuar los controles de handoff tras ese resultado. Guardar `phase3-player.json` privado y hash.
 
 ```bash
 {
@@ -342,7 +382,7 @@ wait "$CAPTURE_PID"
 exec 3<&-
 ```
 
-Lanzar el adjudicador tras el primer HTTP sin esperar a los smokes largos. Puede correr mientras esos controles se ejecutan, evitando bloquear el colector al llenarse el pipe. Verificar continuidad de todos los `BASELINE_ACTIVE` vía BLUE. Con baseline vacío registrar que no hubo evidencia física. Playback sólo se acredita si existe evidencia real. Registrar RAM/CPU/conexiones Docker y PostgreSQL de forma pasiva. El colector de este intento puede detenerse por ID cuando ya se verificó su salida y se guardó el recibo.
+Lanzar el adjudicador tras el primer HTTP sin esperar a los smokes largos. Puede correr mientras esos controles se ejecutan, evitando bloquear el colector al llenarse el pipe. Para un baseline no vacío, exigir `ALL_BASELINE_CONTINUOUS` con un heartbeat HTTP 200 de cada pseudónimo HMAC del baseline observado tras la apertura, atribuido a generación 0, slot BLUE y upstream R3 exacto. Un dispositivo nuevo no sustituye a uno faltante. Los heartbeats anteriores a la apertura quedan excluidos. Ante un dispositivo faltante, errores incompatibles, 409/5xx o evidencia incompleta, ejecutar inmediatamente la sección 6. Con baseline vacío registrar `PASS_NO_ACTIVE_BASELINE` y evidencia física `UNVERIFIED`. Acreditar playback HTTP 201 únicamente cuando exista evidencia real. Registrar RAM/CPU/conexiones Docker y PostgreSQL de forma pasiva. El colector de este intento puede detenerse por ID cuando ya se verificó su salida y se guardó el recibo.
 
 Si todos los controles pasan y se verificó la ruta de reversión, instalar y habilitar `bgv2-edge-ingress.service` con un `edge-supervisor.env` privado. Aprobar las rutas y el pin exactos del controlador final. Usar rutas absolutas sin espacios y confirmar que el nombre corresponde a `$EDGE_NAME`. Crear los archivos sólo durante la intervención autorizada, después de verificar que sus rutas todavía están libres. Conservar las rutas definitivas incluso después de que termine el shell. El supervisor reconoce un marcador de admisión ya abierto y conserva esa admisión mientras verifica la época de los procesos.
 
@@ -371,13 +411,13 @@ systemctl is-active --quiet bgv2-edge-ingress.service
 
 El arranque posterior compara el `boot_id` del host y la época sellada. Con mismo boot y PID/`StartedAt` distinto se cierra ingreso y se exige `STOP_REATTEST_REQUIRED`. Con nuevo boot y la misma identidad estable, PostgreSQL exacto healthy y BLUE/BLUE coherente, `LEGACY_BLUE_REATTEST_AFTER_HOST_REBOOT` actualiza la época de forma durable antes de abrir. Si hay deriva estable, corrupción o ambigüedad, conservar el ingreso cerrado.
 
-Escribir `phase3-final.json` en directorio privado, con `phase3=PASS`, `active_api_slot=BLUE`, `active_frontend_slot=BLUE`, `generation=0`, IDs exactos e imágenes de roles, hash del manifest, épocas, hash de estado/config/autosave, identidad de PG/índice, huellas TLS, eventos monotónicos y UTC, downtime, recibos de backup y Players, snapshot, capacidad observada y recursos de reversión. No incluir cuerpos, tokens, env ni IDs Player crudos. Confirmar que frontend histórico sigue intacto y detenido en la ventana acordada.
+Escribir `phase3-final.json` en directorio privado, con `phase3=PASS`, `active_api_slot=BLUE`, `active_frontend_slot=BLUE`, `generation=0`, IDs exactos e imágenes de roles, hash del manifest, épocas, hash de estado/config/autosave, identidad de PG/índice, huellas TLS, eventos monotónicos y UTC, downtime, recibos de backup y Players, política de contratos, resultado de continuidad, snapshot, capacidad observada y recursos de reversión. No incluir cuerpos, tokens, env ni IDs Player crudos. Confirmar que frontend histórico sigue intacto y detenido en la ventana acordada.
 
 ## 6. Reversión exacta a la topología histórica
 
-Ejecutar `mark_phase3 T_ROLLBACK_DECISION` antes de toda acción. Si el servicio V2.2 quedó instalado, ejecutar `systemctl disable --now bgv2-edge-ingress.service` y comprobar que quedó inactivo. Eso impide que reabra ingreso incluso tras reiniciar el host. Ejecutar `routectl_live close-ingress` bajo el lock de escritor. Si el socket no permite verificar cierre, detener sólo el Edge exacto para hacer imposible seguir sirviendo. Comprobar que el marcador ya no admite tráfico. Detener `$EDGE_ID` con `docker_local stop --time 3 "$EDGE_ID"`, verificar 80/443 liberados, cero escritores TLS y que el proceso esperado terminó. Si aún aparecen sus endpoints, desconectarlo de proxy e ingreso por ID. No tocar otros contenedores. Registrar `T_EDGE_RELEASED`.
+Ejecutar `mark_phase3 T_ROLLBACK_DECISION` antes de toda acción. Si el supervisor V2 quedó instalado, ejecutar `systemctl disable --now bgv2-edge-ingress.service` y comprobar que quedó inactivo. Eso impide que reabra ingreso incluso tras reiniciar el host. Ejecutar `routectl_live close-ingress` bajo el lock de escritor. Si el socket no permite verificar cierre, detener sólo el Edge exacto para hacer imposible seguir sirviendo. Comprobar que el marcador ya no admite tráfico. Detener `$EDGE_ID` con `docker_local stop --time 3 "$EDGE_ID"`, verificar 80/443 liberados, cero escritores TLS y que el proceso esperado terminó. Si aún aparecen sus endpoints, desconectarlo de proxy e ingreso por ID. No tocar otros contenedores. Registrar `T_EDGE_RELEASED`.
 
-Reconectar `$OLD_FRONTEND_ID` a `$INGRESS_NET` con su IP y aliases del snapshot inicial y a `$PROXY_NET` con `--ip 172.30.250.2` y sus aliases históricos. Confirmar que el contenedor sigue fijado al mismo digest, Caddyfile, `/config` histórico y volumen TLS `/data`. Arrancar el mismo contenedor con `docker_local start "$OLD_FRONTEND_ID"`. Registrar `T_R3_START_RETURN` y verificar las publicaciones exactas. Esperar el listener local TCP 443 del frontend histórico mediante `nc -z`, dentro de los 30 s medidos desde la decisión. Usar el presupuesto restante, con un máximo de 10 s, para un único GET público de la API con el mismo Host/SNI y certificado válido. Registrar `T_FIRST_R3_HTTP_200` sólo con HTTP 200. Verificar app, TLS, propiedad única del storage y puertos, `.2`, IP cliente real, backend original y PostgreSQL/media intactos. Comparar imágenes, red, aliases, mounts y configuración del frontend restaurado con el snapshot. Su nuevo PID/`StartedAt` por stop/start es esperado. No recrear contenedores ni restaurar DB en la reversión normal. Retener Edge cerrado, el frontend-blue privado, estado y recibos para análisis. Escribir un recibo de rollback con los tiempos desde la decisión y el resultado real.
+Reconectar `$OLD_FRONTEND_ID` a `$INGRESS_NET` con su IP y aliases del snapshot inicial y a `$PROXY_NET` con `--ip 172.30.250.2` y sus aliases históricos. Confirmar que el contenedor sigue fijado al mismo digest, Caddyfile, `/config` histórico y volumen TLS `/data`. Arrancar el mismo contenedor con `docker_local start "$OLD_FRONTEND_ID"`. Registrar `T_R3_START_RETURN` y verificar las publicaciones exactas. Esperar el listener local TCP 443 del frontend histórico mediante `nc -z`, dentro de los 30 s medidos desde la decisión. Usar el presupuesto restante, con un máximo de 10 s, para un único GET público de la API con el mismo Host/SNI y certificado válido. Registrar `T_FIRST_R3_HTTP_200` sólo con HTTP 200. Verificar app, TLS, propiedad única del storage y puertos, `.2`, IP cliente real, backend original y PostgreSQL/media intactos. Comparar imágenes, red, aliases, hash canónico de `Mounts` y configuración del frontend restaurado con el snapshot. Su nuevo PID/`StartedAt` por stop/start es esperado. No recrear contenedores ni restaurar DB en la reversión normal. Retener Edge cerrado, el frontend-blue privado, estado y recibos para análisis. Escribir un recibo de rollback con los tiempos desde la decisión y el resultado real.
 
 ```bash
 # OLD_INGRESS_ALIASES y OLD_PROXY_ALIASES son arrays del snapshot aprobado.

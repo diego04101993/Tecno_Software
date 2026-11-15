@@ -2,15 +2,20 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass
 from getpass import getpass
 import hashlib
 from pathlib import Path
 import re
 import sys
+from uuid import uuid4
 
-from gates import DockerProbe, ReadyGate, hex_digest, identifier, sign_receipt
-from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT, READY_ADOPTION
+from docker_mounts import encode_mount_evidence
+from gates import (
+    PHASE3_PRODUCT_CONTRACTS, PHASE3_REAL_PLAYER_CONTINUITY_GATE, DockerProbe, ReadyGate, hex_digest, identifier, sign_receipt,
+)
+from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION
 from qualify_r3 import R3_IMAGES, docker_read
 from release_state import Stop, canonical, decode, digest, now, read_private, require, validate_release, write_private_atomic
 from routectl import DEFAULT_HOSTS
@@ -114,6 +119,21 @@ def legacy_frontend_ready_pin(qualification, probe):
     return pin
 
 
+def validate_reviewed_checks(qualification, reviewed):
+    release = qualification["release"]
+    validate_release(release)
+    require(qualification["scope"] == "R3_EXACT_IMAGE_QUALIFICATION" and qualification["status"] == "PASS"
+            and release == R3_POLICY.release
+            and all(qualification["roles"][role]["image_id"] == image_id for role, image_id in R3_IMAGES.items()),
+            "PHASE3_R3_QUALIFICATION_REQUIRED")
+    expected = {"qualification_sha256": digest(qualification), "schema_unchanged": True, "media_unchanged": True,
+                "phase3_infra_capacity": True, "pool": "ISOLATED_NOT_APPLICABLE",
+                "phase3_product_contracts": PHASE3_PRODUCT_CONTRACTS,
+                "phase3_real_player_continuity_gate": PHASE3_REAL_PLAYER_CONTINUITY_GATE}
+    require(canonical(reviewed) == canonical(expected), "PHASE3_REVIEWED_EVIDENCE_INVALID")
+    return release
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ("qualification", "bindings", "legacy-manifest", "key", "channels", "reviewed-checks", "receipts"):
@@ -121,24 +141,20 @@ def main(argv=None):
     for option in ("legacy-sha256", "trusted-proxy-name", "edge-id"):
         parser.add_argument("--" + option, required=True)
     args = parser.parse_args(argv)
+    mount_observations = []
+    evidence = args.receipts.with_name(args.receipts.stem + ".mounts.json")
     try:
         require(sys.platform.startswith("linux") and hex_digest(args.edge_id), "PHASE3_LOCAL_EDGE_REQUIRED")
         require(sys.stdin.isatty(), "PHASE3_PRIVATE_JWT_TTY_REQUIRED")
         qualification = read_json(args.qualification)
-        release = qualification["release"]
-        validate_release(release)
-        require(qualification["scope"] == "R3_EXACT_IMAGE_QUALIFICATION" and qualification["status"] == "PASS"
-                and release["images"] == R3_IMAGES, "PHASE3_R3_QUALIFICATION_REQUIRED")
         reviewed = read_json(args.reviewed_checks)
-        exact = {"qualification_sha256": digest(qualification), "schema_unchanged": True, "media_unchanged": True,
-                 "phase3_infra_capacity": True, "pool": "ISOLATED_NOT_APPLICABLE",
-                 "contracts": {"windows_legacy": True, "android_normal": True}}
-        require(canonical(reviewed) == canonical(exact), "PHASE3_REVIEWED_EVIDENCE_INVALID")
+        release = validate_reviewed_checks(qualification, reviewed)
         channels = read_json(args.channels)
         require(type(channels) is list and 0 < len(channels) <= 36 and all(identifier(channel) for channel in channels)
                 and len(channels) == len(set(channels)), "PHASE3_CHANNEL_FIXTURE_INVALID")
         probe = DockerProbe(read_json(args.bindings), edge_name=args.trusted_proxy_name,
-                            legacy_blue=read_json(args.legacy_manifest), legacy_blue_sha256=args.legacy_sha256)
+                            legacy_blue=read_json(args.legacy_manifest), legacy_blue_sha256=args.legacy_sha256,
+                            mount_observations=mount_observations)
         frontend_pin = legacy_frontend_ready_pin(qualification, probe)
         if frontend_pin is not None:
             probe.verify_initial_legacy_frontend_source()
@@ -175,9 +191,16 @@ def main(argv=None):
                                               "private_route": True, "checks": checks[role]}, key)
             require(ReadyGate(key)(receipt, context), "PHASE3_READY_RECEIPT_INVALID")
             receipts[role] = receipt
+        write_private_atomic(evidence, encode_mount_evidence(mount_observations), replace=False)
         write_private_atomic(args.receipts, canonical(receipts) + b"\n", replace=False)
-    except (Stop, OSError, ValueError, KeyError, TypeError, AttributeError):
-        print("STOP: PHASE3_PRIVATE_READINESS_FAILED", file=sys.stderr)
+    except (Stop, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        if mount_observations:
+            with suppress(Stop, OSError):
+                failed = evidence.with_name(evidence.stem + ".failed-" + uuid4().hex + ".json")
+                write_private_atomic(failed, encode_mount_evidence(mount_observations), replace=False)
+        reason = str(error) if isinstance(error, Stop) and str(error) == "DUPLICATE_MOUNT_DESTINATION" else (
+            "PHASE3_PRIVATE_READINESS_FAILED")
+        print(f"STOP: {reason}", file=sys.stderr)
         return 1
     print("PHASE3_BLUE_PRIVATE_READY=PASS")
     return 0

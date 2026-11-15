@@ -322,7 +322,8 @@ def readonly_ready(fixture, probe, http, qa_token, key):
     api = {**checks.api("BLUE", expected_name="R3-shaped disposable backend"),
            "schema_unchanged": True, "media_unchanged": True,
            "phase3_infra_capacity": True, "pool": "ISOLATED_NOT_APPLICABLE",
-           "contracts": {"windows_legacy": True, "android_normal": True}}
+           "phase3_product_contracts": "UNCHANGED_PRODUCT_NOT_REQUALIFIED",
+           "phase3_real_player_continuity_gate": "REQUIRED_AFTER_HANDOFF"}
     front = checks.frontend("BLUE", route="BLUE")
     output = {}
     for role, values in (("api", api), ("frontend", front)):

@@ -29,12 +29,14 @@ class LegacyFrontendFixture:
 
     def __init__(self, docker, directory):
         from qa_topology import choose_subnet
+        from docker_config import parse_optional_config
 
         self.docker = docker
         self.directory = directory
         self.image = docker.inspect("image", CADDY_IMAGE)
         assert self.image["Id"] == CADDY_IMAGE
-        assert all(key not in (self.image["Config"].get("Labels") or {}) for key in OCI_KEYS)
+        labels = parse_optional_config(self.image.get("Config"))["Labels"]
+        assert all(key not in labels for key in OCI_KEYS)
         assert self.image["RepoDigests"], "Cached QA image must have a RepoDigest"
         subnet = choose_subnet(docker)
         self.subnet_prefix = subnet.rsplit(".", 1)[0]
@@ -238,7 +240,8 @@ def verify_runtime_admission(fixture, policy, manifest, frontend_binding):
                   "channels_elapsed_ns": 1, "runtime_serial_ok": 36, "runtime_concurrent_ok": 16,
                   "runtime_clients": 4, "runtime_transport_timeout_s": 10, "phase3_infra_capacity": True,
                   "schema_unchanged": True, "media_unchanged": True, "pool": "ISOLATED_NOT_APPLICABLE",
-                  "contracts": {"windows_legacy": True, "android_normal": True}}
+                  "phase3_product_contracts": "UNCHANGED_PRODUCT_NOT_REQUALIFIED",
+                  "phase3_real_player_continuity_gate": "REQUIRED_AFTER_HANDOFF"}
     front_checks = {"startup_listener_ready": True, "root_http": 200, "root_get_count": 1, "assets_ok": True}
     key = bytes(range(48))
     release = manifest["payload"]["release"]

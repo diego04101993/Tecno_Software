@@ -1,5 +1,6 @@
 """Initial legacy frontend provenance through the qualification and READY entrypoints."""
 
+from copy import deepcopy
 from hashlib import sha256
 import json
 from types import SimpleNamespace
@@ -9,13 +10,56 @@ from unittest.mock import patch
 from gates import REVISION_LABEL, TREE_LABEL
 from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT
 from phase3_ready import Response, legacy_frontend_ready_pin, private_checks
-from qualify_r3 import R3_CADDY_ARGV, R3_IMAGES, qualify_role, require_private_network_available
+from qualify_r3 import R3_CADDY_ARGV, R3_IMAGES, qualify_role, require_private_network_available, runtime_snapshot
 from release_state import Stop
 from test_phase3_ready import CHANNEL
 from test_qualify_r3 import IDS, RELEASE, fixture
 
 
 class LegacyQualificationTests(TestCase):
+    def test_qualifies_mounts_in_either_order_and_records_all_raw_samples(self):
+        before, image = fixture("frontend")
+        before["Mounts"] = [{"Destination": "/config", "Type": "volume", "Source": "/fixture/config", "RW": True},
+                            {"Destination": "/data", "Type": "volume", "Source": "/fixture/data", "RW": True}]
+        after = deepcopy(before)
+        after["Mounts"].reverse()
+        manifest, pin = {"payload": {}}, "e" * 64
+        caddyfile = b"disposable historical Caddyfile"
+
+        def read(*args):
+            self.assertEqual(args, ("container", "inspect", IDS["frontend"]))
+            return json.dumps([before]).encode()
+
+        with (patch("qualify_r3.R3_CADDYFILE_SHA256", sha256(caddyfile).hexdigest()),
+              patch("qualify_r3.verify_manifest", return_value={"release": RELEASE, "private_contract": {}}),
+              patch("qualify_r3.classify_historical", return_value=LEGACY_FRONTEND_IMAGE_EXACT),
+              patch("qualify_r3.require_private_network_available")):
+            result = qualify_role("frontend", RELEASE, IDS["frontend"], before, after, image,
+                                  R3_CADDY_ARGV, caddyfile, legacy_frontend_manifest=manifest,
+                                  legacy_frontend_sha256=pin, read=read)
+        self.assertEqual(runtime_snapshot(before), runtime_snapshot(after))
+        self.assertEqual(result["frontend_classifier"], LEGACY_FRONTEND_IMAGE_EXACT)
+        samples = result["mount_evidence"]
+        self.assertEqual(samples["before"]["raw_mounts"], before["Mounts"])
+        self.assertEqual(samples["after"]["raw_mounts"], after["Mounts"])
+        self.assertEqual(samples["final"]["raw_mounts"], before["Mounts"])
+        for sample in samples.values():
+            self.assertEqual(sample["canonical_mounts"], before["Mounts"])
+            self.assertEqual(sample["canonical_mounts_sha256"], result["runtime"]["mounts_sha256"])
+
+    def test_qualification_still_rejects_changed_or_ambiguous_mount_identity(self):
+        before, image = fixture("frontend")
+        before["Mounts"] = [{"Destination": "/config", "Source": "/fixture/config", "RW": True}]
+        for row, error in (({"Source": "/changed"}, "R3_RUNTIME_IDENTITY_CHANGED_OR_UNHEALTHY"),
+                           ({"duplicate": True}, "DUPLICATE_MOUNT_DESTINATION")):
+            with self.subTest(error=error), self.assertRaisesRegex(Stop, error):
+                after = deepcopy(before)
+                if row.get("duplicate"):
+                    after["Mounts"].append(deepcopy(after["Mounts"][0]))
+                else:
+                    after["Mounts"][0].update(row)
+                qualify_role("frontend", RELEASE, IDS["frontend"], before, after, image, R3_CADDY_ARGV)
+
     def test_qualified_image_id_is_only_returned_after_manifest_classification(self):
         container, image = fixture("frontend")
         for key in (REVISION_LABEL, TREE_LABEL):

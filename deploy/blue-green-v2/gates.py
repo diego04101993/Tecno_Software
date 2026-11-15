@@ -17,6 +17,8 @@ import subprocess
 from time import monotonic
 from uuid import UUID
 
+from docker_config import parse_optional_config
+from docker_mounts import canonicalize_mounts, mount_evidence
 from legacy_frontend_blue import (
     LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION, classify_historical, verify_manifest,
     verify_private_frontend,
@@ -127,7 +129,8 @@ def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
             "SLOT_UNHEALTHY_OR_RESTARTED")
     require(item["Name"] == "/" + binding["name"] and hex_digest(item["Id"]), "WRONG_CONTAINER")
     config = item["Config"]
-    labels = config["Labels"]
+    optional = parse_optional_config(config, validate=require)
+    labels = optional["Labels"]
     if legacy_compose is None:
         require(labels.get("io.tecnocontrol.bgv2.slot") == slot
                 and labels.get("io.tecnocontrol.bgv2.role") == role, "WRONG_SLOT_LABELS")
@@ -138,10 +141,8 @@ def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
                 and "io.tecnocontrol.bgv2.role" not in labels, "LEGACY_BLUE_COMPOSE_IDENTITY_CHANGED")
     require(item["Image"] == image["Id"] == binding["image_id"]
             and image["Id"].startswith("sha256:") and hex_digest(image["Id"][7:]), "WRONG_IMAGE_ID")
-    image_labels = image["Config"]["Labels"]
+    image_labels = parse_optional_config(image.get("Config"), validate=require)["Labels"]
     permits_missing_oci = legacy_compose is not None or legacy_frontend_proof is not None
-    if permits_missing_oci and image_labels is None:
-        image_labels = {}
     for key, pin in ((REVISION_LABEL, "revision"), (TREE_LABEL, "tree")):
         require(re.fullmatch(r"[0-9a-f]{40}", binding[pin]) and (
             image_labels.get(key) == labels.get(key) == binding[pin] or (
@@ -157,10 +158,12 @@ def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
             and endpoint["NetworkID"] == network["Id"] and network["Name"] == binding["network"]
             and network["Driver"] == "bridge" and network["Internal"] is True
             and peers == [item["Id"]], "SLOT_NETWORK_NOT_EXCLUSIVE")
-    mounts = item["Mounts"]
+    mounts = canonicalize_mounts(item["Mounts"])
     if role == "api":
-        env = dict(value.split("=", 1) for value in config["Env"])
-        require(len(env) == len(config["Env"]) and env.get("AUTO_SEED") == "false"
+        env_entries = optional["Env"]
+        require(all("=" in value for value in env_entries), "UNSAFE_BACKEND_RUNTIME")
+        env = dict(value.split("=", 1) for value in env_entries)
+        require(len(env) == len(env_entries) and env.get("AUTO_SEED") == "false"
                 and env.get("APP_ENV", "production") == "production" and env.get("WEB_CONCURRENCY", "1") == "1"
                 and str(IPv4Address(binding["proxy_ip"])) == env.get("FORWARDED_ALLOW_IPS")
                 and env.get("MEDIA_ROOT") == "/app/storage/uploads" and argv == BACKEND_ARGV,
@@ -306,10 +309,12 @@ class DockerProbe:
     """Read-only Docker commands against an explicitly selected local Engine."""
 
     def __init__(self, bindings, context="default", edge_name=None, legacy_blue=None, legacy_blue_sha256=None, *,
-                 legacy_frontend_blue=None, legacy_frontend_blue_sha256=None, legacy_frontend_policy=R3_POLICY):
+                 legacy_frontend_blue=None, legacy_frontend_blue_sha256=None, legacy_frontend_policy=R3_POLICY,
+                 mount_observations=None):
         require(isinstance(context, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", context), "INVALID_DOCKER_CONTEXT")
         self.bindings = bindings
         self.context = context
+        self.mount_observations = mount_observations
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("DOCKER_")}
         self.edge_name = edge_name
         require(edge_name is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", edge_name), "INVALID_EDGE_NAME")
@@ -367,6 +372,18 @@ class DockerProbe:
     def _json(self, *args):
         return json.loads(self._run(*args))
 
+    def _observe_mounts(self, label, item):
+        if self.mount_observations is not None:
+            observation = {"inspection": label, "container_id": item["Id"]}
+            try:
+                observation.update(mount_evidence(item["Mounts"]))
+            except Stop as error:
+                observation.update(raw_mounts=deepcopy(item["Mounts"]), canonical_mounts=None,
+                                   canonical_mounts_sha256=None, error=str(error))
+                self.mount_observations.append(observation)
+                raise
+            self.mount_observations.append(observation)
+
     def _host_boot_id(self, container, observed=None):
         if observed is None:
             observed = self._run("exec", container, "cat", "/proc/sys/kernel/random/boot_id").decode().strip()
@@ -405,6 +422,7 @@ class DockerProbe:
         name = binding["name"]
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", name), "INVALID_CONTAINER_NAME")
         first = self._json("container", "inspect", name)[0]
+        self._observe_mounts("slot_before", first)
         container = first["Id"]
         require(hex_digest(container), "WRONG_CONTAINER")
         image_id = first["Image"]
@@ -460,13 +478,15 @@ class DockerProbe:
             require(proof["classification"] == LEGACY_FRONTEND_IMAGE_EXACT and proof["container_id"] == container
                     and proof["image_id"] == image_id, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
         last = self._json("container", "inspect", name)[0]
+        self._observe_mounts("slot_after", last)
         require(first["Id"] == last["Id"] and first["State"]["StartedAt"] == last["State"]["StartedAt"]
                 and first["State"]["Pid"] == last["State"]["Pid"], "SLOT_CHANGED_DURING_INSPECTION")
         if legacy_compose is not None:
             return legacy_blue_payload(last, image, network, peers, binding, argv, ticks, raw_argv,
                                        namespace, legacy_compose, self._host_boot_id(container, host_boot_raw.decode()))
         if legacy_frontend:
-            require(all(first[field] == last[field] for field in ("Image", "Config", "HostConfig", "Mounts", "NetworkSettings")),
+            require(all(first[field] == last[field] for field in ("Image", "Config", "HostConfig", "NetworkSettings"))
+                    and canonical(canonicalize_mounts(first["Mounts"])) == canonical(canonicalize_mounts(last["Mounts"])),
                     "LEGACY_FRONTEND_CHANGED_DURING_INSPECTION")
         identity = live_identity(last, image, network, peers, binding, role, slot, argv, ticks,
                                  config_hash, raw_argv, namespace, allow_restarted=with_epoch,
@@ -538,6 +558,7 @@ class DockerProbe:
         try:
             historical_id = payload["historical"]["container_id"]
             item, = self._json("container", "inspect", historical_id)
+            self._observe_mounts("historical_frontend_before", item)
             image, = self._json("image", "inspect", payload["release"]["images"]["frontend"])
             require(item["Name"] == "/" + self.edge_name and item["State"]["Running"] is True,
                     "LEGACY_FRONTEND_HISTORICAL_SOURCE_NOT_ACTIVE")
@@ -546,11 +567,15 @@ class DockerProbe:
                                         policy=self.legacy_frontend_policy) == LEGACY_FRONTEND_IMAGE_EXACT,
                     "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
             after, = self._json("container", "inspect", historical_id)
-            require(all(after[field] == item[field] for field in ("Id", "Image", "Config", "HostConfig", "Mounts", "NetworkSettings"))
+            self._observe_mounts("historical_frontend_after", after)
+            require(all(after[field] == item[field] for field in ("Id", "Image", "Config", "HostConfig", "NetworkSettings"))
+                    and canonical(canonicalize_mounts(after["Mounts"])) == canonical(canonicalize_mounts(item["Mounts"]))
                     and after["State"]["Running"] is True
                     and all(after["State"][field] == item["State"][field] for field in ("Pid", "StartedAt")),
                     "LEGACY_FRONTEND_CHANGED_DURING_INSPECTION")
-        except (Stop, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        except (Stop, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
+                raise
             raise GateError("LEGACY_FRONTEND_HISTORICAL_SOURCE_UNKNOWN_OR_DRIFTED") from None
 
     def legacy_postgres_id(self):
@@ -645,6 +670,10 @@ def verified_payload(kind, receipt, key, context, keys):
     return payload
 
 
+PHASE3_PRODUCT_CONTRACTS = "UNCHANGED_PRODUCT_NOT_REQUALIFIED"
+PHASE3_REAL_PLAYER_CONTINUITY_GATE = "REQUIRED_AFTER_HANDOFF"
+
+
 class ReadyGate:
     def __init__(self, key, now=lambda: datetime.now(timezone.utc)):
         self.key = key
@@ -671,7 +700,8 @@ class ReadyGate:
             if context.get("adoption") == "LEGACY_BLUE":
                 require(context.get("slot") == "BLUE", "LEGACY_BLUE_SCOPE_INVALID")
                 exact.update(phase3_infra_capacity=True, schema_unchanged=True, media_unchanged=True,
-                             contracts={"windows_legacy": True, "android_normal": True})
+                             phase3_product_contracts=PHASE3_PRODUCT_CONTRACTS,
+                             phase3_real_player_continuity_gate=PHASE3_REAL_PLAYER_CONTINUITY_GATE)
             else:
                 exact.update(dual_slot_schema=True, media_cross_slot=True, dual_slot_capacity=True,
                              contracts={"windows_legacy": True, "android_normal": True, "android_node_slice": True})

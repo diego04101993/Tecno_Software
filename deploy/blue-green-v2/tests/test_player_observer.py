@@ -197,14 +197,22 @@ class Phase3ContinuityTests(unittest.TestCase):
             self.traffic(index, DEVICES[index - 1], index, status=status, slot="BLUE", generation=0)
             self.logs[-1]["upstream"] = "172.30.250.3:8000"
         tail = {"type": "done", "ended_ns": nanos(121), "kernel_dropped": 0, "kernel_packets": len(self.capture) * 2}
-        return decide_phase3(lines(self.capture + [tail]), lines(self.logs), lambda pairs: self.rows, baseline,
+
+        def query(pairs):
+            return [row for row in self.rows if (row["channel_id"], row["received_at"]) in pairs]
+
+        return decide_phase3(lines(self.capture + [tail]), lines(self.logs), query, baseline,
                              phase3_context(state, postgres), KEY, stamp(0), stamp(120), stamp(-1))
 
     def test_initial_blue_same_legacy_endpoint_and_separate_receipt(self):
         receipt, accepted = self.phase3(self.initial_state())
         self.assertTrue(accepted)
         self.assertEqual(receipt["kind"], "PHASE3_PLAYER")
-        self.assertEqual(receipt["payload"]["result"], "PASS")
+        payload = receipt["payload"]
+        self.assertEqual(payload["result"], "PASS")
+        self.assertEqual((payload["generation"], payload["slot"], payload["upstream"]), (0, "BLUE", "172.30.250.3:8000"))
+        self.assertEqual({row["device_ref"] for row in payload["heartbeats"]},
+                         {device_ref(device, KEY) for device in DEVICES[:2]})
         self.assertFalse(PlayerGate(KEY, now=lambda: NOW + timedelta(seconds=121))(receipt, {}))
 
     def test_initial_blue_missing_device_or_rejected_heartbeat(self):
@@ -212,6 +220,16 @@ class Phase3ContinuityTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertEqual(receipt["payload"]["result"], "FAIL")
         self.assertEqual(len(receipt["payload"]["heartbeats"]), 1)
+
+    def test_initial_blue_replacement_duplicate_and_pre_handoff_heartbeat_do_not_satisfy_gate(self):
+        for index, device, seconds in ((3, DEVICES[1], -2), (4, DEVICES[2], 3), (5, DEVICES[0], 4)):
+            self.traffic(index, device, seconds, slot="BLUE", generation=0)
+            self.logs[-1]["upstream"] = "172.30.250.3:8000"
+        receipt, accepted = self.phase3(self.initial_state(), (200,))
+        self.assertFalse(accepted)
+        self.assertEqual(receipt["payload"]["result"], "FAIL")
+        self.assertEqual({row["device_ref"] for row in receipt["payload"]["heartbeats"]},
+                         {device_ref(DEVICES[index], KEY) for index in (0, 2)})
 
     def test_initial_blue_rejects_stale_baseline_or_candidate(self):
         with self.assertRaisesRegex(Stop, "INVALID_PHASE3_OBSERVATION_WINDOW"):

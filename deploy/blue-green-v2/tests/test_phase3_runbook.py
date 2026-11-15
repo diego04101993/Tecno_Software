@@ -30,9 +30,9 @@ class Phase3RunbookTest(unittest.TestCase):
 
     def test_handoff_and_reverse_preserve_roles_and_scope(self):
         self.assert_order(RUNBOOK, "R3_EXACT_IMAGE_QUALIFICATION", "verify_index(package)",
-                          "deployment_phases.py backup", 'docker_local start "$FRONTEND_BLUE_NAME"',
-                          'docker_local start "$EDGE_ID"', "routectl_pre preview", "phase3_ready.py",
-                          "routectl_pre initialize", "phase3-baseline", "T_R3_STOP_COMMAND",
+                          'docker_local start "$FRONTEND_BLUE_NAME"', 'docker_local start "$EDGE_ID"',
+                          "routectl_pre preview", "phase3_ready.py", "routectl_pre initialize",
+                          "deployment_phases.py backup", "phase3-baseline", "T_R3_STOP_COMMAND",
                           "T_80_443_RELEASED", "T_PROXY_IDENTITY_READY", "T_EDGE_OWNS_PORTS",
                           "T_TLS_WRITER_READY", "T_PLAYER_CAPTURE_READY", "routectl_live recover-ingress",
                           "T_FIRST_PUBLIC_HTTP_200", "phase3-observe", "systemctl enable --now",
@@ -58,6 +58,17 @@ class Phase3RunbookTest(unittest.TestCase):
                           'docker_local stop "$BACKEND_ID"', 'docker_local stop "$PG_ID"'):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, commands)
+
+    def test_prestage_stops_before_fresh_backup_player_baseline_and_ingress_change(self):
+        prestage, handoff = RUNBOOK.split("## 4. Ventana de traspaso con autorización independiente", 1)
+        self.assertIn("READY_FOR_DOWNTIME_WINDOW=YES", prestage)
+        self.assertIn("INGRESS_READY=NO", prestage)
+        for command in ("deployment_phases.py backup", "phase3-baseline", "recover-ingress", "docker_local stop"):
+            with self.subTest(command=command):
+                self.assertNotIn(command, prestage)
+        self.assert_order(handoff, "deployment_phases.py backup", "check_backup(state, payload, verify_bytes=True)",
+                          "phase3-baseline", "T_R3_STOP_COMMAND", "PHASE3_REAL_PLAYER_CONTINUITY_GATE",
+                          "ALL_BASELINE_CONTINUOUS")
 
     @unittest.skipUnless(bash(), "Bash is required for shell snippet validation")
     def test_shell_blocks_parse(self):

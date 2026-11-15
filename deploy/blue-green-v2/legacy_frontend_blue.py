@@ -13,6 +13,8 @@ import re
 import subprocess
 import sys
 
+from docker_config import parse_optional_config
+from docker_mounts import canonicalize_mounts
 from release_state import Stop, canonical, decode, digest, read_private, require, write_private_atomic
 
 
@@ -192,8 +194,7 @@ def measure_static_content(read, container_id, *, private=False):
 
 
 def historical_mounts(item):
-    keys = ("Type", "Name", "Source", "Destination", "Driver", "Mode", "RW", "Propagation")
-    return sorted(({key: row.get(key) for key in keys} for row in item["Mounts"]), key=lambda row: row["Destination"])
+    return canonicalize_mounts(item["Mounts"])
 
 
 def historical_ports(item):
@@ -205,10 +206,7 @@ def network_endpoints(networks):
     return tuple(sorted((name, row["NetworkID"], row["IPAddress"]) for name, row in networks.items()))
 
 
-def label_evidence(config, policy):
-    labels = config.get("Labels")
-    require(labels is None or type(labels) is dict, "LEGACY_FRONTEND_LABELS_INVALID")
-    labels = labels or {}
+def label_evidence(labels, policy):
     expected = {REVISION: policy.revision, TREE: policy.tree}
     require(all(key not in labels or labels[key] == value for key, value in expected.items()),
             "LEGACY_FRONTEND_CONTRADICTORY_OCI_LABEL")
@@ -216,20 +214,21 @@ def label_evidence(config, policy):
 
 
 def image_evidence(image, policy):
-    cfg = image["Config"]
-    labels = label_evidence(cfg, policy)
+    cfg = image.get("Config")
+    optional = parse_optional_config(cfg)
+    labels = label_evidence(optional["Labels"], policy)
     repos = image.get("RepoDigests")
     require(repos is None or type(repos) is list and all(isinstance(value, str) and REPO.fullmatch(value) for value in repos),
             "LEGACY_FRONTEND_REPODIGEST_INVALID")
     require(image["Id"] == policy.image_id and image["Os"] == "linux" and image["Architecture"] == "amd64"
             and tuple(sorted(repos or [])) == policy.repo_digests and digest(cfg) == policy.image_config_sha256
-            and cfg.get("Entrypoint") is None and cfg["Cmd"] == HISTORICAL_COMMAND,
+            and cfg.get("Entrypoint") is None and optional["Cmd"] == HISTORICAL_COMMAND,
             "LEGACY_FRONTEND_IMAGE_UNKNOWN_OR_DRIFTED")
     layers = image["RootFS"]["Layers"]
     require(image["RootFS"]["Type"] == "layers" and type(layers) is list and layers and all(is_image_id(layer) for layer in layers),
             "LEGACY_FRONTEND_LAYERS_INVALID")
     return {"id": image["Id"], "repo_digests": sorted(repos or []), "config_sha256": digest(cfg), "os": image["Os"],
-            "architecture": image["Architecture"], "entrypoint": cfg.get("Entrypoint"), "cmd": cfg["Cmd"],
+            "architecture": image["Architecture"], "entrypoint": cfg.get("Entrypoint"), "cmd": optional["Cmd"],
             "rootfs_layers": layers, "oci_labels": labels}
 
 
@@ -241,8 +240,9 @@ def rollback_record(policy):
 def historical_evidence(item, image, read, *, policy=R3_POLICY, read_host=None):
     """Project the running historical instance, before the historical frontend is stopped."""
     cfg, state = item["Config"], item["State"]
-    labels = cfg.get("Labels") or {}
-    oci = label_evidence(cfg, policy)
+    optional = parse_optional_config(cfg)
+    labels = optional["Labels"]
+    oci = label_evidence(labels, policy)
     require(item["Id"] == policy.historical_container_id and item["Name"] == "/" + policy.historical_name
             and item["Image"] == policy.image_id and cfg["Image"] == policy.image_id
             and digest(cfg) == policy.historical_config_sha256
@@ -253,7 +253,7 @@ def historical_evidence(item, image, read, *, policy=R3_POLICY, read_host=None):
             and all(state[key] is False for key in ("OOMKilled", "Dead", "Paused", "Restarting"))
             and type(item["RestartCount"]) is int and item["RestartCount"] == 0
             and utc_timestamp(item["Created"])
-            and cfg.get("Entrypoint") is None and cfg["Cmd"] == [item["Path"], *item["Args"]] == HISTORICAL_COMMAND,
+            and cfg.get("Entrypoint") is None and optional["Cmd"] == [item["Path"], *item["Args"]] == HISTORICAL_COMMAND,
             "LEGACY_FRONTEND_HISTORICAL_UNKNOWN_OR_DRIFTED")
     measured_image = image_evidence(image, policy)
     mounts, ports = historical_mounts(item), historical_ports(item)
@@ -318,12 +318,13 @@ def validate_payload(payload, policy):
             and old["container_id"] == policy.historical_container_id and old["name"] == policy.historical_name
             and old["compose_project"] == policy.historical_project and old["compose_service"] == "frontend"
             and old["container_config_sha256"] == policy.historical_config_sha256 and hex_hash(old["host_config_sha256"])
-            and utc_timestamp(old["created_at"]) and digest(old["mounts"]) == policy.historical_mounts_sha256
+            and utc_timestamp(old["created_at"])
+            and digest(canonicalize_mounts(old["mounts"])) == policy.historical_mounts_sha256
             and digest(old["ports"]) == policy.historical_ports_sha256 and network_endpoints(old["networks"]) == policy.historical_networks,
             "LEGACY_FRONTEND_MANIFEST_HISTORICAL_INVALID")
     for row in (image, old):
         labels = row["oci_labels"]
-        require(type(labels) is dict and label_evidence({"Labels": labels}, policy) == labels, "LEGACY_FRONTEND_MANIFEST_OCI_INVALID")
+        require(type(labels) is dict and label_evidence(labels, policy) == labels, "LEGACY_FRONTEND_MANIFEST_OCI_INVALID")
     require(type(content) is dict and set(content) == {"caddy_version", "caddyfile_sha256", "index_sha256", "asset_sha256"}
             and content["caddy_version"] == policy.caddy_version and content["caddyfile_sha256"] == policy.historical_caddyfile_sha256
             and content["index_sha256"] == policy.index_sha256 and type(content["asset_sha256"]) is dict
@@ -358,9 +359,12 @@ def classify_historical(item, image, read, manifest, expected_sha256, *, policy=
     payload = verify_manifest(manifest, expected_sha256, policy=policy)
     try:
         actual = historical_evidence(item, image, read, policy=policy, read_host=read_host)
+        payload["historical"]["mounts"] = canonicalize_mounts(payload["historical"]["mounts"])
         require(all(actual[key] == payload[key] for key in ("image", "historical", "content")),
                 "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
-    except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError):
+    except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
+            raise
         raise Stop("LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED") from None
     return LEGACY_FRONTEND_IMAGE_EXACT
 
@@ -371,21 +375,21 @@ def verify_private_frontend(item, image, network, read, payload, binding, *, pol
         validate_payload(payload, policy)
         contract = payload["private_contract"]
         cfg, host = item["Config"], item["HostConfig"]
-        label_evidence(cfg, policy)
-        labels = cfg["Labels"]
+        optional = parse_optional_config(cfg)
+        labels = optional["Labels"]
+        label_evidence(labels, policy)
         require(item["Image"] == cfg["Image"] == policy.image_id and hex_hash(item["Id"])
                 and item["Id"] != payload["historical"]["container_id"] and item["Name"] == "/" + binding["name"]
                 and binding["image_id"] == policy.image_id and binding["revision"] == policy.revision and binding["tree"] == policy.tree
                 and labels.get("io.tecnocontrol.bgv2.slot") == "BLUE" and labels.get("io.tecnocontrol.bgv2.role") == "frontend"
-                and cfg.get("Entrypoint") is None and cfg["Cmd"] == [item["Path"], *item["Args"]] == PRIVATE_COMMAND
+                and cfg.get("Entrypoint") is None and optional["Cmd"] == [item["Path"], *item["Args"]] == PRIVATE_COMMAND
                 and image_evidence(image, policy) == payload["image"], "LEGACY_FRONTEND_PRIVATE_IMAGE_DRIFTED")
-        mount_rows = item["Mounts"]
+        mount_rows = canonicalize_mounts(item["Mounts"])
         binds = [row for row in mount_rows if row.get("Destination") == PRIVATE_CONFIG]
         require(len(binds) == 1 and binds[0].get("Type") == "bind" and binds[0].get("RW") is False
                 and binds[0].get("Source") == contract["slot_caddyfile_source"] and host.get("Tmpfs") == PRIVATE_TMPFS
                 and all(row is binds[0] or row.get("Destination") in PRIVATE_TMPFS and row.get("Type") == "tmpfs"
                         and row.get("RW") is False for row in mount_rows)
-                and len({row["Destination"] for row in mount_rows}) == len(mount_rows)
                 and not host.get("PortBindings") and host["PublishAllPorts"] is False
                 and not any(item["NetworkSettings"]["Ports"].values()), "LEGACY_FRONTEND_PRIVATE_MOUNT_OR_PORT_DRIFTED")
         name = contract["network_name"]
@@ -401,7 +405,9 @@ def verify_private_frontend(item, image, network, read, payload, binding, *, pol
         active = content.pop("slot_caddyfile_sha256")
         require(content == payload["content"] and active == contract["slot_caddyfile_sha256"],
                 "LEGACY_FRONTEND_PRIVATE_CONTENT_DRIFTED")
-    except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError):
+    except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
+            raise
         raise Stop("LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED") from None
     return {"classification": LEGACY_FRONTEND_IMAGE_EXACT, "container_id": item["Id"], "image_id": image["Id"]}
 

@@ -1,9 +1,12 @@
 """Prepare read-only evidence for the initial legacy BLUE backend adoption."""
 
 import argparse
+from contextlib import suppress
 from pathlib import Path
 import sys
+from uuid import uuid4
 
+from docker_mounts import encode_mount_evidence
 from edge_config import seal_new
 from gates import DockerProbe
 from release_state import Stop, canonical, decode, read_private, require_private
@@ -17,13 +20,21 @@ def main(argv=None):
     parser.add_argument("--project", required=True)
     parser.add_argument("--manifest", required=True, type=Path)
     args = parser.parse_args(argv)
+    mount_observations = []
+    evidence = args.manifest.with_name(args.manifest.stem + ".mounts.json")
     try:
         bindings = decode(read_private(args.bindings))
         require_private(args.manifest.parent, directory=True)
-        probe = DockerProbe(bindings, context=args.docker_context, edge_name=args.trusted_proxy_name)
+        probe = DockerProbe(bindings, context=args.docker_context, edge_name=args.trusted_proxy_name,
+                            mount_observations=mount_observations)
         manifest = probe.capture_legacy_blue(expected_project=args.project, expected_service="backend")
+        seal_new(evidence, encode_mount_evidence(mount_observations))
         seal_new(args.manifest, canonical(manifest) + b"\n")
     except (Stop, OSError, ValueError, KeyError, TypeError) as error:
+        if mount_observations:
+            with suppress(Stop, OSError):
+                failed = evidence.with_name(evidence.stem + ".failed-" + uuid4().hex + ".json")
+                seal_new(failed, encode_mount_evidence(mount_observations))
         print(str(error) if isinstance(error, Stop) else "LEGACY_BLUE_CAPTURE_FAILED", file=sys.stderr)
         return 1
     print(f"LEGACY_BLUE_MANIFEST_SHA256={manifest['sha256']}")

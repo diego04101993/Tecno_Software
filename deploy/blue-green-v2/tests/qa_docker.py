@@ -85,13 +85,15 @@ class LocalDocker:
         return value
 
     def verify_inputs(self):
+        from docker_config import parse_optional_config
+
         limits = json.loads(self.run("info", "--format", "{{json .}}"))
         if limits["OSType"] != "linux" or limits["NCPU"] < 4 or limits["MemTotal"] < 7_500_000_000:
             raise RuntimeError("Disposable dual-slot QA requires Linux Docker, 4 CPU and 7.5 GB")
         for release in RELEASES.values():
             for image in release["images"].values():
                 details = self.inspect("image", image)
-                labels = details["Config"]["Labels"]
+                labels = parse_optional_config(details.get("Config"))["Labels"]
                 if details["Id"] != image or (
                     labels.get("org.opencontainers.image.revision"), labels.get("io.tecnocontrol.git.tree")
                 ) != (release["revision"], release["tree"]):

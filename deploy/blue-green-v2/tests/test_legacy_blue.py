@@ -214,7 +214,8 @@ class LegacyBlueTests(unittest.TestCase):
                   "runtime_serial_ok": 36, "runtime_concurrent_ok": 16, "runtime_clients": 4,
                   "runtime_transport_timeout_s": 10, "channels_elapsed_ns": 42, "pool": "BALANCED",
                   "phase3_infra_capacity": True, "schema_unchanged": True, "media_unchanged": True,
-                  "contracts": {"windows_legacy": True, "android_normal": True}}
+                  "phase3_product_contracts": "UNCHANGED_PRODUCT_NOT_REQUALIFIED",
+                  "phase3_real_player_continuity_gate": "REQUIRED_AFTER_HANDOFF"}
         now = datetime(2026, 11, 12, 18, 2, tzinfo=timezone.utc)
         extra = {"healthy_at": now.isoformat(), "ready_at": now.isoformat(), "private_route": True, "checks": checks}
         gate = ReadyGate(key, now=lambda: now)

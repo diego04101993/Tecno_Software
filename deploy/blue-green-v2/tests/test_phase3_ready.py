@@ -1,15 +1,49 @@
 from collections import Counter
+from copy import deepcopy
 import json
 from threading import Lock
 from unittest import TestCase
 from unittest.mock import patch
 from uuid import UUID
 
-from phase3_ready import PREVIEW_CA, Response, private_checks, request
-from release_state import Stop
+from legacy_frontend_blue import R3_POLICY
+from phase3_ready import PREVIEW_CA, Response, private_checks, request, validate_reviewed_checks
+from release_state import Stop, digest
 
 
 CHANNEL = str(UUID(int=1))
+
+
+class ReviewPolicyTests(TestCase):
+    def setUp(self):
+        release = R3_POLICY.release
+        self.qualification = {"scope": "R3_EXACT_IMAGE_QUALIFICATION", "status": "PASS", "release": release,
+                              "roles": {role: {"image_id": image} for role, image in release["images"].items()}}
+        self.reviewed = {"qualification_sha256": digest(self.qualification), "schema_unchanged": True,
+                         "media_unchanged": True, "phase3_infra_capacity": True, "pool": "ISOLATED_NOT_APPLICABLE",
+                         "phase3_product_contracts": "UNCHANGED_PRODUCT_NOT_REQUALIFIED",
+                         "phase3_real_player_continuity_gate": "REQUIRED_AFTER_HANDOFF"}
+
+    def test_exact_r3_has_no_historical_product_contract_precondition(self):
+        self.assertEqual(validate_reviewed_checks(self.qualification, self.reviewed), R3_POLICY.release)
+
+    def test_changed_backend_release_or_qualified_image_cannot_reuse_phase3_policy(self):
+        different_image = "sha256:" + "6" * 64
+        for target in ("pinned", "observed"):
+            with self.subTest(target=target):
+                qualification = deepcopy(self.qualification)
+                if target == "pinned":
+                    qualification["release"]["images"]["api"] = different_image
+                else:
+                    qualification["roles"]["api"]["image_id"] = different_image
+                with self.assertRaisesRegex(Stop, "PHASE3_R3_QUALIFICATION_REQUIRED"):
+                    validate_reviewed_checks(qualification, {**self.reviewed, "qualification_sha256": digest(qualification)})
+
+    def test_review_stays_bound_to_qualification_and_defers_continuity(self):
+        for override in ({"qualification_sha256": "3" * 64}, {"phase3_real_player_continuity_gate": "PASS"},
+                         {"media_unchanged": False}, {"phase3_infra_capacity": False}):
+            with self.subTest(override=override), self.assertRaisesRegex(Stop, "PHASE3_REVIEWED_EVIDENCE_INVALID"):
+                validate_reviewed_checks(self.qualification, {**self.reviewed, **override})
 
 
 class PrivateReadinessTests(TestCase):
