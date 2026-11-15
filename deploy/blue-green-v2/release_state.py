@@ -180,11 +180,16 @@ def validate_state(state):
                 "ACTIVE_SLOT_MISSING")
     if "legacy_blue" in state:
         legacy = state["legacy_blue"]
-        require(type(legacy) is dict and set(legacy) == {
+        legacy_fields = {
             "manifest_sha256", "postgres_id", "frontend_stable_hash", "runtime_epochs",
-        }, "INVALID_LEGACY_ADOPTION_STATE")
+        }
+        require(type(legacy) is dict and set(legacy) in (legacy_fields, legacy_fields | {"frontend_manifest_sha256"}),
+                "INVALID_LEGACY_ADOPTION_STATE")
         for key in ("manifest_sha256", "postgres_id", "frontend_stable_hash"):
             validate_hash(legacy[key])
+        if "frontend_manifest_sha256" in legacy:
+            validate_hash(legacy["frontend_manifest_sha256"])
+            require(slots["BLUE"] is not None and slots["BLUE"]["phase"] != "RETIRED", "LEGACY_FRONTEND_ADOPTION_RETIRED")
         epochs = legacy["runtime_epochs"]
         require(type(epochs) is dict and set(epochs) == set(ROLES)
                 and slots["BLUE"] is not None and set(slots["BLUE"]["ready"]) == set(ROLES),

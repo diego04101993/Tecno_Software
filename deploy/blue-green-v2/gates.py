@@ -17,6 +17,10 @@ import subprocess
 from time import monotonic
 from uuid import UUID
 
+from legacy_frontend_blue import (
+    LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION, classify_historical, verify_manifest,
+    verify_private_frontend,
+)
 from release_state import EPOCH_IDENTITY_FIELDS, IDENTITY_FIELDS, Stop, canonical, digest, now, same_runtime_epoch, validate_runtime_epoch
 
 
@@ -98,8 +102,14 @@ def comparison_host_config(raw):
 
 def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
                   frontend_config_hash=None, raw_argv=None, network_namespace=None, *, legacy_compose=None,
-                  allow_restarted=False):
+                  allow_restarted=False, legacy_frontend_proof=None, legacy_frontend_policy=R3_POLICY):
     """Project Docker evidence without persisting credentials or raw config."""
+    if legacy_frontend_proof is not None:
+        release = legacy_frontend_policy.release
+        require((role, slot) == ("frontend", "BLUE") and legacy_compose is None and legacy_frontend_proof == {
+            "classification": LEGACY_FRONTEND_IMAGE_EXACT, "container_id": item["Id"], "image_id": image["Id"],
+        } and image["Id"] == release["images"]["frontend"]
+                and all(binding[field] == release[field] for field in ("revision", "tree")), "LEGACY_FRONTEND_SCOPE_INVALID")
     alias = scope_name(role, slot)
     if legacy_compose is None:
         expected_upstream = f"{alias}:{8000 if role == 'api' else 80}"
@@ -129,12 +139,13 @@ def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
     require(item["Image"] == image["Id"] == binding["image_id"]
             and image["Id"].startswith("sha256:") and hex_digest(image["Id"][7:]), "WRONG_IMAGE_ID")
     image_labels = image["Config"]["Labels"]
-    if legacy_compose is not None and image_labels is None:
+    permits_missing_oci = legacy_compose is not None or legacy_frontend_proof is not None
+    if permits_missing_oci and image_labels is None:
         image_labels = {}
     for key, pin in ((REVISION_LABEL, "revision"), (TREE_LABEL, "tree")):
         require(re.fullmatch(r"[0-9a-f]{40}", binding[pin]) and (
             image_labels.get(key) == labels.get(key) == binding[pin] or (
-                legacy_compose is not None and key not in image_labels and key not in labels
+                permits_missing_oci and key not in image_labels and key not in labels
             )), "WRONG_OCI_LABELS")
     settings = item["NetworkSettings"]
     require(not item["HostConfig"].get("PortBindings")
@@ -294,7 +305,8 @@ def backend_argv(raw_argv):
 class DockerProbe:
     """Read-only Docker commands against an explicitly selected local Engine."""
 
-    def __init__(self, bindings, context="default", edge_name=None, legacy_blue=None, legacy_blue_sha256=None):
+    def __init__(self, bindings, context="default", edge_name=None, legacy_blue=None, legacy_blue_sha256=None, *,
+                 legacy_frontend_blue=None, legacy_frontend_blue_sha256=None, legacy_frontend_policy=R3_POLICY):
         require(isinstance(context, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", context), "INVALID_DOCKER_CONTEXT")
         self.bindings = bindings
         self.context = context
@@ -317,6 +329,30 @@ class DockerProbe:
             except (ValueError, KeyError, TypeError, AttributeError):
                 raise GateError("LEGACY_BLUE_MANIFEST_INVALID") from None
         self.legacy_blue_sha256 = legacy_blue_sha256
+        self.legacy_frontend_blue = None
+        self.legacy_frontend_blue_sha256 = None
+        self.legacy_frontend_policy = legacy_frontend_policy
+        frontend_binding = bindings.get("frontend:BLUE", {})
+        require(type(frontend_binding) is dict, "LEGACY_FRONTEND_BINDING_INVALID")
+        if "legacy_frontend_adoption" in frontend_binding:
+            approved = frontend_binding["legacy_frontend_adoption"]
+            require(legacy_frontend_blue is None and legacy_frontend_blue_sha256 is None
+                    and type(approved) is dict and set(approved) == {"manifest", "sha256"}
+                    and approved["manifest"] is not None and approved["sha256"] is not None,
+                    "LEGACY_FRONTEND_MANIFEST_SOURCE_INVALID")
+            legacy_frontend_blue, legacy_frontend_blue_sha256 = approved["manifest"], approved["sha256"]
+        require((legacy_frontend_blue is None) == (legacy_frontend_blue_sha256 is None),
+                "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
+        if legacy_frontend_blue is not None:
+            require(self.legacy_blue is not None, "LEGACY_FRONTEND_SCOPE_INVALID")
+            payload = verify_manifest(legacy_frontend_blue, legacy_frontend_blue_sha256, policy=legacy_frontend_policy)
+            release = payload["release"]
+            backend = self.legacy_blue["stable_identity"]
+            require(all(frontend_binding.get(field) == backend[field] == release[field]
+                        for field in ("revision", "tree")) and frontend_binding.get("image_id") == release["images"]["frontend"]
+                    and backend["image_id"] == release["images"]["api"], "LEGACY_FRONTEND_RELEASE_MISMATCH")
+            self.legacy_frontend_blue = payload
+            self.legacy_frontend_blue_sha256 = legacy_frontend_blue_sha256
         endpoint = self._json("context", "inspect", context)[0]["Endpoints"]["docker"]["Host"]
         require(endpoint.startswith(("unix:///", "npipe:////./pipe/")), "NONLOCAL_DOCKER_CONTEXT")
 
@@ -360,7 +396,10 @@ class DockerProbe:
                 and state["Health"]["Status"] == "healthy", "LEGACY_POSTGRES_NOT_EXACT_HEALTHY")
         return postgres
 
-    def _probe(self, role, slot, legacy_compose=None, *, with_epoch=False):
+    def _probe(self, role, slot, legacy_compose=None, *, with_epoch=False, legacy_frontend=False):
+        if legacy_frontend:
+            require((role, slot) == ("frontend", "BLUE") and with_epoch and self.legacy_frontend_blue is not None,
+                    "LEGACY_FRONTEND_SCOPE_INVALID")
         alias = scope_name(role, slot)
         binding = self.bindings[f"{role}:{slot}"]
         name = binding["name"]
@@ -414,14 +453,29 @@ class DockerProbe:
         config_hash = None
         if role == "frontend":
             config_hash = hashlib.sha256(b"\n".join(config_lines)).hexdigest()
+        proof = None
+        if legacy_frontend:
+            proof = verify_private_frontend(first, image, network, self._run, self.legacy_frontend_blue, binding,
+                                            policy=self.legacy_frontend_policy)
+            require(proof["classification"] == LEGACY_FRONTEND_IMAGE_EXACT and proof["container_id"] == container
+                    and proof["image_id"] == image_id, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
         last = self._json("container", "inspect", name)[0]
         require(first["Id"] == last["Id"] and first["State"]["StartedAt"] == last["State"]["StartedAt"]
                 and first["State"]["Pid"] == last["State"]["Pid"], "SLOT_CHANGED_DURING_INSPECTION")
         if legacy_compose is not None:
             return legacy_blue_payload(last, image, network, peers, binding, argv, ticks, raw_argv,
                                        namespace, legacy_compose, self._host_boot_id(container, host_boot_raw.decode()))
+        if legacy_frontend:
+            require(all(first[field] == last[field] for field in ("Image", "Config", "HostConfig", "Mounts", "NetworkSettings")),
+                    "LEGACY_FRONTEND_CHANGED_DURING_INSPECTION")
         identity = live_identity(last, image, network, peers, binding, role, slot, argv, ticks,
-                                 config_hash, raw_argv, namespace, allow_restarted=with_epoch)
+                                 config_hash, raw_argv, namespace, allow_restarted=with_epoch,
+                                 legacy_frontend_proof=None if proof is None else {
+                                     field: proof[field] for field in ("classification", "container_id", "image_id")
+                                 }, legacy_frontend_policy=getattr(self, "legacy_frontend_policy", R3_POLICY))
+        if legacy_frontend:
+            identity["runtime_hash"] = digest({"runtime_hash": identity["runtime_hash"],
+                                               "approved_manifest": self.legacy_frontend_blue_sha256})
         if with_epoch:
             return {"identity": identity, "stable_identity": stable_slot_identity(last, image, identity, raw_argv, binding),
                     "runtime_epoch": runtime_epoch(identity, self._host_boot_id(container, host_boot_raw.decode()))}
@@ -465,9 +519,39 @@ class DockerProbe:
     def legacy_frontend_snapshot(self):
         require(self.legacy_blue is not None, "LEGACY_BLUE_MANIFEST_APPROVAL_REQUIRED")
         try:
+            if getattr(self, "legacy_frontend_blue", None) is not None:
+                return self._probe("frontend", "BLUE", with_epoch=True, legacy_frontend=True)
             return self._probe("frontend", "BLUE", with_epoch=True)
         except (GateError, ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise GateError("LEGACY_BLUE_FRONTEND_UNKNOWN_OR_DRIFTED") from None
+
+    def initial_legacy_frontend_identity(self):
+        require(self.legacy_frontend_blue is not None, "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
+        snapshot = self.legacy_frontend_snapshot()
+        require(snapshot["runtime_epoch"]["restart_count"] == 0, "LEGACY_FRONTEND_INITIAL_RESTART_COUNT")
+        return snapshot["identity"]
+
+    def verify_initial_legacy_frontend_source(self):
+        """Require the original R3 ingress to be present before first adoption."""
+        require(self.legacy_frontend_blue is not None, "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
+        payload = self.legacy_frontend_blue
+        try:
+            historical_id = payload["historical"]["container_id"]
+            item, = self._json("container", "inspect", historical_id)
+            image, = self._json("image", "inspect", payload["release"]["images"]["frontend"])
+            require(item["Name"] == "/" + self.edge_name and item["State"]["Running"] is True,
+                    "LEGACY_FRONTEND_HISTORICAL_SOURCE_NOT_ACTIVE")
+            pin = self.legacy_frontend_blue_sha256
+            require(classify_historical(item, image, self._run, {"sha256": pin, "payload": payload}, pin,
+                                        policy=self.legacy_frontend_policy) == LEGACY_FRONTEND_IMAGE_EXACT,
+                    "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+            after, = self._json("container", "inspect", historical_id)
+            require(all(after[field] == item[field] for field in ("Id", "Image", "Config", "HostConfig", "Mounts", "NetworkSettings"))
+                    and after["State"]["Running"] is True
+                    and all(after["State"][field] == item["State"][field] for field in ("Pid", "StartedAt")),
+                    "LEGACY_FRONTEND_CHANGED_DURING_INSPECTION")
+        except (Stop, ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise GateError("LEGACY_FRONTEND_HISTORICAL_SOURCE_UNKNOWN_OR_DRIFTED") from None
 
     def legacy_postgres_id(self):
         try:
@@ -527,8 +611,9 @@ class DockerProbe:
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise GateError("INVALID_SLOT_INSPECTION_EVIDENCE") from None
 
-    def frontend_listener(self, slot, expected):
+    def frontend_listener(self, slot, expected, *, initial_legacy=False):
         """Prove the same Caddy process owns a ready TCP path without a GET."""
+        require(not initial_legacy or slot == "BLUE", "LEGACY_FRONTEND_SCOPE_INVALID")
         require(hex_digest(expected["container_id"]), "WRONG_CONTAINER")
         started = monotonic()
         self._run("exec", expected["container_id"], "sh", "-ec", """
@@ -537,7 +622,8 @@ class DockerProbe:
             nc -z -w 1 127.0.0.1 80
         """, timeout=5)
         require(monotonic() - started <= 5, "FRONTEND_LISTENER_DEADLINE")
-        require(self("frontend", slot) == expected, "FRONTEND_IDENTITY_CHANGED_DURING_READINESS")
+        observed = self.initial_legacy_frontend_identity() if initial_legacy else self("frontend", slot)
+        require(observed == expected, "FRONTEND_IDENTITY_CHANGED_DURING_READINESS")
 
 
 def sign_receipt(kind, payload, key):
@@ -573,6 +659,9 @@ class ReadyGate:
                     "INVALID_READINESS_TIMELINE")
             checks = data["checks"]
             if context["role"] == "frontend":
+                if "adoption" in context:
+                    require(context["adoption"] == READY_ADOPTION and context.get("slot") == "BLUE",
+                            "LEGACY_FRONTEND_SCOPE_INVALID")
                 exact = {"startup_listener_ready": True, "root_http": 200, "root_get_count": 1, "assets_ok": True}
                 return canonical(checks) == canonical(exact)
             require(context["role"] == "api", "INVALID_READY_ROLE")

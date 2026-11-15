@@ -12,6 +12,7 @@ import stat
 from pathlib import Path
 
 from gates import legacy_blue_endpoint, utc, verify_legacy_blue_manifest
+from legacy_frontend_blue import READY_ADOPTION
 
 from release_state import (
     IDENTITY_FIELDS, ROLES, SLOTS, StateStore, Stop, canonical, decode, digest, exclusive_lock, now, read_private,
@@ -345,6 +346,12 @@ class Controller:
                     and legacy["postgres_id"] == self.probe.legacy_blue["postgres_id"], "LEGACY_BLUE_ADOPTION_STATE_MISMATCH")
         else:
             require(legacy is None, "UNEXPECTED_LEGACY_BLUE_ADOPTION_STATE")
+        self._require_legacy_frontend_binding(legacy)
+
+    def _require_legacy_frontend_binding(self, legacy):
+        expected = None if legacy is None else legacy.get("frontend_manifest_sha256")
+        require(expected == getattr(self.probe, "legacy_frontend_blue_sha256", None),
+                "LEGACY_FRONTEND_ADOPTION_STATE_MISMATCH")
 
     def _legacy_snapshots(self, release):
         snapshots = {"api": self.probe.legacy_api_snapshot(), "frontend": self.probe.legacy_frontend_snapshot()}
@@ -362,6 +369,9 @@ class Controller:
         if (role, slot) == ("api", "BLUE") and getattr(self.probe, "legacy_blue_endpoint", None):
             require(initial_adoption, "LEGACY_BLUE_REQUIRES_INITIAL_ADOPTION")
             context["adoption"] = "LEGACY_BLUE"
+        if (role, slot) == ("frontend", "BLUE") and getattr(self.probe, "legacy_frontend_blue_sha256", None):
+            require(initial_adoption, "LEGACY_FRONTEND_REQUIRES_INITIAL_ADOPTION")
+            context["adoption"] = READY_ADOPTION
         require(self.ready_gate(receipt, context) is True, "READY_RECEIPT_REJECTED")
         return {"identity": identity, "identity_hash": context["identity_hash"], "validated_at": now()}
 
@@ -376,6 +386,7 @@ class Controller:
             if role == "api":
                 identity = self.probe.classify_legacy_blue(approved_epoch=epoch)[1]
             else:
+                self._require_legacy_frontend_binding(legacy)
                 snapshot = self.probe.legacy_frontend_snapshot()
                 require(digest(snapshot["stable_identity"]) == legacy["frontend_stable_hash"],
                         "LEGACY_BLUE_FRONTEND_UNKNOWN_OR_DRIFTED")
@@ -445,6 +456,10 @@ class Controller:
 
     def _initial_state(self, release, receipts_by_role, config_hash):
         legacy = getattr(self.probe, "legacy_blue_endpoint", None) is not None
+        frontend_pin = getattr(self.probe, "legacy_frontend_blue_sha256", None)
+        if frontend_pin is not None:
+            require(legacy and self.probe.legacy_frontend_blue["release"] == release, "LEGACY_FRONTEND_SCOPE_INVALID")
+            self.probe.verify_initial_legacy_frontend_source()
         snapshots = self._legacy_snapshots(release) if legacy else {}
         if legacy:
             require(same_runtime_epoch(snapshots["api"]["runtime_epoch"], self.probe.legacy_blue["runtime_epoch"])
@@ -467,12 +482,15 @@ class Controller:
                 "frontend_stable_hash": digest(snapshots["frontend"]["stable_identity"]),
                 "runtime_epochs": {role: snapshots[role]["runtime_epoch"] for role in ROLES},
             }
+            if frontend_pin is not None:
+                state["legacy_blue"]["frontend_manifest_sha256"] = frontend_pin
         return state
 
     def reattest_legacy_blue_after_host_reboot(self, state):
         legacy = state.get("legacy_blue")
         if legacy is None:
             return None
+        self._require_legacy_frontend_binding(legacy)
         before = legacy["runtime_epochs"]
         if self.probe.legacy_engine_boot_id() == before["api"]["boot_id"]:
             return None
@@ -741,6 +759,8 @@ def main():
     parser.add_argument("--edge-name", required=True)
     parser.add_argument("--legacy-blue-manifest")
     parser.add_argument("--legacy-blue-sha256")
+    parser.add_argument("--legacy-frontend-manifest")
+    parser.add_argument("--legacy-frontend-sha256")
     subparsers = parser.add_subparsers(dest="action", required=True)
     initialize = subparsers.add_parser("initialize")
     initialize.add_argument("release")
@@ -772,11 +792,15 @@ def main():
 
         key = read_private(args.key)
         require(bool(args.legacy_blue_manifest) == bool(args.legacy_blue_sha256), "LEGACY_MANIFEST_PIN_REQUIRED")
+        require(bool(args.legacy_frontend_manifest) == bool(args.legacy_frontend_sha256),
+                "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
         controller = Controller(
             StateStore(args.state_dir), CaddyEdge(args.socket, args.autosave),
             DockerProbe(_json(args.bindings), edge_name=args.edge_name,
                         legacy_blue=_json(args.legacy_blue_manifest) if args.legacy_blue_manifest else None,
-                        legacy_blue_sha256=args.legacy_blue_sha256), ReadyGate(key), PlayerGate(key),
+                        legacy_blue_sha256=args.legacy_blue_sha256,
+                        legacy_frontend_blue=_json(args.legacy_frontend_manifest) if args.legacy_frontend_manifest else None,
+                        legacy_frontend_blue_sha256=args.legacy_frontend_sha256), ReadyGate(key), PlayerGate(key),
         )
         action = args.action
         if action == "initialize":

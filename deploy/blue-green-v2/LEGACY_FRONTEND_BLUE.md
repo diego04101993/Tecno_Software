@@ -1,0 +1,18 @@
+# Adopción inicial del frontend histórico R3
+
+V2.3 añade una vía de calificación para `INITIAL_LEGACY_FRONTEND_BLUE_ADOPTION`. La excepción se limita a la revisión y el tree aprobados de R3, al backend R3 ya adoptado y al frontend BLUE inicial. Los slots V2 nativos conservan sus requisitos de OCI. El manifiesto fija el ID inmutable de la imagen histórica, `sha256:b2a1ae4a8515e9d1db4cb14744bba356311317c819a3a16b37c791d0257e905a`, y la configuración del contenedor histórico, `f88d886132ec73965afdee7036ca7fcecc7e2c2376a4937c6e84128052571596`.
+
+La inspección anterior identificó el contenedor, los RepoDigests y el `index.html`, pero sólo registró la cantidad de assets. Para emitir el manifiesto productivo falta recoger los hashes individuales de los assets referenciados desde el contenedor exacto. El manifiesto y su pin se preparan en la calificación final de solo lectura que se autorice por separado.
+
+## Evidencia y sellado
+
+1. Obtener la proyección de solo lectura con `qualify_r3.py --capture-legacy-frontend-evidence --frontend-id "$OLD_FRONTEND_ID"`. Conservarla localmente. El selector utiliza el ID completo aprobado. La proyección contiene hashes de configuración y archivos, campos técnicos de imagen y los contratos de red y montaje. Las variables de entorno, los archivos TLS y los cuerpos de assets quedan fuera de la proyección.
+2. Preparar el JSON de contrato privado con `network_name`, `network_id`, `ipv4`, `slot_caddyfile_source` y `slot_caddyfile_sha256`. Usar la red proxy exacta observada, la IP privada libre aprobada y el origen absoluto del bind de `Caddyfile.slot`. El contrato fija el alias `frontend-blue`, TCP 80 interno, ausencia de publicación y ausencia de volúmenes TLS públicos.
+3. Sellar en local con `legacy_frontend_blue.py seal --evidence r3-frontend-evidence.json --private-contract frontend-blue-private.json --manifest legacy-frontend-blue-manifest.json`. Revisar el contenido y aprobar por separado el SHA-256 del payload canónico. El campo `sha256` del JSON no otorga aprobación por sí mismo.
+4. Ejecutar la calificación existente de `qualify_r3.py` con `--legacy-frontend-manifest` y `--legacy-frontend-sha256`. Verificar `LEGACY_FRONTEND_IMAGE_EXACT`, `PASS_LEGACY_MANIFEST` y `frontend_blue_create_image_id` exactamente igual al ID histórico aprobado. La calificación también exige que el alias y la IP previstos estén libres en el bridge interno aprobado. Ante una diferencia, detener la calificación.
+
+## Integración con Phase 3
+
+Sólo tras autorizar Phase 3, usar la secuencia existente. En el JSON privado `BINDINGS`, añadir a `frontend:BLUE` el objeto `legacy_frontend_adoption` con `manifest` igual al JSON sellado y `sha256` igual al pin aprobado de forma independiente. El controlador, el firmante de READY y el supervisor leen el mismo binding. El firmante exige la calificación del mismo pin y comprueba los archivos del frontend privado antes del handoff. El controlador vincula el pin al estado de la adopción inicial y conserva el guard en recuperación. La excepción queda ligada al frontend admitido de R3 y no habilita otra admisión tras su retiro.
+
+La creación privada sigue el contrato del runbook. Usa el ID calificado con `--pull=never`, `Caddyfile.slot` en solo lectura, la red interna y ningún puerto de host. El frontend histórico conserva su configuración y su papel en la reversión. Este documento añade los datos de provenance al procedimiento existente. La creación de contenedores y los cambios de tráfico requieren autorización independiente de Phase 3.

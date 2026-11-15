@@ -4,11 +4,13 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from getpass import getpass
+import hashlib
 from pathlib import Path
 import re
 import sys
 
 from gates import DockerProbe, ReadyGate, hex_digest, identifier, sign_receipt
+from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT, READY_ADOPTION
 from qualify_r3 import R3_IMAGES, docker_read
 from release_state import Stop, canonical, decode, digest, now, read_private, require, validate_release, write_private_atomic
 from routectl import DEFAULT_HOSTS
@@ -52,7 +54,7 @@ def validate_runtime(response, channel):
             and type(value["outputs"]) is list and len(value["outputs"]) == 1, "PHASE3_R3_RUNTIME_CONTRACT")
 
 
-def private_checks(call, channel_ids, jwt):
+def private_checks(call, channel_ids, jwt, *, legacy_frontend_content=None):
     call("api", "/")
     call("api", "/api/player/time")
     call("api", "/api/auth/me", jwt)
@@ -74,12 +76,21 @@ def private_checks(call, channel_ids, jwt):
                 result.result()
 
     root = call("frontend", "/")
-    assets = set(ASSET.findall(root.body))
+    expected_assets = None if legacy_frontend_content is None else legacy_frontend_content["asset_sha256"]
+    if expected_assets is None:
+        assets = set(ASSET.findall(root.body))
+    else:
+        require(hashlib.sha256(root.body).hexdigest() == legacy_frontend_content["index_sha256"],
+                "PHASE3_LEGACY_FRONTEND_INDEX_MISMATCH")
+        assets = {path.encode() for path in expected_assets}
     require(root.mime.startswith("text/html") and any(path.endswith(b".js") for path in assets),
             "PHASE3_FRONTEND_INDEX_INVALID")
     for path in sorted(assets):
         asset = call("frontend", path.decode())
         require(asset.body and not asset.mime.startswith("text/html"), "PHASE3_FRONTEND_ASSET_INVALID")
+        if expected_assets is not None:
+            require(hashlib.sha256(asset.body).hexdigest() == expected_assets[path.decode()],
+                    "PHASE3_LEGACY_FRONTEND_ASSET_MISMATCH")
     return {"api": {"root_http": 200, "time_http": 200, "auth_me_http": 200, "channels_http": 200,
                      "channels_elapsed_ns": channels.elapsed_ns, "runtime_serial_ok": 36, "runtime_concurrent_ok": 16,
                      "runtime_clients": 4, "runtime_transport_timeout_s": 10},
@@ -88,6 +99,19 @@ def private_checks(call, channel_ids, jwt):
 
 def read_json(path):
     return decode(read_private(path))
+
+
+def legacy_frontend_ready_pin(qualification, probe):
+    frontend = qualification["roles"]["frontend"]
+    pin = probe.legacy_frontend_blue_sha256
+    if pin is not None or frontend.get("provenance") == "PASS_LEGACY_MANIFEST":
+        require(hex_digest(pin) and frontend.get("legacy_frontend_manifest_sha256") == pin
+                and frontend.get("frontend_classifier") == LEGACY_FRONTEND_IMAGE_EXACT
+                and frontend.get("provenance") == "PASS_LEGACY_MANIFEST"
+                and frontend.get("frontend_blue_feasibility") == "PASS"
+                and frontend.get("frontend_blue_create_image_id") == R3_IMAGES["frontend"],
+                "PHASE3_LEGACY_FRONTEND_QUALIFICATION_MISMATCH")
+    return pin
 
 
 def main(argv=None):
@@ -115,25 +139,38 @@ def main(argv=None):
                 and len(channels) == len(set(channels)), "PHASE3_CHANNEL_FIXTURE_INVALID")
         probe = DockerProbe(read_json(args.bindings), edge_name=args.trusted_proxy_name,
                             legacy_blue=read_json(args.legacy_manifest), legacy_blue_sha256=args.legacy_sha256)
-        before = {role: probe(role, "BLUE") for role in R3_IMAGES}
+        frontend_pin = legacy_frontend_ready_pin(qualification, probe)
+        if frontend_pin is not None:
+            probe.verify_initial_legacy_frontend_source()
+
+        def identity(role):
+            if role == "frontend" and frontend_pin is not None:
+                return probe.initial_legacy_frontend_identity()
+            return probe(role, "BLUE")
+
+        before = {role: identity(role) for role in R3_IMAGES}
         original = qualification["roles"]["api"]["runtime"]
         require(all(before["api"][field] == original[field] for field in ("container_id", "pid", "started_at"))
                 and all(before[role]["image_id"] == R3_IMAGES[role] for role in R3_IMAGES),
                 "PHASE3_R3_READY_IDENTITY_MISMATCH")
-        probe.frontend_listener("BLUE", before["frontend"])
+        probe.frontend_listener("BLUE", before["frontend"], initial_legacy=frontend_pin is not None)
         healthy_at = now()
         jwt = getpass("JWT administrativo existente: ")
         require(re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", jwt), "PHASE3_JWT_FORMAT_INVALID")
-        checks = private_checks(lambda role, path, token=None: request(args.edge_id, role, path, token), channels, jwt)
+        content = None if frontend_pin is None else probe.legacy_frontend_blue["content"]
+        checks = private_checks(lambda role, path, token=None: request(args.edge_id, role, path, token), channels, jwt,
+                                legacy_frontend_content=content)
         key = read_private(args.key)
         receipts = {}
         for role, expected in before.items():
-            require(probe(role, "BLUE") == expected, "PHASE3_R3_READY_IDENTITY_CHANGED")
+            require(identity(role) == expected, "PHASE3_R3_READY_IDENTITY_CHANGED")
             context = {"role": role, "slot": "BLUE", "release": release,
                        "identity_hash": digest(expected), "started_at": expected["started_at"]}
             if role == "api":
                 context["adoption"] = "LEGACY_BLUE"
                 checks[role].update({name: value for name, value in reviewed.items() if name != "qualification_sha256"})
+            elif frontend_pin is not None:
+                context["adoption"] = READY_ADOPTION
             receipt = sign_receipt("READY", {**context, "healthy_at": healthy_at, "ready_at": now(),
                                               "private_route": True, "checks": checks[role]}, key)
             require(ReadyGate(key)(receipt, context), "PHASE3_READY_RECEIPT_INVALID")
