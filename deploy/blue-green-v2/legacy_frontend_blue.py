@@ -65,6 +65,7 @@ class LegacyFrontendPolicy:
     rollback_reference: str
     historical_name: str = "tecnocontrol-frontend-1"
     historical_project: str = "tecnocontrol"
+    historical_srv_tree_sha256: str | None = None
 
     @property
     def release(self):
@@ -96,6 +97,7 @@ R3_POLICY = LegacyFrontendPolicy(
     rollback_source="/root/tecnocontrol-stage3-controller-r2-5f8ed57-20261109T014723Z-kovkyhps/stage3.rollback-images.yml",
     rollback_source_sha256="700423bdb8651d05ee355c217c0c4e0fc7916adb2a362653974775b32bfde19a",
     rollback_reference=f"tecnocontrol/frontend@{R3_IMAGE}",
+    historical_srv_tree_sha256="e7cadd1e11557627fca3123983608bfcc723020b370a7019f447b20eb930fb2a",
 )
 
 
@@ -356,18 +358,40 @@ def verify_manifest(manifest, expected_sha256, *, policy=R3_POLICY):
     return deepcopy(manifest["payload"])
 
 
-def classify_historical(item, image, read, manifest, expected_sha256, *, policy=R3_POLICY, read_host=None):
+def classify_historical(item, image, read, manifest, expected_sha256, *, policy=R3_POLICY, read_host=None,
+                        stable_pin=None, compose_proof=None):
     payload = verify_manifest(manifest, expected_sha256, policy=policy)
     try:
         actual = historical_evidence(item, image, read, policy=policy, read_host=read_host)
-        payload["historical"]["mounts"] = canonicalize_mounts(payload["historical"]["mounts"])
-        require(all(actual[key] == payload[key] for key in ("image", "historical", "content")),
-                "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+        require((stable_pin is None) == (compose_proof is None), "LEGACY_FRONTEND_STABLE_APPROVAL_REQUIRED")
+        if stable_pin is None:
+            payload["historical"]["mounts"] = canonicalize_mounts(payload["historical"]["mounts"])
+            require(all(actual[key] == payload[key] for key in ("image", "historical", "content")),
+                    "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+        else:
+            attest_historical_stable(item, read, manifest, expected_sha256, actual, stable_pin=stable_pin,
+                                     compose_proof=compose_proof, policy=policy)
     except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError) as exc:
         if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
             raise
         raise Stop("LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED") from None
     return LEGACY_FRONTEND_IMAGE_EXACT
+
+
+def attest_historical_stable(item, read, manifest, expected_sha256, observed, *, stable_pin, compose_proof,
+                             policy=R3_POLICY):
+    from legacy_frontend_inventory import measure_srv_tree
+
+    require(hex_hash(stable_pin) and type(compose_proof) is dict
+            and compose_proof.get("container_create_hash") == item["Config"]["Labels"].get("com.docker.compose.config-hash")
+            and compose_proof.get("container_declared_mac") == item["Config"].get("MacAddress")
+            and compose_proof.get("container_network_mode") == item["HostConfig"]["NetworkMode"],
+            "LEGACY_FRONTEND_RECONNECT_COMPOSE_CONTAINER_DRIFT")
+    proof = verify_historical_stable_projection(manifest, expected_sha256, observed, compose_proof=compose_proof,
+                                                observed_srv_tree_sha256=measure_srv_tree(item, read), policy=policy)
+    require(hmac.compare_digest(proof["legacy_frontend_stable_pin"], stable_pin),
+            "LEGACY_FRONTEND_STABLE_PIN_MISMATCH")
+    return proof
 
 
 def attest_reconnected_historical(item, image, read, manifest, expected_sha256, *, reconnect, policy=R3_POLICY,
@@ -476,7 +500,36 @@ def attest_reconnected_networks(expected, actual, *, reconnect, configured_mac=N
             "volatile_endpoint_evidence": volatile}
 
 
-def verify_private_frontend(item, image, network, read, payload, binding, *, policy=R3_POLICY):
+def verify_historical_stable_projection(manifest, expected_sha256, observed, *, compose_proof,
+                                        observed_srv_tree_sha256, policy=R3_POLICY):
+    """Attest current R3 against the sealed pre-reconnect manifest and full static inventory."""
+    payload = verify_manifest(manifest, expected_sha256, policy=policy)
+    fields = ("historical", "image", "content")
+    require(type(observed) is dict and set(observed) == set(fields), "LEGACY_FRONTEND_EVIDENCE_INVALID")
+    require(hex_hash(policy.historical_srv_tree_sha256) and hex_hash(observed_srv_tree_sha256)
+            and hmac.compare_digest(observed_srv_tree_sha256, policy.historical_srv_tree_sha256),
+            "LEGACY_FRONTEND_SRV_TREE_DRIFT")
+    approved = {key: payload[key] for key in fields}
+    historical = approved["historical"]
+    networks = historical["networks"]
+    reconnect = historical_reconnect_policy(networks, compose_proof, {name: row["IPAddress"] for name, row in networks.items()})
+    attachment = attest_reconnected_projection(approved, observed, reconnect=reconnect,
+                                               configured_mac=compose_proof["container_declared_mac"])
+    historical["networks"] = attachment["stable_network_contract"]
+    historical["mounts"] = canonicalize_mounts(historical["mounts"])
+    tls, = [mount for mount in historical["mounts"] if mount["Destination"] == "/data"]
+    require(tls["Type"] == "volume" and type(tls["Name"]) is str and bool(tls["Name"]) and tls["RW"] is True,
+            "LEGACY_FRONTEND_RECONNECTED_TLS_MOUNT_UNPROVEN")
+    stable = {**approved, "srv_tree_sha256": observed_srv_tree_sha256, "scope": payload["scope"],
+              "release": payload["release"], "tls_role": {"writer": historical["name"], "mount": "/data"}}
+    return {"classification": LEGACY_FRONTEND_IMAGE_EXACT,
+            "legacy_frontend_stable_pin": digest(stable),
+            "legacy_frontend_evidence_sha256": digest({"projection": observed, "srv_tree_sha256": observed_srv_tree_sha256}),
+            "stable_projection": stable,
+            "volatile_endpoint_evidence": attachment["volatile_endpoint_evidence"]}
+
+
+def verify_private_frontend(item, image, network, read, payload, binding, *, policy=R3_POLICY, verify_srv_tree=False):
     """Check the private replacement against the historically qualified bytes and contract."""
     try:
         validate_payload(payload, policy)
@@ -512,6 +565,12 @@ def verify_private_frontend(item, image, network, read, payload, binding, *, pol
         active = content.pop("slot_caddyfile_sha256")
         require(content == payload["content"] and active == contract["slot_caddyfile_sha256"],
                 "LEGACY_FRONTEND_PRIVATE_CONTENT_DRIFTED")
+        if verify_srv_tree:
+            from legacy_frontend_inventory import measure_srv_tree
+
+            require(hex_hash(policy.historical_srv_tree_sha256)
+                    and measure_srv_tree(item, read) == policy.historical_srv_tree_sha256,
+                    "LEGACY_FRONTEND_PRIVATE_SRV_TREE_DRIFT")
     except (Stop, KeyError, TypeError, ValueError, OSError, AttributeError, subprocess.SubprocessError) as exc:
         if isinstance(exc, Stop) and str(exc) == "DUPLICATE_MOUNT_DESTINATION":
             raise

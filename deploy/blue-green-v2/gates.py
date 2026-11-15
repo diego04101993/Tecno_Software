@@ -22,8 +22,9 @@ from docker_mounts import canonicalize_mounts, mount_evidence
 from legacy_frontend_blue import (
     LEGACY_FRONTEND_IMAGE_EXACT, R3_POLICY, READY_ADOPTION, attest_reconnected_historical,
     classify_historical, historical_reconnect_policy, measure_static_content, require_historical_ownership,
-    verify_manifest, verify_private_frontend,
+    verify_historical_stable_projection, verify_manifest, verify_private_frontend,
 )
+from legacy_frontend_inventory import measure_srv_tree
 from release_state import EPOCH_IDENTITY_FIELDS, IDENTITY_FIELDS, Stop, canonical, digest, now, same_runtime_epoch, validate_runtime_epoch
 
 
@@ -337,16 +338,26 @@ class DockerProbe:
         self.legacy_blue_sha256 = legacy_blue_sha256
         self.legacy_frontend_blue = None
         self.legacy_frontend_blue_sha256 = None
+        self.legacy_frontend_source_sha256 = None
+        self.legacy_frontend_compose_proof = None
         self.legacy_frontend_policy = legacy_frontend_policy
         frontend_binding = bindings.get("frontend:BLUE", {})
         require(type(frontend_binding) is dict, "LEGACY_FRONTEND_BINDING_INVALID")
+        stable_pin = None
         if "legacy_frontend_adoption" in frontend_binding:
             approved = frontend_binding["legacy_frontend_adoption"]
+            manifest_fields = {"manifest", "sha256"}
+            stable_fields = manifest_fields | {"stable_pin", "compose_proof"}
             require(legacy_frontend_blue is None and legacy_frontend_blue_sha256 is None
-                    and type(approved) is dict and set(approved) == {"manifest", "sha256"}
+                    and type(approved) is dict and set(approved) in (manifest_fields, stable_fields)
                     and approved["manifest"] is not None and approved["sha256"] is not None,
                     "LEGACY_FRONTEND_MANIFEST_SOURCE_INVALID")
             legacy_frontend_blue, legacy_frontend_blue_sha256 = approved["manifest"], approved["sha256"]
+            if set(approved) == stable_fields:
+                stable_pin = approved["stable_pin"]
+                self.legacy_frontend_compose_proof = deepcopy(approved["compose_proof"])
+                require(hex_digest(stable_pin) and type(self.legacy_frontend_compose_proof) is dict,
+                        "LEGACY_FRONTEND_STABLE_APPROVAL_REQUIRED")
         require((legacy_frontend_blue is None) == (legacy_frontend_blue_sha256 is None),
                 "LEGACY_FRONTEND_MANIFEST_APPROVAL_REQUIRED")
         if legacy_frontend_blue is not None:
@@ -357,8 +368,18 @@ class DockerProbe:
             require(all(frontend_binding.get(field) == backend[field] == release[field]
                         for field in ("revision", "tree")) and frontend_binding.get("image_id") == release["images"]["frontend"]
                     and backend["image_id"] == release["images"]["api"], "LEGACY_FRONTEND_RELEASE_MISMATCH")
+            if stable_pin is not None:
+                approved_projection = {key: payload[key] for key in ("historical", "image", "content")}
+                proof = verify_historical_stable_projection(
+                    legacy_frontend_blue, legacy_frontend_blue_sha256, approved_projection,
+                    compose_proof=self.legacy_frontend_compose_proof,
+                    observed_srv_tree_sha256=legacy_frontend_policy.historical_srv_tree_sha256,
+                    policy=legacy_frontend_policy,
+                )
+                require(proof["legacy_frontend_stable_pin"] == stable_pin, "LEGACY_FRONTEND_STABLE_PIN_MISMATCH")
             self.legacy_frontend_blue = payload
-            self.legacy_frontend_blue_sha256 = legacy_frontend_blue_sha256
+            self.legacy_frontend_source_sha256 = legacy_frontend_blue_sha256
+            self.legacy_frontend_blue_sha256 = stable_pin if stable_pin is not None else legacy_frontend_blue_sha256
         endpoint = self._json("context", "inspect", context)[0]["Endpoints"]["docker"]["Host"]
         require(endpoint.startswith(("unix:///", "npipe:////./pipe/")), "NONLOCAL_DOCKER_CONTEXT")
 
@@ -475,7 +496,8 @@ class DockerProbe:
         proof = None
         if legacy_frontend:
             proof = verify_private_frontend(first, image, network, self._run, self.legacy_frontend_blue, binding,
-                                            policy=self.legacy_frontend_policy)
+                                            policy=self.legacy_frontend_policy,
+                                            **({"verify_srv_tree": True} if self.legacy_frontend_compose_proof is not None else {}))
             require(proof["classification"] == LEGACY_FRONTEND_IMAGE_EXACT and proof["container_id"] == container
                     and proof["image_id"] == image_id, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
         last = self._json("container", "inspect", name)[0]
@@ -570,12 +592,18 @@ class DockerProbe:
             image, = self._json("image", "inspect", payload["release"]["images"]["frontend"])
             require(item["Name"] == "/" + self.edge_name and item["State"]["Running"] is True,
                     "LEGACY_FRONTEND_HISTORICAL_SOURCE_NOT_ACTIVE")
-            pin = self.legacy_frontend_blue_sha256
+            pin = getattr(self, "legacy_frontend_source_sha256", self.legacy_frontend_blue_sha256)
             manifest = {"sha256": pin, "payload": payload}
             evidence = None
-            if compose_proof is None and reconnected_ipv4 is None:
-                require(classify_historical(item, image, self._run, manifest, pin, policy=self.legacy_frontend_policy)
+            stable_compose = getattr(self, "legacy_frontend_compose_proof", None)
+            if stable_compose is not None:
+                require(classify_historical(item, image, self._run, manifest, pin, policy=self.legacy_frontend_policy,
+                                            stable_pin=self.legacy_frontend_blue_sha256, compose_proof=stable_compose)
                         == LEGACY_FRONTEND_IMAGE_EXACT, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+            if compose_proof is None and reconnected_ipv4 is None:
+                if stable_compose is None:
+                    require(classify_historical(item, image, self._run, manifest, pin, policy=self.legacy_frontend_policy)
+                            == LEGACY_FRONTEND_IMAGE_EXACT, "LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
             else:
                 historical = payload["historical"]
                 reconnect = historical_reconnect_policy(historical["networks"], compose_proof, reconnected_ipv4)
@@ -698,6 +726,12 @@ class DockerProbe:
             require(config == binding["frontend_config_sha256"] and content == manifest["content"]
                     and measure_static_content(self._run, historical["id"]) == manifest["content"],
                     "INVALIDATE_HANDOFF_PREPARED_FRONTEND_CONTENT")
+            if getattr(self, "legacy_frontend_compose_proof", None) is not None:
+                private, = self._json("container", "inspect", frontend)
+                historical_item, = self._json("container", "inspect", historical["id"])
+                tree = self.legacy_frontend_policy.historical_srv_tree_sha256
+                require(measure_srv_tree(private, self._run) == measure_srv_tree(historical_item, self._run) == tree,
+                        "INVALIDATE_HANDOFF_PREPARED_FRONTEND_SRV_TREE")
 
     def require_legacy_reboot_health_ready(self, ready, postgres_id):
         expected = {entry["identity"]["container_id"]: entry["identity"]["image_id"] for entry in ready.values()}

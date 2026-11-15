@@ -13,7 +13,9 @@ import sys
 from docker_config import parse_optional_config
 from docker_mounts import canonicalize_mounts, mount_evidence
 from gates import BACKEND_ARGV, REVISION_LABEL, TREE_LABEL, hex_digest, utc
-from legacy_frontend_blue import LEGACY_FRONTEND_IMAGE_EXACT, classify_historical, historical_evidence, verify_manifest
+from legacy_frontend_blue import (
+    LEGACY_FRONTEND_IMAGE_EXACT, attest_historical_stable, classify_historical, historical_evidence, verify_manifest,
+)
 from release_state import Stop, decode, digest, read_private, require, validate_release
 
 
@@ -48,7 +50,8 @@ def runtime_snapshot(container):
 
 
 def qualify_role(role, release, expected_container, before, after, image, raw_argv, caddyfile=None,
-                 *, legacy_frontend_manifest=None, legacy_frontend_sha256=None, read=None):
+                 *, legacy_frontend_manifest=None, legacy_frontend_sha256=None, read=None,
+                 legacy_frontend_stable_pin=None, legacy_frontend_compose_proof=None):
     service = {"api": "backend", "frontend": "frontend"}[role]
     approved_image = release["images"][role]
     require(hex_digest(expected_container) and before["Id"] == after["Id"] == expected_container
@@ -63,12 +66,21 @@ def qualify_role(role, release, expected_container, before, after, image, raw_ar
     require((legacy_frontend_manifest is None) == (legacy_frontend_sha256 is None),
             "R3_LEGACY_FRONTEND_MANIFEST_PIN_REQUIRED")
     legacy = legacy_frontend_manifest is not None
+    stable = legacy_frontend_stable_pin is not None
+    require(stable == (legacy_frontend_compose_proof is not None) and (not stable or legacy),
+            "R3_LEGACY_FRONTEND_STABLE_APPROVAL_REQUIRED")
     if legacy:
         require(role == "frontend" and callable(read), "R3_LEGACY_FRONTEND_SCOPE_INVALID")
         manifest_payload = verify_manifest(legacy_frontend_manifest, legacy_frontend_sha256)
         require(manifest_payload["release"] == release, "R3_LEGACY_FRONTEND_RELEASE_MISMATCH")
-        require(classify_historical(after, image, read, legacy_frontend_manifest, legacy_frontend_sha256)
-                == LEGACY_FRONTEND_IMAGE_EXACT, "R3_LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
+        if stable:
+            current = historical_evidence(after, image, read)
+            attestation = attest_historical_stable(after, read, legacy_frontend_manifest, legacy_frontend_sha256,
+                                                   current, stable_pin=legacy_frontend_stable_pin,
+                                                   compose_proof=legacy_frontend_compose_proof)
+        else:
+            require(classify_historical(after, image, read, legacy_frontend_manifest, legacy_frontend_sha256)
+                    == LEGACY_FRONTEND_IMAGE_EXACT, "R3_LEGACY_FRONTEND_UNKNOWN_OR_DRIFTED")
         require_private_network_available(manifest_payload["private_contract"], read)
         final = one(decode(read("container", "inspect", expected_container)))
         require(runtime_snapshot(final) == runtime and final["Name"] == after["Name"]
@@ -126,9 +138,12 @@ def qualify_role(role, release, expected_container, before, after, image, raw_ar
             "runtime": runtime, "mount_evidence": mounts}
     if legacy:
         mounts["final"] = mount_evidence(final["Mounts"])
-        result.update(frontend_classifier=LEGACY_FRONTEND_IMAGE_EXACT,
-                      provenance="PASS_LEGACY_MANIFEST", legacy_frontend_manifest_sha256=legacy_frontend_sha256,
+        result.update(frontend_classifier=LEGACY_FRONTEND_IMAGE_EXACT, provenance="PASS_LEGACY_MANIFEST",
+                      legacy_frontend_manifest_sha256=legacy_frontend_stable_pin if stable else legacy_frontend_sha256,
                       frontend_blue_feasibility="PASS", frontend_blue_create_image_id=image["Id"])
+        if stable:
+            for field in ("legacy_frontend_stable_pin", "legacy_frontend_evidence_sha256", "volatile_endpoint_evidence"):
+                result[field] = attestation[field]
     return result
 
 
@@ -165,7 +180,8 @@ def require_private_network_available(contract, read):
                 "R3_FRONTEND_BLUE_PRIVATE_ALIAS_OCCUPIED")
 
 
-def qualify(release, container_ids, read, *, legacy_frontend_manifest=None, legacy_frontend_sha256=None):
+def qualify(release, container_ids, read, *, legacy_frontend_manifest=None, legacy_frontend_sha256=None,
+            legacy_frontend_stable_pin=None, legacy_frontend_compose_proof=None):
     validate_release(release)
     require(release["images"] == R3_IMAGES, "R3_RELEASE_IMAGES_NOT_APPROVED")
     require(set(container_ids) == set(R3_IMAGES) and all(hex_digest(value) for value in container_ids.values())
@@ -183,10 +199,12 @@ def qualify(release, container_ids, read, *, legacy_frontend_manifest=None, lega
         argv = raw[:-1].decode().split("\0")
         caddyfile = read("exec", identifier, "cat", "/etc/caddy/Caddyfile") if role == "frontend" else None
         after = one(decode(read("container", "inspect", identifier)))
-        result[role] = qualify_role(role, release, identifier, before, after, image, argv, caddyfile,
-                                    legacy_frontend_manifest=legacy_frontend_manifest if role == "frontend" else None,
-                                    legacy_frontend_sha256=legacy_frontend_sha256 if role == "frontend" else None,
-                                    read=read)
+        frontend_options = ({"legacy_frontend_manifest": legacy_frontend_manifest,
+                             "legacy_frontend_sha256": legacy_frontend_sha256,
+                             "legacy_frontend_stable_pin": legacy_frontend_stable_pin,
+                             "legacy_frontend_compose_proof": legacy_frontend_compose_proof} if role == "frontend" else {})
+        result[role] = qualify_role(role, release, identifier, before, after, image, argv, caddyfile, read=read,
+                                    **frontend_options)
     return {"scope": "R3_EXACT_IMAGE_QUALIFICATION", "status": "PASS", "release": release, "roles": result}
 
 
@@ -220,12 +238,15 @@ def main(argv=None):
     parser.add_argument("--capture-legacy-frontend-evidence", action="store_true")
     parser.add_argument("--legacy-frontend-manifest", type=Path)
     parser.add_argument("--legacy-frontend-sha256")
+    parser.add_argument("--legacy-frontend-stable-pin")
+    parser.add_argument("--legacy-frontend-compose-proof", type=Path)
     args = parser.parse_args(argv)
     try:
         require(sys.platform.startswith("linux"), "R3_QUALIFICATION_REQUIRES_LOCAL_LINUX")
         if args.capture_legacy_frontend_evidence:
             require(not any((args.approved_release, args.backend_id, args.legacy_frontend_manifest,
-                             args.legacy_frontend_sha256)), "R3_FRONTEND_EVIDENCE_CAPTURE_ARGUMENTS_INVALID")
+                             args.legacy_frontend_sha256, args.legacy_frontend_stable_pin,
+                             args.legacy_frontend_compose_proof)), "R3_FRONTEND_EVIDENCE_CAPTURE_ARGUMENTS_INVALID")
             result = capture_legacy_frontend(args.frontend_id, docker_read)
         else:
             require(args.approved_release and args.backend_id, "R3_QUALIFICATION_ARGUMENTS_REQUIRED")
@@ -233,7 +254,10 @@ def main(argv=None):
                              {"api": args.backend_id, "frontend": args.frontend_id}, docker_read,
                              legacy_frontend_manifest=(decode(read_private(args.legacy_frontend_manifest))
                                                        if args.legacy_frontend_manifest else None),
-                             legacy_frontend_sha256=args.legacy_frontend_sha256)
+                             legacy_frontend_sha256=args.legacy_frontend_sha256,
+                             legacy_frontend_stable_pin=args.legacy_frontend_stable_pin,
+                             legacy_frontend_compose_proof=(decode(read_private(args.legacy_frontend_compose_proof))
+                                                            if args.legacy_frontend_compose_proof else None))
     except (Stop, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         print(str(exc) if isinstance(exc, Stop) else "R3_QUALIFICATION_INPUT_OR_INSPECTION_INVALID", file=sys.stderr)
         return 1

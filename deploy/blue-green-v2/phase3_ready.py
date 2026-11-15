@@ -116,6 +116,10 @@ def legacy_frontend_ready_pin(qualification, probe):
                 and frontend.get("frontend_blue_feasibility") == "PASS"
                 and frontend.get("frontend_blue_create_image_id") == R3_IMAGES["frontend"],
                 "PHASE3_LEGACY_FRONTEND_QUALIFICATION_MISMATCH")
+        if getattr(probe, "legacy_frontend_compose_proof", None) is not None:
+            require(frontend.get("legacy_frontend_stable_pin") == pin
+                    and hex_digest(frontend.get("legacy_frontend_evidence_sha256")),
+                    "PHASE3_LEGACY_FRONTEND_STABLE_EVIDENCE_REQUIRED")
     return pin
 
 

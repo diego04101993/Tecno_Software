@@ -125,6 +125,8 @@ El supervisor host sigue detenido en la preparación. Capturar la adopción lega
 
 `generated_mac_networks` es opcional por rol. Contiene una lista JSON ordenada y sin duplicados con los nombres Docker exactos de las redes cuya MAC generada quedó demostrada. En `api:BLUE`, incluir sólo los endpoints aprobados en el precheck. En `frontend:BLUE`, el único nombre elegible es el de `$PROXY_NET`, si la creación y conexión aprobadas arriba se ejecutaron sin una opción MAC. Omitir el campo si la lista queda vacía. Fijar esas listas antes de capturar el manifiesto y confirmar BLUE/BLUE. La identidad estable vincula la lista y mantiene el resto de los campos de cada red. La época conserva también la MAC operativa observada. Así, con el mismo boot una MAC cambiada sigue siendo deriva y después de un reboot sólo se puede readmitir una MAC regenerada para un endpoint aprobado expresamente. Una MAC fija permanece fijada al valor original.
 
+Si se reconectó el frontend histórico, usar la calificación con el pin estable descrita en [Frontend histórico R3](LEGACY_FRONTEND_BLUE.md#calificación-tras-una-reconexión). Mantener `manifest` y `sha256` originales en el binding y añadir `stable_pin` y `compose_proof`. Calificar el frontend histórico mientras la IP y el alias del slot privado aún estén libres. Si una instancia privada anterior ocupa el slot, sólo retirar su attachment con autorización expresa y tras comprobar que el contenedor es el aprobado, que no publica puertos ni posee TLS y que R3 sirve el tráfico. Repetir los smokes públicos y exigir que la IP y el alias estén libres antes de crear el slot nuevo.
+
 ```sh
 /usr/bin/python3 -B "$TOOL/legacy_blue.py" --bindings "$BACKEND_BINDINGS" \
   --trusted-proxy-name "$OLD_FRONTEND_NAME" --project tecnocontrol \
