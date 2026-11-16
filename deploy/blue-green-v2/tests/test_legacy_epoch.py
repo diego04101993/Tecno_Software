@@ -81,10 +81,10 @@ class EpochWire(Wire):
             self.autosave = previous
         return response
 
-    def read_autosave(self):
+    def read_autosave(self, *, synchronize=True):
         if self.autosave is None:
             raise FileNotFoundError
-        return super().read_autosave()
+        return super().read_autosave(synchronize=synchronize)
 
     def close_ingress(self):
         self.admitted = False

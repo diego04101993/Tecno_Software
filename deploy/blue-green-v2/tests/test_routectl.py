@@ -3,12 +3,14 @@
 import copy
 import multiprocessing
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from release_state import StateStore, Stop, canonical, decode, digest, exclusive_lock, now
-from routectl import ADMIN_ADDRESS, BLUE_PAIR, CaddyEdge, Controller, DEFAULT_HOSTS, upstream
+from routectl import ADMIN_ADDRESS, BLUE_PAIR, CaddyEdge, Controller, DEFAULT_HOSTS, STATUS_TRANSITION, upstream
 
 
 class Killed(BaseException):
@@ -87,7 +89,7 @@ class Wire(CaddyEdge):
             self.fault()
         return 200, None, b""
 
-    def read_autosave(self):
+    def read_autosave(self, *, synchronize=True):
         return self.raw_autosave if self.raw_autosave is not None else canonical(self.autosave)
 
 
@@ -269,7 +271,8 @@ class RouteControllerTests(unittest.TestCase):
         self.edge.fault = lambda: self.identities.__setitem__(("api", "GREEN"), None)
         with self.assertRaisesRegex(Stop, "SWITCH_IDENTITY_CHECK_FAILED"):
             self.controller.switch_api("GREEN", "fixture-baseline")
-        self.assertEqual(self.controller.status()["slots"]["GREEN"]["phase"], "FAILED")
+        self.assertEqual(self.store.load()["slots"]["GREEN"]["phase"], "FAILED")
+        self.assertEqual(self.controller.status_report()["REASON"], "SLOT_NOT_READY")
         self.edge.fault = None
         self.controller.rollback()
         self.assert_routes("BLUE", "BLUE")
@@ -425,6 +428,130 @@ class RouteControllerTests(unittest.TestCase):
             process.join(10)
         self.assertEqual(process.exitcode, 0)
         self.assertEqual(self.edge.patch_attempts, 0)
+
+    def test_status_has_no_writer_or_durability_calls(self):
+        state = self.store.load()
+        self.store.lock_path.unlink()
+        before = [(path, path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in self.store.directory.rglob("*") if path.is_file()]
+        with (patch.object(self.edge, "lock", side_effect=AssertionError("status acquired Edge lock")),
+              patch.object(self.store, "lock", side_effect=AssertionError("status acquired state lock")),
+              patch.object(self.store, "save", side_effect=AssertionError("status wrote state")),
+              patch.object(self.edge, "patch", side_effect=AssertionError("status sent PATCH")),
+              patch("routectl.os.fsync", side_effect=AssertionError("status synced a file")),
+              patch("routectl.sync_dir", side_effect=AssertionError("status synced a directory"))):
+            report = self.controller.status_report()
+            self.assertEqual(report["STATUS"], "PASS")
+            self.assertEqual(report["state"], state)
+            self.assertEqual(report["STATE_SHA256"], digest(state))
+            self.assertEqual(report["WRITER_LOCKED"], "NO" if sys.platform == "linux" else "UNKNOWN")
+        after = [(path, path.read_bytes(), path.stat().st_mtime_ns)
+                 for path in self.store.directory.rglob("*") if path.is_file()]
+        self.assertEqual(after, before)
+        self.assertFalse(self.store.lock_path.exists())
+
+    def test_status_rejects_invalid_state_checksum(self):
+        original = decode(self.store.path.read_bytes())
+        original["sha256"] = "0" * 64
+        self.store.path.write_bytes(canonical(original))
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "STATE_CHECKSUM_MISMATCH"))
+        self.assertNotIn("state", report)
+
+    def test_status_rejects_corrupt_state(self):
+        self.store.path.write_bytes(b"{")
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "INVALID_JSON"))
+        self.assertNotIn("state", report)
+
+    def test_status_reports_config_divergence_without_active_state(self):
+        changed = self.edge.effective()[0].changed({"api": "GREEN", "frontend": "BLUE"}, 1).config
+        for field, reason in (("live", "EFFECTIVE_CONFIG_DIFFERS_FROM_COMMITTED"),
+                              ("autosave", "AUTOSAVE_DIFFERS_FROM_COMMITTED")):
+            with self.subTest(field=field), patch.object(self.edge, field, changed):
+                report = self.controller.status_report()
+                self.assertEqual((report["STATUS"], report["REASON"]), (STATUS_TRANSITION, reason))
+                self.assertNotIn("state", report)
+
+    def test_status_neither_commits_nor_exposes_a_pending_intent(self):
+        self.store.fault = "DISPATCHED"
+        with self.assertRaises(Killed):
+            self.controller.switch_api("GREEN", "fixture-baseline")
+        original = self.store.path.read_bytes()
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), (STATUS_TRANSITION, "PENDING_INTENT"))
+        self.assertNotIn("state", report)
+        self.assertEqual(self.store.path.read_bytes(), original)
+        self.assertEqual(self.edge.patch_attempts, 0)
+
+        envelope = decode(original)
+        envelope["state"]["pending"]["stage"] = "AMBIGUOUS"
+        envelope["sha256"] = digest(envelope["state"])
+        self.store.path.write_bytes(canonical(envelope))
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "INVALID_PENDING"))
+        self.assertNotIn("state", report)
+
+    def test_status_rejects_slot_drift_without_marking_slot_failed(self):
+        self.identities["api", "BLUE"]["pid"] += 1
+        state = self.store.path.read_bytes()
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "READY_IDENTITY_CHANGED"))
+        self.assertNotIn("state", report)
+        self.assertEqual(self.store.path.read_bytes(), state)
+
+    def test_status_rejects_edge_identity_change(self):
+        with patch.object(self.edge, "status_identity", side_effect=[("socket-a", "marker"), ("socket-b", "marker")]):
+            report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "EDGE_IDENTITY_CHANGED_DURING_STATUS"))
+        self.assertNotIn("state", report)
+
+    def test_status_rejects_state_changed_during_sampling(self):
+        state = self.store.load()
+        later = copy.deepcopy(state)
+        later["slots"]["GREEN"]["phase"] = "FAILED"
+        with patch.object(self.store, "load", side_effect=[state, later]):
+            report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), (STATUS_TRANSITION, "SNAPSHOT_CHANGED_DURING_STATUS"))
+        self.assertNotIn("state", report)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux kernel flock ownership")
+    def test_status_preserves_evidence_for_unrecognized_lock_owner(self):
+        context = multiprocessing.get_context("spawn")
+        ready, release = context.Event(), context.Event()
+        process = context.Process(target=take_lock, args=(self.store.directory, ready, release))
+        process.start()
+        try:
+            self.assertTrue(ready.wait(10))
+            report = self.controller.status_report()
+            self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "WRITER_LOCK_OWNER_UNVERIFIED"))
+            self.assertEqual((report["WRITER_LOCKED"], report["WRITER_OWNER"], report["WRITER_PID"]),
+                             ("YES", "UNKNOWN", process.pid))
+            self.assertIsNone(report["WRITER_IDENTITY"])
+            self.assertNotIn("state", report)
+        finally:
+            release.set()
+            process.join(10)
+        self.assertEqual(process.exitcode, 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux lock evidence")
+    def test_status_fails_on_lock_file_with_insecure_permissions(self):
+        self.store.lock_path.chmod(0o644)
+        report = self.controller.status_report()
+        self.assertEqual((report["STATUS"], report["REASON"]), ("FAIL", "WRITER_LOCK_EVIDENCE_INVALID"))
+        self.assertEqual(report["WRITER_LOCKED"], "UNKNOWN")
+        self.assertNotIn("state", report)
+        self.assertEqual(self.store.lock_path.stat().st_mode & 0o777, 0o644)
+
+    @unittest.skipUnless(os.name == "posix", "Linux production autosave read")
+    def test_read_only_autosave_never_flushes(self):
+        autosave = Path(self.temp.name) / "autosave.json"
+        autosave.write_bytes(canonical(self.edge.autosave))
+        autosave.chmod(0o600)
+        edge = CaddyEdge(autosave_path=autosave)
+        with (patch("routectl.os.fsync", side_effect=AssertionError("autosave read flushed")),
+              patch("routectl.sync_dir", side_effect=AssertionError("autosave read synced a directory"))):
+            self.assertEqual(edge.persisted(synchronize=False).config, self.edge.autosave)
 
 
 if __name__ == "__main__":

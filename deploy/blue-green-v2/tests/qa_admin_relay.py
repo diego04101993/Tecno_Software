@@ -10,9 +10,9 @@ from routectl import CaddyEdge
 def run():
     request = json.load(sys.stdin)
     edge = CaddyEdge("/run/bgv2/admin.sock", "/config/caddy/autosave.json")
-    if request["method"] == "AUTOSAVE":
+    if request["method"] in ("AUTOSAVE", "AUTOSAVE_READ_ONLY"):
         try:
-            raw = edge.read_autosave()
+            raw = edge.read_autosave(synchronize=request["method"] == "AUTOSAVE")
         except FileNotFoundError:
             print(json.dumps({"missing": True}))
         else:

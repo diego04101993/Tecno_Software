@@ -1,10 +1,10 @@
-# Phase 3 de Blue-Green V2.6.5
+# Phase 3 de Blue-Green V2.6.6
 
 **El pre-stage y el handoff requieren autorizaciones separadas.** El pre-stage termina en `READY_FOR_DOWNTIME_WINDOW=YES` con Edge cerrado. Sólo el handoff autorizado puede trasladar 80/443, la escritura TLS o la IP de confianza. Phase 3 termina con `ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`. El backend R3 conserva su contenedor y redes. El frontend BLUE sirve la imagen R3 exacta. El frontend histórico se conserva para reversión. Phase 4 y Videowall GREEN quedan fuera de esta intervención.
 
 ## 1. Precheck y calificación de imágenes en solo lectura
 
-Verificar los hashes aprobados del tooling V2.6.5. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.6.5`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
+Verificar los hashes aprobados del tooling V2.6.6. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.6.6`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
 
 Registrar el ID y la configuración completa del frontend histórico, sus dos redes, IDs de red, aliases, IPs y todos los `HostIp/HostPort` publicados. Fijar el backend y los volúmenes `tecnocontrol_backend_uploads`, `tecnocontrol_caddy_data`, `tecnocontrol_caddy_config` y `tecnocontrol_postgres_data`. La identidad de proxy observada debe seguir siendo `172.30.250.2`. Medir el endpoint privado del backend desde Docker, con expectativa histórica `172.30.250.3:8000`, y exigir que sólo ese contenedor lo posea. No confiar en una IP histórica que discrepe de la medición. Conservar el frontend histórico, los manifests y los recursos de reversión intactos.
 
@@ -496,7 +496,14 @@ Lanzar el adjudicador tras el primer HTTP sin esperar a los smokes largos. Puede
 
 Si todos los controles pasan y se verificó la ruta de reversión, instalar y habilitar `bgv2-edge-ingress.service` con un `edge-supervisor.env` privado. Aprobar las rutas y el pin exactos del controlador final. Usar rutas absolutas sin espacios y confirmar que el nombre corresponde a `$EDGE_NAME`. Crear los archivos sólo durante la intervención autorizada, después de verificar que sus rutas todavía están libres. Conservar las rutas definitivas incluso después de que termine el shell. El supervisor reconoce un marcador de admisión ya abierto y conserva esa admisión mientras verifica la época de los procesos.
 
+`routectl status` sólo observa. En estado coherente devuelve `STATUS=PASS` y el estado confirmado en `state`. Los campos `WRITER_*` corresponden a una muestra de los locks. `WRITER_LOCKED=YES` con propietario `Edge supervisor` es normal. Con una intención pendiente o una discrepancia de publicación devuelve `STATUS_TRANSITION_IN_PROGRESS`, sin exponer un objeto `state` como activo. Con evidencia inválida devuelve `FAIL`. Ambos resultados salen con código 1. Conservar el reporte completo y cotejar sólo `state` con el estado confirmado.
+
 ```sh
+record_phase3_status() {
+  routectl_live status > "$WORK/$1.report.json" || return
+  /usr/bin/python3 -I -B -c 'import json,sys; report=json.load(sys.stdin); assert report["STATUS"]=="PASS"; print(json.dumps(report["state"],sort_keys=True))' \
+    < "$WORK/$1.report.json" > "$WORK/$1.json"
+}
 test ! -e /etc/systemd/system/bgv2-edge-ingress.service
 test ! -e /etc/tecnocontrol-bgv2/edge-supervisor.env
 install -d -m 0700 /etc/tecnocontrol-bgv2
@@ -514,9 +521,10 @@ EOF
 install -m 0600 "$WORK/edge-supervisor.env" /etc/tecnocontrol-bgv2/edge-supervisor.env
 install -m 0644 "$TOOL/bgv2-edge-ingress.service" /etc/systemd/system/bgv2-edge-ingress.service
 systemctl daemon-reload
-routectl_live status > "$WORK/blue-status-before-supervisor.json"
+record_phase3_status blue-status-before-supervisor
 systemctl enable --now bgv2-edge-ingress.service
 systemctl is-active --quiet bgv2-edge-ingress.service
+record_phase3_status blue-status-after-supervisor
 ```
 
 El arranque posterior compara el `boot_id` del host y la época sellada. Con mismo boot y PID/`StartedAt` distinto se cierra ingreso y se exige `STOP_REATTEST_REQUIRED`. Con nuevo boot y la misma identidad estable, PostgreSQL exacto healthy y BLUE/BLUE coherente, `LEGACY_BLUE_REATTEST_AFTER_HOST_REBOOT` actualiza la época de forma durable antes de abrir. Si hay deriva estable, corrupción o ambigüedad, conservar el ingreso cerrado.

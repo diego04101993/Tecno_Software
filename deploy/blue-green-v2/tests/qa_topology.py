@@ -219,8 +219,8 @@ class QAEdge(CaddyEdge):
         result = self._relay(method, etag, config)
         return result["status"], result["etag"], base64.b64decode(result["body"])
 
-    def read_autosave(self):
-        result = self._relay("AUTOSAVE")
+    def read_autosave(self, *, synchronize=True):
+        result = self._relay("AUTOSAVE" if synchronize else "AUTOSAVE_READ_ONLY")
         if result.get("missing"):
             raise FileNotFoundError("Disposable Edge autosave missing")
         return base64.b64decode(result["body"])

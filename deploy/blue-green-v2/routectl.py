@@ -19,6 +19,7 @@ from release_state import (
     IDENTITY_FIELDS, ROLES, SLOTS, StateStore, Stop, canonical, decode, digest, exclusive_lock, now, read_private,
     require, require_private, same_runtime_epoch, sync_dir, validate_hash, validate_release, write_private_atomic,
 )
+from routectl_lock_status import writer_status
 
 DEFAULT_HOSTS = {
     "api": "api.tecnocontrolcloud.com",
@@ -27,6 +28,11 @@ DEFAULT_HOSTS = {
 BLUE_PAIR = {"api": "BLUE", "frontend": "BLUE"}
 ADMIN_ADDRESS = "unix//run/bgv2/admin.sock|0600"
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
+STATUS_TRANSITION = "STATUS_TRANSITION_IN_PROGRESS"
+
+
+class StatusTransition(Stop):
+    """The sampled routing artifacts do not yet describe one committed view."""
 
 
 def upstream(role, slot):
@@ -210,9 +216,13 @@ class CaddyEdge:
             return contextlib.nullcontext()
         require_private(self.socket_path.parent, directory=True)
         # Different --state-dir values cannot acquire two writers for one Edge.
-        return exclusive_lock(self.socket_path.with_name(self.socket_path.name + ".writer.lock"))
+        return exclusive_lock(self.writer_lock_path)
 
-    def read_autosave(self):
+    @property
+    def writer_lock_path(self):
+        return self.socket_path.with_name(self.socket_path.name + ".writer.lock")
+
+    def read_autosave(self, *, synchronize=True):
         require(self.autosave_path is not None and os.name == "posix", "EDGE_AUTOSAVE_REQUIRED")
         require_private(self.autosave_path.parent, directory=True)
         require_private(self.autosave_path)
@@ -223,11 +233,13 @@ class CaddyEdge:
                     and stat.S_IMODE(before.st_mode) == 0o600, "EDGE_AUTOSAVE_PERMISSIONS")
             raw = stream.read(MAX_CONFIG_BYTES + 1)
             require(len(raw) <= MAX_CONFIG_BYTES, "EDGE_CONFIG_TOO_LARGE")
-            os.fsync(stream.fileno())
+            if synchronize:
+                os.fsync(stream.fileno())
             after = self.autosave_path.lstat()
             require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
                     (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns), "EDGE_AUTOSAVE_CHANGED")
-        sync_dir(self.autosave_path.parent)
+        if synchronize:
+            sync_dir(self.autosave_path.parent)
         return raw
 
     def effective(self):
@@ -244,9 +256,10 @@ class CaddyEdge:
                 "EDGE_ETAG_REQUIRED")
         return decode(raw), etag
 
-    def persisted(self):
+    def persisted(self, *, synchronize=True):
         try:
-            return RouteConfig(decode(self.read_autosave()), self.hosts)
+            raw = self.read_autosave() if synchronize else self.read_autosave(synchronize=False)
+            return RouteConfig(decode(raw), self.hosts)
         except OSError as exc:
             raise Stop("EDGE_AUTOSAVE_READ_FAILED") from exc
 
@@ -298,6 +311,24 @@ class CaddyEdge:
 
     def boot_token(self):
         return read_private(self.ingress_marker.with_name("boot-id"))
+
+    def status_identity(self):
+        if self.socket_path is None:
+            return None, None
+        info = self.socket_path.lstat()
+        require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == 0o600, "EDGE_UNIX_SOCKET_PERMISSIONS")
+        boot = self.boot_token()
+        require(re.fullmatch(rb"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n", boot), "INVALID_EDGE_BOOT_ID")
+        identity = info.st_dev, info.st_ino, info.st_ctime_ns, boot
+        marker = self.ingress_marker
+        try:
+            admission = marker.lstat()
+            value = read_private(marker)
+        except FileNotFoundError:
+            return identity, None
+        require(re.fullmatch(rb"[0-9a-f]{64}\n", value), "INVALID_EDGE_INGRESS_MARKER")
+        return identity, (admission.st_dev, admission.st_ino, admission.st_ctime_ns, value)
 
 
 class Controller:
@@ -387,7 +418,7 @@ class Controller:
         require(self.ready_gate(receipt, context) is True, "READY_RECEIPT_REJECTED")
         return {"identity": identity, "identity_hash": context["identity_hash"], "validated_at": now()}
 
-    def _assert_ready(self, state, role, slot, allow_failed=False):
+    def _assert_ready(self, state, role, slot, allow_failed=False, *, mark_failed=True):
         entry = state["slots"][slot]
         phases = ("READY", "ACTIVE", "STANDBY", "FAILED") if allow_failed else ("READY", "ACTIVE", "STANDBY")
         require(entry is not None and entry["phase"] in phases
@@ -414,8 +445,9 @@ class Controller:
             require(digest(identity) == entry["ready"][role]["identity_hash"], "READY_IDENTITY_CHANGED")
             return identity
         except Stop:
-            entry["phase"] = "FAILED"
-            self.store.save(state)
+            if mark_failed:
+                entry["phase"] = "FAILED"
+                self.store.save(state)
             raise
 
     @staticmethod
@@ -530,11 +562,68 @@ class Controller:
         self.store.save(state)
         return "LEGACY_BLUE_REATTEST_AFTER_HOST_REBOOT"
 
+    def _status_routes(self, state):
+        effective, etag = self.edge.effective()
+        try:
+            persisted = self.edge.persisted(synchronize=False)
+        except Stop as exc:
+            if str(exc) == "EDGE_AUTOSAVE_CHANGED":
+                raise StatusTransition("AUTOSAVE_CHANGED_DURING_STATUS") from exc
+            raise
+        routes = state["routing"]
+        if effective.hash != routes["config_hash"] or (effective.generation, effective.active) != (
+                routes["generation"], routes["active"]):
+            raise StatusTransition("EFFECTIVE_CONFIG_DIFFERS_FROM_COMMITTED")
+        if persisted.hash != routes["config_hash"]:
+            raise StatusTransition("AUTOSAVE_DIFFERS_FROM_COMMITTED")
+        return effective, etag, persisted.hash
+
+    def _status_state(self):
+        require_private(self.store.directory, directory=True)
+        state = self.store.load()
+        if state["pending"] is not None:
+            raise StatusTransition("PENDING_INTENT")
+        edge_identity, admission = self.edge.status_identity()
+        if edge_identity is not None and admission is None:
+            raise StatusTransition("INGRESS_NOT_READY")
+        effective, etag, autosave_hash = self._status_routes(state)
+        require(self.store.load_config(state["routing"]["config_hash"]) == effective.config, "SEALED_CONFIG_CHANGED")
+        self._require_legacy_binding(state, effective)
+        self._verify_route_bindings(state, effective)
+        active = {(role, slot) for role, slot in state["routing"]["active"].items()}
+        advertised = {(role, slot) for slot, entry in state["slots"].items()
+                      if entry is not None and entry["phase"] in ("READY", "ACTIVE", "STANDBY")
+                      for role in entry["ready"]}
+        for role, slot in sorted(active | advertised):
+            self._assert_ready(state, role, slot, mark_failed=False)
+        # Read both sides again before publishing any READY or ACTIVE data.
+        last_effective, last_etag, last_autosave = self._status_routes(state)
+        last_identity, last_admission = self.edge.status_identity()
+        require(edge_identity == last_identity, "EDGE_IDENTITY_CHANGED_DURING_STATUS")
+        if (admission != last_admission or (effective.hash, etag, autosave_hash) !=
+                (last_effective.hash, last_etag, last_autosave) or self.store.load() != state):
+            raise StatusTransition("SNAPSHOT_CHANGED_DURING_STATUS")
+        return state
+
     def status(self):
-        with self._locked():
-            state = self.store.load()
-            self._current(state)
-            return state
+        """Return a consistent committed state for in-process callers."""
+        return self._status_state()
+
+    def status_report(self):
+        paths = [self.store.lock_path]
+        if self.edge.socket_path is not None:
+            paths.append(self.edge.writer_lock_path)
+        ownership, reason = writer_status(paths, Path(__file__).resolve())
+        if reason is not None:
+            return {"STATUS": "FAIL", "REASON": reason, **ownership}
+        try:
+            state = self.status()
+        except StatusTransition as exc:
+            return {"STATUS": STATUS_TRANSITION, "REASON": str(exc), **ownership}
+        except (Stop, OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            reason = str(exc) if isinstance(exc, Stop) else "ROUTECTL_LOCAL_IO_OR_INPUT_FAILED"
+            return {"STATUS": "FAIL", "REASON": reason, **ownership}
+        return {"STATUS": "PASS", "STATE_SHA256": digest(state), "state": state, **ownership}
 
     def prepare(self, slot, release):
         require(slot in SLOTS, "UNKNOWN_SLOT")
@@ -874,6 +963,10 @@ def main():
                         legacy_frontend_blue_sha256=args.legacy_frontend_sha256), ReadyGate(key), PlayerGate(key),
         )
         action = args.action
+        if action == "status":
+            report = controller.status_report()
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if report["STATUS"] == "PASS" else 1
         if action == "initialize":
             result = ColdStart(controller).initialize(_json(args.sealed_config), _json(args.release),
                                                       _json(args.receipts), args.baseline_hash)
