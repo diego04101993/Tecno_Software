@@ -776,7 +776,7 @@ class DockerProbe:
 
 
 def sign_receipt(kind, payload, key):
-    require(kind in ("READY", "BASELINE", "PLAYER", "PHASE3_BASELINE", "PHASE3_PLAYER")
+    require(kind in ("READY", "BASELINE", "PLAYER", "PHASE3_BASELINE", "PHASE3_PLAYER", "PROMOTION_BASELINE_CLOCK")
             and isinstance(key, bytes) and len(key) >= 32,
             "INVALID_RECEIPT_KEY")
     record = {"kind": kind, "payload": payload}
@@ -871,9 +871,10 @@ def attribute_heartbeats(edge_acks, db_rows, key, generation, slot, upstream):
 
 
 class PlayerGate:
-    def __init__(self, key, now=lambda: datetime.now(timezone.utc)):
+    def __init__(self, key, now=lambda: datetime.now(timezone.utc), *, require_monotonic=False):
         self.key = key
         self.now = now
+        self.require_monotonic = require_monotonic
 
     @staticmethod
     def baseline_hash(data):
@@ -891,16 +892,59 @@ class PlayerGate:
         except (GateError, TypeError, ValueError, KeyError):
             return None
 
-    def __call__(self, receipt, context):
+    def baseline_clock(self, baseline, clock_receipt):
+        clock = verified_payload("PROMOTION_BASELINE_CLOCK", clock_receipt, self.key,
+                                 {"baseline_sha256": digest(baseline)},
+                                 {"baseline_monotonic_ns", "time_namespace", "collector_id", "collector_pid",
+                                  "collector_started_at", "edge_id", "postgres_id"})
+        require(number(clock["baseline_monotonic_ns"], 1) and number(clock["collector_pid"], 1)
+                and type(clock["time_namespace"]) is str and re.fullmatch(r"time:\[[1-9][0-9]*\]", clock["time_namespace"])
+                and all(hex_digest(clock[key]) for key in ("collector_id", "edge_id", "postgres_id"))
+                and baseline["payload"]["baseline_refs"], "PLAYER_PROMOTION_BASELINE_CLOCK_INVALID")
+        utc(clock["collector_started_at"])
+        return clock
+
+    @staticmethod
+    def _validate_monotonic_observation(observation, routing):
+        expected = {"OBSERVER_MODE": "PROMOTION_MONOTONIC", "EXPECTED_GENERATION": routing["generation"],
+                    "EXPECTED_SLOT": routing["slot"], "EXPECTED_UPSTREAM": routing["upstream"],
+                    "EXPECTED_BACKEND_CONTAINER": routing["backend_container"],
+                    "ROUTING_CONTEXT_SHA256": digest(routing), "TIME_NAMESPACE_MATCH": "YES"}
+        window_keys = ("WINDOW_OPENED_MONOTONIC", "WINDOW_START_MONOTONIC", "WINDOW_FINISH_MONOTONIC",
+                       "TERMINAL_DEADLINE_MONOTONIC")
+        require(type(observation) is dict and set(observation) == set(expected) | set(window_keys) |
+                {"TIME_NAMESPACE", "PLAYER_OBSERVED_COUNT", "PLAYER_MISSING_COUNT", "REQUEST_EVIDENCE_SHA256"}
+                and type(observation["EXPECTED_GENERATION"]) is int
+                and all(observation[key] == value for key, value in expected.items())
+                and all(number(observation[key], 1) for key in window_keys)
+                and hex_digest(observation["REQUEST_EVIDENCE_SHA256"])
+                and type(observation["TIME_NAMESPACE"]) is str
+                and re.fullmatch(r"time:\[[1-9][0-9]*\]", observation["TIME_NAMESPACE"]),
+                "PLAYER_PROMOTION_OBSERVATION_CONTEXT_INVALID")
+        opened, start, finish, deadline = (observation[key] for key in window_keys)
+        require(opened <= start and finish - start >= 120_000_000_000 and finish <= deadline,
+                "PLAYER_OBSERVATION_WINDOW_INVALID")
+
+    def __call__(self, receipt, context, *, routing_context=None):
         try:
-            data = verified_payload("PLAYER", receipt, self.key, context, {
+            monotonic = routing_context is not None
+            require(monotonic or not self.require_monotonic, "PLAYER_PROMOTION_MONOTONIC_RECEIPT_REQUIRED")
+            keys = {
                 "baseline_at", "started_at", "finished_at", "baseline_refs", "heartbeats", "source",
                 "access_complete", "http_409", "http_5xx", "incompatible", "playback_201", "playback_evidence",
-            })
+            }
+            if monotonic:
+                keys.add("observation")
+            data = verified_payload("PLAYER", receipt, self.key, context, keys)
             switched, baseline, started, finished = (utc(value) for value in (
                 context["switched_at"], data["baseline_at"], data["started_at"], data["finished_at"]))
-            require(switched - timedelta(seconds=120) <= baseline <= switched <= started <= finished <= self.now()
-                    and finished - started >= timedelta(seconds=120), "PLAYER_OBSERVATION_WINDOW_INVALID")
+            require(switched - timedelta(seconds=120) <= baseline <= switched, "PLAYER_OBSERVATION_WINDOW_INVALID")
+            if monotonic:
+                self._validate_monotonic_observation(data["observation"], routing_context)
+                require(data["baseline_refs"], "PLAYER_PROMOTION_EMPTY_BASELINE")
+            else:
+                require(switched <= started <= finished <= self.now() and finished - started >= timedelta(seconds=120),
+                        "PLAYER_OBSERVATION_WINDOW_INVALID")
             require(data["source"] == "EDGE_ACK_EXACT_DB_JOIN" and data["access_complete"] is True
                     and all(number(data[key]) and data[key] == 0 for key in ("http_409", "http_5xx", "incompatible"))
                     and number(data["playback_201"])
@@ -915,10 +959,18 @@ class PlayerGate:
             for entry in observations:
                 require(set(entry) == {"device_ref", "trace_ref", "received_at"}
                         and hex_digest(entry["device_ref"]) and hex_digest(entry["trace_ref"])
-                        and entry["trace_ref"] not in traces
-                        and started <= utc(entry["received_at"]) <= finished, "PLAYER_HEARTBEAT_INVALID")
+                        and entry["trace_ref"] not in traces, "PLAYER_HEARTBEAT_INVALID")
+                received = utc(entry["received_at"])
+                require(monotonic or started <= received <= finished, "PLAYER_HEARTBEAT_INVALID")
                 traces.add(entry["trace_ref"])
                 observed.add(entry["device_ref"])
+            if monotonic:
+                count = len(set(refs) & observed)
+                require(number(data["observation"]["PLAYER_OBSERVED_COUNT"])
+                        and number(data["observation"]["PLAYER_MISSING_COUNT"])
+                        and data["observation"]["PLAYER_OBSERVED_COUNT"] == count
+                        and data["observation"]["PLAYER_MISSING_COUNT"] == len(refs) - count,
+                        "PLAYER_PROMOTION_OBSERVATION_COUNT_INVALID")
             return set(refs) <= observed
         except (GateError, TypeError, ValueError, KeyError):
             return False

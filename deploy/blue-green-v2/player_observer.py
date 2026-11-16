@@ -341,7 +341,7 @@ def save_receipt(destination, receipt):
         os.unlink(path)
 
 
-def phase3_pipe_watchdog(stream, opened_ns, time_namespace, ready_line=None):
+def phase3_pipe_watchdog(stream, opened_ns, time_namespace, ready_line=None, checkpoint=None):
     """Bound transport independently of the shorter request-evidence deadline."""
     deadline = opened_ns + CAPTURE_PIPE_WATCHDOG_NS
     fd = stream.fileno()
@@ -350,7 +350,12 @@ def phase3_pipe_watchdog(stream, opened_ns, time_namespace, ready_line=None):
     while True:
         remaining = deadline - monotonic_ns()
         require(remaining > 0, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
-        readable, _, _ = select([fd], [], [], remaining / NANOSECONDS)
+        if checkpoint is not None:
+            checkpoint()
+        delay = remaining if checkpoint is None else min(remaining, NANOSECONDS)
+        readable, _, _ = select([fd], [], [], delay / NANOSECONDS)
+        if not readable and checkpoint is not None and monotonic_ns() < deadline:
+            continue
         require(bool(readable) and monotonic_ns() < deadline, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
         block = os.read(fd, 65536)
         if not block:
@@ -376,9 +381,9 @@ def phase3_pipe_watchdog(stream, opened_ns, time_namespace, ready_line=None):
         require(len(pending) <= 2048, "CAPTURE_STREAM_INVALID")
 
 
-def capture_input(stream, *, opened_monotonic_ns=None, time_namespace=None, ready_line=None):
+def capture_input(stream, *, opened_monotonic_ns=None, time_namespace=None, ready_line=None, checkpoint=None):
     if opened_monotonic_ns is not None:
-        return phase3_pipe_watchdog(stream, opened_monotonic_ns, time_namespace, ready_line)
+        return phase3_pipe_watchdog(stream, opened_monotonic_ns, time_namespace, ready_line, checkpoint)
     captured = []
     for index, line in enumerate(iter(lambda: stream.readline(2049), b"")):
         require(index <= MAX_ROWS and len(line) <= 2048, "CAPTURE_STREAM_INVALID")
@@ -461,6 +466,19 @@ def _parser():
     observe.add_argument("--capture-ready-json")
     for marker in ("opened", "started", "finished"):
         observe.add_argument(f"--{marker}-monotonic-ns", type=int, required=True)
+    for action in ("promotion-baseline", "promotion-observe"):
+        promotion = actions.add_parser(action)
+        for option in ("socket", "autosave", "bindings", "edge-name", "clock-receipt"):
+            promotion.add_argument("--" + option, required=True)
+        for role in ("blue", "frontend"):
+            promotion.add_argument(f"--legacy-{role}-manifest")
+            promotion.add_argument(f"--legacy-{role}-sha256")
+        if action == "promotion-observe":
+            for option in ("edge-id", "baseline", "opened-at", "started-at", "finished-at", "committed-state-sha256"):
+                promotion.add_argument("--" + option, required=True)
+            promotion.add_argument("--capture-ready-json")
+            for marker in ("opened", "started", "finished"):
+                promotion.add_argument(f"--{marker}-monotonic-ns", type=int, required=True)
     return parser
 
 
@@ -475,6 +493,10 @@ def main(argv=None):
         ids = (args.postgres_id, args.edge_id) if hasattr(args, "edge_id") else (args.postgres_id,)
         require(sys.platform.startswith("linux") and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in ids),
                 "OBSERVER_REQUIRES_EXACT_LOCAL_IDENTITIES")
+        if args.action.startswith("promotion-"):
+            from promotion_player_observer import run_promotion
+
+            return run_promotion(args, diagnostic)
         diagnostic.advance("load_state_and_key")
         store = StateStore(args.state_dir)
         state = store.load()

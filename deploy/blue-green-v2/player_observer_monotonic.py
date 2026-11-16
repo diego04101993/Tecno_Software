@@ -1,4 +1,4 @@
-"""Initial BLUE continuity using only the captured request's monotonic start."""
+"""Continuity for a verified route using the captured request's monotonic start."""
 
 from collections import Counter
 from dataclasses import dataclass
@@ -15,6 +15,7 @@ CAPTURE_LIFETIME_NS = PHASE3_CAPTURE_SECONDS * SECOND
 MAX_ROWS = 100_000
 PATHS = {"heartbeat": 200, "playback-events": 201}
 TIME_NAMESPACE = re.compile(r"time:\[[1-9][0-9]*\]")
+GENERATION = re.compile(r"0|[1-9][0-9]*")
 UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -63,7 +64,7 @@ def _audit_row(trace, window, deadline, event=None):
             "FINAL_ADJUDICATION": "NO_CREDIT" if eligible is False else "UNVERIFIED"}
 
 
-def _read_capture(lines, window, time_namespace, audit):
+def _read_capture(lines, window, time_namespace, audit, *, phase3=False):
     frames = iter(lines)
     prelude = []
     for _ in range(2):
@@ -113,10 +114,12 @@ def _read_capture(lines, window, time_namespace, audit):
                 expected |= {"channel_id", "received_at"}
         require(set(event) == expected, "CAPTURE_EVENT_FIELDS_INVALID")
         captured[trace] = event
-        if endpoint == "heartbeat":
+        if not phase3 or endpoint == "heartbeat":
             rows[trace] = _audit_row(trace, window, deadline, event)
+            if not phase3:
+                rows[trace]["ENDPOINT"] = endpoint
             audit.append(rows[trace])
-            if event.get("status") == 200:
+            if endpoint == "heartbeat" and event.get("status") == 200:
                 try:
                     utc(event["received_at"])
                 except GateError:
@@ -133,7 +136,7 @@ def _read_capture(lines, window, time_namespace, audit):
     return captured, rows, deadline
 
 
-def _edge_rows(lines):
+def _edge_rows(lines, *, phase3):
     rows = {}
     for index, line in enumerate(lines):
         require(index <= MAX_ROWS and len(line) <= 65536, "EDGE_LOG_BOUNDS_EXCEEDED")
@@ -144,7 +147,8 @@ def _edge_rows(lines):
             continue
         require(not ({"request", "resp_headers", "headers", "body"} & set(row)), "EDGE_ACCESS_LOG_NOT_REDACTED")
         trace, status = row.get("request_id"), row.get("status")
-        require(identifier(trace) and trace not in rows and type(status) is int and 200 <= status <= 599,
+        require(identifier(trace) and trace not in rows and type(status) is int
+                and (200 <= status <= 599 or not phase3 and status == 0),
                 "EDGE_LOG_TRACE_OR_STATUS_INVALID")
         require(type(row.get("received_at_ms")) is str and re.fullmatch(r"[0-9]{13}", row["received_at_ms"]),
                 "EDGE_LOG_TIMESTAMP_INVALID")
@@ -152,29 +156,63 @@ def _edge_rows(lines):
     return rows
 
 
-def _route_audit(row, edge, context):
+def _route_audit(row, edge, context, *, phase3):
     if row is None or edge is None:
         return
     generation = edge.get("route_generation")
     row["EDGE_RECEIVED_AT_MS"] = int(edge["received_at_ms"])
     row["EDGE_HTTP_STATUS"] = edge["status"]
-    row["ROUTE_GENERATION"] = int(generation) if type(generation) is str and re.fullmatch(r"[0-9]{1,12}", generation) else None
+    if phase3:
+        valid_generation = type(generation) is str and re.fullmatch(r"[0-9]{1,12}", generation)
+    else:
+        valid_generation = type(generation) is str and GENERATION.fullmatch(generation) and len(generation) <= 64
+    row["ROUTE_GENERATION"] = int(generation) if valid_generation else None
     if edge.get("upstream") == context["upstream"]:
         row["UPSTREAM"] = context["upstream"]
-        if row["ROUTE_GENERATION"] == context["generation"]:
+        if not phase3 or row["ROUTE_GENERATION"] == context["generation"]:
             row["SLOT"] = context["slot"]
+    elif not phase3 and edge.get("upstream") == context["prior_upstream"]:
+        row["UPSTREAM"] = context["prior_upstream"]
+        row["SLOT"] = context["prior_slot"]
     if row["HTTP_STATUS"] is None:
         row["HTTP_STATUS"] = edge["status"]
 
 
-def _correlate(captured, rows, edges, window, deadline, context, audit):
+def _promotion_route(edge, context):
+    """Return the audit disposition and fault before considering any ACK."""
+    generation = edge.get("route_generation")
+    if type(generation) is not str or not GENERATION.fullmatch(generation):
+        return "FAIL_INVALID_ROUTE_GENERATION", "PLAYER_MONOTONIC_ROUTE_GENERATION_INVALID"
+    expected = str(context["generation"])
+    if (len(generation), generation) > (len(expected), expected):
+        return "FAIL_FUTURE_ROUTE_GENERATION", "PLAYER_MONOTONIC_FUTURE_GENERATION"
+    upstream = edge.get("upstream")
+    if upstream == context["prior_upstream"]:
+        fault = "EDGE_WIRE_CORRELATION_INCOMPLETE" if generation == expected else None
+        return "WRONG_SLOT_FOR_OBSERVATION", fault
+    if generation != expected:
+        return "STALE_ROUTE_GENERATION", None
+    if upstream != context["upstream"]:
+        return "FAIL_WRONG_UPSTREAM", "EDGE_WIRE_CORRELATION_INCOMPLETE"
+    return None, None
+
+
+def _correlate(captured, rows, edges, window, deadline, context, audit, *, phase3):
     acks, faults = [], []
     counters = Counter()
     for trace, event in captured.items():
         edge = edges.pop(trace, None)
         row = rows.get(trace)
-        _route_audit(row, edge, context)
-        if not window.admits(event["request_start_monotonic_ns"]):
+        _route_audit(row, edge, context, phase3=phase3)
+        eligible = window.admits(event["request_start_monotonic_ns"])
+        if not phase3 and edge is not None:
+            disposition, fault = _promotion_route(edge, context)
+            if disposition is not None and (eligible or disposition == "FAIL_FUTURE_ROUTE_GENERATION"):
+                row["FINAL_ADJUDICATION"] = disposition
+                if fault is not None:
+                    faults.append(fault)
+                continue
+        if not eligible:
             continue
         if event["type"] == "incomplete":
             if row is not None:
@@ -201,6 +239,8 @@ def _correlate(captured, rows, edges, window, deadline, context, audit):
             continue
         if endpoint == "playback-events":
             counters["playback_201"] += 1
+            if row is not None:
+                row["FINAL_ADJUDICATION"] = "VERIFIED_PLAYBACK"
             continue
         ack = row["ACK_RECEIVED_AT"]
         if ack is None:
@@ -214,14 +254,23 @@ def _correlate(captured, rows, edges, window, deadline, context, audit):
                     "generation": context["generation"], "slot": context["slot"], "upstream": context["upstream"],
                     "status": 200, "public": True, "path_class": "heartbeat"})
     for trace, edge in edges.items():
-        if edge.get("route_generation") != str(context["generation"]):
-            continue
-        if edge["endpoint"] == "heartbeat":
+        if phase3:
+            if edge.get("route_generation") != str(context["generation"]):
+                continue
+            disposition, fault = "FAIL_MISSING_MONOTONIC_EVIDENCE", "PLAYER_MONOTONIC_EDGE_WITHOUT_WIRE"
+        else:
+            disposition, fault = _promotion_route(edge, context)
+            if disposition is None:
+                disposition, fault = "FAIL_MISSING_MONOTONIC_EVIDENCE", "PLAYER_MONOTONIC_EDGE_WITHOUT_WIRE"
+        if not phase3 or edge["endpoint"] == "heartbeat":
             row = _audit_row(trace, window, deadline)
-            _route_audit(row, edge, context)
-            row["FINAL_ADJUDICATION"] = "FAIL_MISSING_MONOTONIC_EVIDENCE"
+            _route_audit(row, edge, context, phase3=phase3)
+            if not phase3:
+                row["ENDPOINT"] = edge["endpoint"]
+            row["FINAL_ADJUDICATION"] = disposition
             audit.append(row)
-        faults.append("PLAYER_MONOTONIC_EDGE_WITHOUT_WIRE")
+        if fault is not None:
+            faults.append(fault)
     return acks, counters, faults
 
 
@@ -260,9 +309,42 @@ def _join(acks, query, key, context, rows, baseline_refs):
     return proof, faults
 
 
+def observe_committed_slot(capture, logs, query, baseline_refs, context, key, window, *,
+                           time_namespace, audit=None, phase3=False):
+    """Adjudicate an already verified route without using UTC for request eligibility."""
+    window.validate()
+    if not phase3:
+        require(type(context["generation"]) is int and context["generation"] > 0
+                and {context["slot"], context["prior_slot"]} == {"BLUE", "GREEN"}
+                and type(context["upstream"]) is str and context["upstream"]
+                and type(context["prior_upstream"]) is str and context["prior_upstream"]
+                and context["prior_upstream"] != context["upstream"], "INVALID_OBSERVATION_TARGET")
+    if audit is None:
+        audit = []
+    captured, rows, deadline = _read_capture(capture, window, time_namespace, audit, phase3=phase3)
+    edges = _edge_rows(logs, phase3=phase3)
+    acks, counters, faults = _correlate(captured, rows, edges, window, deadline, context, audit, phase3=phase3)
+    baseline_refs = set(baseline_refs)
+    proof, join_faults = _join(acks, query, key, context, rows, baseline_refs)
+    if faults or join_faults:
+        for row in rows.values():
+            if row["FINAL_ADJUDICATION"] == "CREDITED":
+                row["FINAL_ADJUDICATION"] = "VERIFIED_NO_WINDOW_RECEIPT"
+        if faults:
+            require(False, faults[0])
+        raise join_faults[0]
+    observed_refs = {item["device_ref"] for item in proof}
+    accepted = baseline_refs <= observed_refs and not any(counters[k] for k in ("http_409", "http_5xx", "incompatible"))
+    evidence = {"source": "EDGE_ACK_EXACT_DB_JOIN", "access_complete": True, "heartbeats": proof,
+                "http_409": counters["http_409"], "http_5xx": counters["http_5xx"],
+                "incompatible": counters["incompatible"], "playback_201": counters["playback_201"],
+                "playback_evidence": "PASS" if counters["playback_201"] else "UNVERIFIED"}
+    return evidence, accepted, deadline
+
+
 def adjudicate_monotonic(capture, logs, query, baseline, context, key, window, *,
                          time_namespace, diagnostics=None, audit=None, audit_times=None):
-    """Freeze eligibility at the monotonic end and join only terminal eligible ACKs."""
+    """Verify the historical Phase 3 baseline and retain its sealed receipt format."""
     window.validate()
     require(type(context["generation"]) is int and context["generation"] == 0 and context["slot"] == "BLUE"
             and context["upstream"] == legacy_blue_endpoint(context["upstream"]), "INVALID_OBSERVATION_TARGET")
@@ -278,30 +360,15 @@ def adjudicate_monotonic(capture, logs, query, baseline, context, key, window, *
     if diagnostics is not None:
         diagnostics.record_baseline_count(data)
         diagnostics.set_window(baseline_at=utc(data["baseline_at"]), **{k: utc(v) for k, v in times.items()})
-    if audit is None:
-        audit = []
-    captured, rows, deadline = _read_capture(capture, window, time_namespace, audit)
-    acks, counters, faults = _correlate(captured, rows, _edge_rows(logs), window, deadline, context, audit)
-    baseline_refs = set(data["baseline_refs"])
-    proof, join_faults = _join(acks, query, key, context, rows, baseline_refs)
-    if faults or join_faults:
-        for row in rows.values():
-            if row["FINAL_ADJUDICATION"] == "CREDITED":
-                row["FINAL_ADJUDICATION"] = "VERIFIED_NO_WINDOW_RECEIPT"
-        if faults:
-            require(False, faults[0])
-        raise join_faults[0]
-    observed_refs = {item["device_ref"] for item in proof}
-    accepted = baseline_refs <= observed_refs and not any(counters[k] for k in ("http_409", "http_5xx", "incompatible"))
+    evidence, accepted, deadline = observe_committed_slot(capture, logs, query, data["baseline_refs"], context, key,
+                                                          window, time_namespace=time_namespace, audit=audit,
+                                                          phase3=True)
     receipt = sign_receipt("PHASE3_PLAYER", {**context, **times,
         "baseline_hash": baseline_hash, "baseline_at": data["baseline_at"], "baseline_refs": data["baseline_refs"],
-        "source": "EDGE_ACK_EXACT_DB_JOIN", "access_complete": True, "heartbeats": proof,
-        "http_409": counters["http_409"], "http_5xx": counters["http_5xx"],
-        "incompatible": counters["incompatible"], "playback_201": counters["playback_201"],
-        "playback_evidence": "PASS" if counters["playback_201"] else "UNVERIFIED",
+        **evidence,
         "window_monotonic": {"opened_ns": window.opened_ns, "started_ns": window.start_ns,
                              "finished_ns": window.finish_ns, "terminal_deadline_ns": deadline,
                              "baseline_sample_ns": data["baseline_monotonic_ns"], "time_namespace": time_namespace},
-        "result": "FAIL" if not accepted else "PASS" if baseline_refs else "PASS_NO_ACTIVE_BASELINE",
+        "result": "FAIL" if not accepted else "PASS" if data["baseline_refs"] else "PASS_NO_ACTIVE_BASELINE",
     }, key)
     return receipt, accepted

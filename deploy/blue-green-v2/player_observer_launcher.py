@@ -1,4 +1,4 @@
-"""Start the Phase 3 observer in the verified collector's Linux time namespace."""
+"""Start the monotonic observer in the verified collector's Linux time namespace."""
 
 import argparse
 from datetime import datetime, timedelta, timezone
@@ -13,7 +13,7 @@ import sys
 from time import monotonic_ns
 
 from player_observer import InvalidObserverArguments, _parser as observer_parser, local_docker
-from release_state import Stop, canonical, decode, read_private, require, require_private, write_private_atomic
+from release_state import StateStore, Stop, canonical, decode, digest, read_private, require, require_private, write_private_atomic
 
 
 NSENTER = Path("/usr/bin/nsenter")
@@ -27,6 +27,8 @@ NANOSECONDS = 1_000_000_000
 HANDSHAKE_SECONDS = 5
 WINDOW_FLAGS = ("--started-at", "--finished-at", "--opened-monotonic-ns", "--started-monotonic-ns",
                 "--finished-monotonic-ns")
+PROMOTION_WINDOW_FLAGS = ("--opened-at", "--committed-state-sha256", *WINDOW_FLAGS)
+PROMOTION_ACTIONS = ("promotion-baseline", "promotion-observe")
 
 
 def _timens_offsets(raw):
@@ -217,15 +219,52 @@ def _offset_ns(offsets):
     return sec * NANOSECONDS + ns
 
 
-def _window_observer(timeline, clock_receipt, argv):
+def promotion_switch_marker(state, observed_monotonic_ns):
+    """Record the host clock immediately after the controller returns a committed API switch."""
+    routes = state["routing"]
+    transition = routes["api_transition"]
+    require(transition is not None and state["pending"] is None and state["history"]
+            and type(observed_monotonic_ns) is int and observed_monotonic_ns > 0,
+            "PLAYER_API_SWITCH_NOT_COMMITTED")
+    record = state["history"][-1]
+    intent = record["intent"]
+    active = routes["active"]
+    require(record["result"] == "COMMITTED" and intent["operation"] == "API"
+            and intent["to_slot"] == active == {"api": transition["slot"], "frontend": transition["prior_slot"]}
+            and active["api"] != active["frontend"] and intent["generation"] == routes["generation"]
+            == transition["generation"] and intent["next_hash"] == routes["config_hash"]
+            and type(record["recorded_at"]) is str and record["recorded_at"] == transition["switched_at"],
+            "PLAYER_API_SWITCH_NOT_COMMITTED")
+    return {"event": "T_API_SWITCH_COMMITTED", "monotonic_ns": observed_monotonic_ns,
+            "utc": transition["switched_at"], "state_sha256": digest(state)}
+
+
+def _promotion_opening(rows, store):
+    markers = [row for row in rows if row["event"] == "T_API_SWITCH_COMMITTED"]
+    require(len(markers) == 1 and set(markers[0]) == {"event", "monotonic_ns", "utc", "state_sha256"},
+            "PLAYER_WINDOW_TIMELINE_INVALID")
+    marker = markers[0]
+    state = store.load()
+    require(marker["state_sha256"] == digest(state), "OBSERVER_ROUTING_CONTEXT_CHANGED")
+    require(marker == promotion_switch_marker(state, marker["monotonic_ns"]), "PLAYER_WINDOW_TIMELINE_INVALID")
+    return marker
+
+
+def _window_arguments(started_at, opened, started):
+    return ["--started-at", started_at.isoformat(), "--finished-at", (started_at + timedelta(seconds=120)).isoformat(),
+            "--opened-monotonic-ns", str(opened), "--started-monotonic-ns", str(started),
+            "--finished-monotonic-ns", str(started + 120 * NANOSECONDS)]
+
+
+def _window_observer(timeline, clock_receipt, argv, *, store=None):
     clock = decode(read_private(clock_receipt))
     require(clock["TIME_NAMESPACE_MATCH"] == "YES"
             and _proc_clock(Path("/proc/self")) == (clock["OBSERVER_TIME_NS"], clock["OBSERVER_TIMENS_OFFSETS"]),
             INVALID_CLOCK)
-    # The existing handoff timeline stays in host coordinates for its 30 s budget.
-    # Translate its past markers exactly. Sample the Player window in the joined clock.
+    # Both timelines retain host coordinates. Sample the observer window in the joined clock.
     shift = _offset_ns(clock["OBSERVER_TIMENS_OFFSETS"]) - _offset_ns(clock["OBSERVER_ORIGINAL_TIMENS_OFFSETS"])
-    length = timedelta(seconds=120)
+    if store is not None:
+        require_private(timeline.parent, directory=True)
     fd = os.open(timeline, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW)
     with os.fdopen(fd, "a+b") as log:
         info = os.fstat(fd)
@@ -233,25 +272,35 @@ def _window_observer(timeline, clock_receipt, argv):
                 "PLAYER_WINDOW_TIMELINE_PERMISSIONS")
         log.seek(0)
         rows = [decode(line) for line in log]
-        opens = [row["monotonic_ns"] for row in rows if row["event"] == "T_INGRESS_READY"]
-        first = [row["monotonic_ns"] for row in rows if row["event"] == "T_FIRST_HTTP_200"]
-        require(len(opens) == len(first) == 1 and type(opens[0]) is type(first[0]) is int
-                and 0 < opens[0] <= first[0]
-                and not any(row["event"] == "T_PLAYER_OBSERVATION_STARTED" for row in rows),
+        require(not any(row["event"] == "T_PLAYER_OBSERVATION_STARTED" for row in rows),
                 "PLAYER_WINDOW_TIMELINE_INVALID")
+        if store is None:
+            opens = [row["monotonic_ns"] for row in rows if row["event"] == "T_INGRESS_READY"]
+            first = [row["monotonic_ns"] for row in rows if row["event"] == "T_FIRST_HTTP_200"]
+            require(len(opens) == len(first) == 1 and type(opens[0]) is type(first[0]) is int
+                    and 0 < opens[0] <= first[0], "PLAYER_WINDOW_TIMELINE_INVALID")
+            opened = opens[0] + shift
+            verified = first[0] + shift
+            opening = None
+        else:
+            opening = _promotion_opening(rows, store)
+            opened = verified = opening["monotonic_ns"] + shift
         started = monotonic_ns()
-        opened = opens[0] + shift
-        require(0 < opened <= first[0] + shift <= started, "PLAYER_WINDOW_TIMELINE_INVALID")
+        require(0 < opened <= verified <= started, "PLAYER_WINDOW_TIMELINE_INVALID")
         started_at = datetime.now(timezone.utc)
-        log.write(canonical({"event": "T_PLAYER_OBSERVATION_STARTED", "utc": started_at.isoformat(),
-                             "monotonic_ns": started - shift, "player_monotonic_ns": started,
-                             "player_time_namespace": clock["OBSERVER_TIME_NS"]}) + b"\n")
+        marker = {"event": "T_PLAYER_OBSERVATION_STARTED", "utc": started_at.isoformat(),
+                  "monotonic_ns": started - shift, "player_monotonic_ns": started,
+                  "player_time_namespace": clock["OBSERVER_TIME_NS"]}
+        if opening is not None:
+            marker["state_sha256"] = opening["state_sha256"]
+        log.write(canonical(marker) + b"\n")
         log.flush()
         os.fsync(log.fileno())
     from player_observer import main
-    return main([*argv, "--started-at", started_at.isoformat(), "--finished-at", (started_at + length).isoformat(),
-                 "--opened-monotonic-ns", str(opened), "--started-monotonic-ns", str(started),
-                 "--finished-monotonic-ns", str(started + 120 * NANOSECONDS)])
+    if opening is not None:
+        argv = [*argv, "--opened-at", opening["utc"], "--committed-state-sha256", opening["state_sha256"],
+                "--clock-receipt", str(clock_receipt)]
+    return main([*argv, *_window_arguments(started_at, opened, started)])
 
 
 def main(argv):
@@ -259,6 +308,8 @@ def main(argv):
         _confirm_child(int(argv[1]), int(argv[2]), argv[3:])
     if argv and argv[0] == "_observe_window":
         return _window_observer(Path(argv[1]), Path(argv[2]), argv[3:])
+    if argv and argv[0] == "_observe_promotion_window":
+        return _window_observer(Path(argv[1]), Path(argv[2]), argv[4:], store=StateStore(argv[3]))
     split = argv.index("--") if "--" in argv else len(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--collector-id", required=True)
@@ -269,8 +320,9 @@ def main(argv):
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("probe")
     actions.add_parser("baseline")
-    observe = actions.add_parser("observe")
-    observe.add_argument("--timeline", required=True, type=Path)
+    actions.add_parser("observe").add_argument("--timeline", required=True, type=Path)
+    actions.add_parser("promotion-baseline")
+    actions.add_parser("promotion-observe").add_argument("--timeline", required=True, type=Path)
     args = parser.parse_args(argv[:split])
     observer = argv[split + 1:]
     here = Path(__file__).resolve()
@@ -281,19 +333,29 @@ def main(argv):
         command = [*python, "-c", "pass"]
     else:
         require(args.preflight_receipt is not None, "CLOCK_OBSERVER_COMMAND_INVALID")
-        validation = observer
-        if args.action == "observe":
-            require(not any(arg.split("=", 1)[0] in WINDOW_FLAGS for arg in observer), "PLAYER_WINDOW_ARGUMENT_OVERRIDE")
-            # Placeholder types only; the joined child supplies every actual value.
-            validation = [*observer, *(arg for flag in WINDOW_FLAGS for arg in (flag, "0"))]
+        promotion = args.action in PROMOTION_ACTIONS
+        flags = {"observe": WINDOW_FLAGS, "promotion-observe": PROMOTION_WINDOW_FLAGS}.get(args.action, ())
+        owned = (*flags, "--clock-receipt") if promotion else flags
+        options = {arg.split("=", 1)[0] for arg in observer if arg.startswith("--")}
+        override = any(flag in options for flag in owned)
+        if promotion:
+            override = override or any(flag.startswith(option) for option in options for flag in owned)
+        require(not override, "PLAYER_WINDOW_ARGUMENT_OVERRIDE")
+        child_args = [*observer, "--clock-receipt", str(args.clock_receipt)] if promotion else observer
+        # Placeholder types only. The joined child supplies every window boundary.
+        validation = [*child_args, *(arg for flag in flags for arg in (flag, "0"))]
         try:
-            scope = observer_parser().parse_args(validation).action
+            parsed = observer_parser().parse_args(validation)
         except InvalidObserverArguments as exc:
             raise Stop("CLOCK_OBSERVER_COMMAND_INVALID") from exc
-        require(scope == f"phase3-{args.action}", "CLOCK_OBSERVER_COMMAND_INVALID")
+        scope = args.action if promotion else f"phase3-{args.action}"
+        require(parsed.action == scope, "CLOCK_OBSERVER_COMMAND_INVALID")
         expected = decode(read_private(args.preflight_receipt))
-        if args.action == "baseline":
-            command = [*python, str(here.with_name("player_observer.py")), *observer]
+        if args.action in ("baseline", "promotion-baseline"):
+            command = [*python, str(here.with_name("player_observer.py")), *child_args]
+        elif promotion:
+            command = [*python, str(here), "_observe_promotion_window", str(args.timeline), str(args.clock_receipt),
+                       parsed.state_dir, *observer]
         else:
             command = [*python, str(here), "_observe_window", str(args.timeline), str(args.clock_receipt), *observer]
     result = launch_observer_in_collector_time_namespace(args.collector_id, args.collector_image,
@@ -310,7 +372,7 @@ def _interrupted(_signum, _frame):
 
 if __name__ == "__main__":
     try:
-        if sys.platform == "linux" and sys.argv[1:2] not in (["_child"], ["_observe_window"]):
+        if sys.platform == "linux" and sys.argv[1:2] not in (["_child"], ["_observe_window"], ["_observe_promotion_window"]):
             for sig in (signal.SIGTERM, signal.SIGHUP):
                 signal.signal(sig, _interrupted)
         sys.exit(main(sys.argv[1:]))

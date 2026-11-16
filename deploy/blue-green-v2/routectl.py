@@ -684,7 +684,7 @@ class Controller:
             self.store.save(state)
             return state
 
-    def switch_api(self, slot, baseline_receipt):
+    def switch_api(self, slot, baseline_receipt, clock_receipt=None):
         require(slot in SLOTS, "UNKNOWN_SLOT")
         with self._locked():
             state = self.store.load()
@@ -700,6 +700,8 @@ class Controller:
             }
             baseline_hash = self.player_gate.capture_baseline(baseline_receipt, context)
             require(baseline_hash is not None, "PLAYER_BASELINE_RECEIPT_REJECTED")
+            if getattr(self.player_gate, "require_monotonic", False):
+                self.player_gate.baseline_clock(baseline_receipt, clock_receipt)
             return self._switch(state, effective, etag, "API", {**active, "api": slot},
                                 baseline_hash=baseline_hash)
 
@@ -712,7 +714,18 @@ class Controller:
             transition = state["routing"]["api_transition"]
             require(active["api"] == slot != active["frontend"] and transition is not None,
                     "FRONTEND_SWITCH_NOT_ALLOWED")
-            if self.player_gate(receipt, transition) is not True:
+            if getattr(self.player_gate, "require_monotonic", False):
+                from promotion_observer_context import committed_routing_context
+
+                try:
+                    context = committed_routing_context(state, effective)
+                except Stop:
+                    accepted = False
+                else:
+                    accepted = self.player_gate(receipt, transition, routing_context=context)
+            else:
+                accepted = self.player_gate(receipt, transition)
+            if accepted is not True:
                 self._rollback(state, effective, etag)
                 raise Stop("PLAYER_GATE_FAILED_BACKEND_ROLLED_BACK")
             return self._switch(state, effective, etag, "FRONTEND", {**active, "frontend": slot},
@@ -960,7 +973,8 @@ def main():
                         legacy_blue=_json(args.legacy_blue_manifest) if args.legacy_blue_manifest else None,
                         legacy_blue_sha256=args.legacy_blue_sha256,
                         legacy_frontend_blue=_json(args.legacy_frontend_manifest) if args.legacy_frontend_manifest else None,
-                        legacy_frontend_blue_sha256=args.legacy_frontend_sha256), ReadyGate(key), PlayerGate(key),
+                        legacy_frontend_blue_sha256=args.legacy_frontend_sha256), ReadyGate(key),
+            PlayerGate(key, require_monotonic=True),
         )
         action = args.action
         if action == "status":
@@ -988,7 +1002,8 @@ def main():
         elif action == "switch-frontend":
             result = controller.switch_frontend(args.slot, _json(args.receipt))
         elif action == "switch-api":
-            result = controller.switch_api(args.slot, _json(args.baseline_receipt))
+            result = controller.switch_api(args.slot, _json(args.baseline_receipt),
+                                           _json(args.baseline_receipt + ".clock.json"))
         elif hasattr(args, "slot"):
             result = getattr(controller, action.replace("-", "_"))(args.slot)
         else:
