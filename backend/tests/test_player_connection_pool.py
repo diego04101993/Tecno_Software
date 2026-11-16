@@ -3,21 +3,64 @@
 No app startup, worker, migration or external database. The fixture creates
 only its own UUID schema in the explicitly verified disposable QA database.
 """
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import os
 import threading
-from unittest import skipUnless
+from unittest import IsolatedAsyncioTestCase, skipUnless
 from unittest.mock import patch
 from uuid import uuid4
 
-from sqlalchemy import create_engine, event, text
+from fastapi import FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 from test_tenant_gate_performance import GateFixture
-from app.api.deps import get_db
-from app.models.entities import CampaignChannelAssignment
+from app.api.deps import get_current_player_device, get_db
+from app.api.routes import player
+from app.models.entities import CampaignChannelAssignment, PlayerHeartbeat, PlayerPlaybackEvent
+from app.schemas.domain import PlayerPlaybackEventCreate
+from app.services import media_references
+
+
+class PlayerActivityAdmissionTests(IsolatedAsyncioTestCase):
+    async def test_activity_shares_capacity_before_auth_and_time_remains_available(self):
+        app = FastAPI()
+        app.include_router(player.router, prefix="/api/player")
+        admitted = []
+        four_admitted = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pause_authentication():
+            admitted.append(None)
+            if len(admitted) == 4:
+                four_admitted.set()
+            await release.wait()
+            raise HTTPException(status_code=401, detail="Synthetic authentication rejection")
+
+        app.dependency_overrides[get_current_player_device] = pause_authentication
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            requests = []
+            for _ in range(2):
+                requests.extend([
+                    client.get("/api/player/runtime-config"),
+                    client.post("/api/player/heartbeat", json={"status": "online"}),
+                    client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"}),
+                ])
+            responses = asyncio.gather(*requests)
+            try:
+                await asyncio.wait_for(four_admitted.wait(), timeout=3)
+                time_response = await asyncio.wait_for(client.get("/api/player/time"), timeout=3)
+                self.assertEqual(time_response.status_code, 200)
+                self.assertEqual(len(admitted), 4, "Additional Player requests must wait before authentication")
+            finally:
+                release.set()
+                results = await asyncio.wait_for(responses, timeout=3)
+        self.assertEqual([response.status_code for response in results], [401] * 6)
+        self.assertEqual(len(admitted), 6, "Authentication failure must release capacity for waiting requests")
 
 
 @skipUnless(os.environ.get("SECURITY_R5_TEST_DATABASE_URL"), "Owned local PostgreSQL QA required")
@@ -110,6 +153,52 @@ class PlayerConnectionPoolTests(GateFixture):
                 self.assert_pool_returned()
         self.assertLessEqual(self.peak_checked_out, 1)
         self.assertEqual(self.engine.pool.size(), 1)
+
+    def test_telemetry_filters_media_candidates_before_validating_each_row(self):
+        a, b = self.rows["A"], self.rows["B"]
+        a["layout"].zones = [{"label": "reported layout"}]
+        b["layout"].zones = [{"label": "unrelated layout"}]
+        self.db.commit()
+        for kind, status_code in (("heartbeat", 200), ("event", 201)):
+            with self.subTest(kind=kind), patch.object(
+                media_references, "_readable_media_row", wraps=media_references._readable_media_row
+            ) as content_checks, patch.object(
+                media_references, "read_payload_media_owned", wraps=media_references.read_payload_media_owned
+            ) as payload_checks:
+                response = self.call(kind)
+                self.assertEqual(response.status_code, status_code, response.text)
+                self.assertEqual([call.args[2].id for call in content_checks.call_args_list], [a["content"].id])
+                layouts = [call.args[2] for call in payload_checks.call_args_list
+                           if call.args[2] in (a["layout"].zones, b["layout"].zones)]
+                self.assertEqual(layouts, [a["layout"].zones])
+                self.assert_pool_returned()
+
+        heartbeat = self.db.scalar(select(PlayerHeartbeat))
+        playback = self.db.scalar(select(PlayerPlaybackEvent))
+        self.assertEqual(heartbeat.current_content_id, a["content"].id)
+        self.assertEqual(heartbeat.current_layout_id, a["layout"].id)
+        self.assertEqual(playback.content_id, a["content"].id)
+        self.assertEqual(playback.layout_id, a["layout"].id)
+
+    def test_telemetry_exact_media_lookup_still_rejects_invalid_authority(self):
+        a, b = self.rows["A"], self.rows["B"]
+        payload = PlayerPlaybackEventCreate(started_at=datetime.now(UTC), content_id=a["content"].id,
+                                            campaign_id=b["campaign"].id, layout_id=b["layout"].id)
+        allowed = player._sanitize_telemetry(payload, self.db, a["client"].id)
+        self.assertEqual(allowed.content_id, a["content"].id)
+        self.assertIsNone(allowed.campaign_id)
+        self.assertIsNone(allowed.layout_id)
+
+        a["layout"].zones = [{"label": b["content"].file_path}]
+        self.db.commit()
+        report_with_layout = payload.model_copy(update={"layout_id": a["layout"].id})
+        blocked_layout = player._sanitize_telemetry(report_with_layout, self.db, a["client"].id)
+        self.assertIsNone(blocked_layout.layout_id, "A same-tenant layout must still pass opaque media validation")
+
+        b["content"].file_path = a["content"].file_path
+        self.db.commit()
+        blocked = player._sanitize_telemetry(payload, self.db, a["client"].id)
+        self.assertIsNone(blocked.content_id, "An unrelated tenant row must still veto ambiguous media ownership")
 
     def test_concurrent_mixed_requests_return_every_connection(self):
         kinds = ("runtime", "heartbeat", "event") * 2

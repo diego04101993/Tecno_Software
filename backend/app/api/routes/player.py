@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import secrets
 from uuid import uuid4
@@ -39,6 +40,20 @@ from app.services.player_runtime import build_player_runtime_from_snapshot, buil
 router = APIRouter()
 
 
+# A single backend process runs the synchronous Player work. Admit it before
+# authentication acquires a connection so concurrent polling/telemetry can
+# leave capacity for administrative reads and the API's health checks.
+_PLAYER_ACTIVITY_SLOTS = 4
+
+
+async def _admit_player_activity(request: Request):
+    slots = getattr(request.app.state, "player_activity_slots", None)
+    if slots is None:
+        slots = request.app.state.player_activity_slots = asyncio.Semaphore(_PLAYER_ACTIVITY_SLOTS)
+    async with slots:
+        yield
+
+
 def _generate_player_token() -> str:
     return f"tpw_{secrets.token_urlsafe(32)}"
 
@@ -73,7 +88,8 @@ def _sanitize_telemetry(payload, db: Session, client_id: str, prefix: str = ""):
     updates = {}
     for name, model in (("content_id", ContentItem), ("campaign_id", Campaign), ("layout_id", Layout)):
         field = prefix + name
-        resource = safe_tenant_resource(db, model, getattr(payload, field), client_id)
+        resource = safe_tenant_resource(db, model, getattr(payload, field), client_id,
+                                        scope_media_to_resource=True)
         updates[field] = resource.id if resource else None
     return payload.model_copy(update=updates)
 
@@ -178,7 +194,7 @@ def _activate_player(payload: PlayerActivationRequest, db: Session) -> PlayerAct
     )
 
 
-@router.get("/runtime-config")
+@router.get("/runtime-config", dependencies=[Depends(_admit_player_activity)])
 def get_runtime_config(
     request: Request,
     player_device: PlayerDevice = Depends(get_current_player_device),
@@ -200,7 +216,7 @@ def get_runtime_config(
     return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
 
 
-@router.post("/heartbeat", response_model=PlayerHeartbeatAck)
+@router.post("/heartbeat", response_model=PlayerHeartbeatAck, dependencies=[Depends(_admit_player_activity)])
 def create_player_heartbeat(
     payload: PlayerHeartbeatCreate,
     player_device: PlayerDevice = Depends(get_current_player_device),
@@ -276,7 +292,8 @@ def create_player_heartbeat(
     return PlayerHeartbeatAck(ok=True, received_at=heartbeat.received_at, channel_id=channel.id)
 
 
-@router.post("/playback-events", response_model=PlayerPlaybackEventAck, status_code=status.HTTP_201_CREATED)
+@router.post("/playback-events", response_model=PlayerPlaybackEventAck, status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(_admit_player_activity)])
 def create_player_playback_event(
     payload: PlayerPlaybackEventCreate,
     player_device: PlayerDevice = Depends(get_current_player_device),

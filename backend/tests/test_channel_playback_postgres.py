@@ -1,12 +1,15 @@
 """Opt-in real PG16 QA, never app startup, migrations or an existing schema."""
 import json
 import os
+import re
 import time
 import unittest
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import median
 from uuid import uuid4
+from unittest.mock import patch
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
@@ -14,7 +17,8 @@ from sqlalchemy.pool import NullPool
 
 from test_tenant_isolation import TenantFixture
 from app.models.base import Base
-from app.models.entities import Channel, PlayerDevice
+from app.models.entities import Branch, Channel, DeviceOutput, PlayerDevice
+from app.services import tenant_responses
 
 
 @unittest.skipUnless(os.environ.get('CHANNEL_PLAYBACK_QA_DATABASE_URL'), 'Explicit owned local PostgreSQL QA required')
@@ -47,6 +51,55 @@ class ChannelPlaybackPostgresTests(TenantFixture):
                 control.dispose()
         self.addCleanup(cleanup)
         return engine
+
+    def test_channel_collection_preserves_output_scope_and_batches_database_reads(self):
+        side = self.res["A"]
+        client_id, branch_id = side["channel"].client_id, side["branch"].id
+        other_branch = self.add(Branch, client_id=client_id, name="Other branch", code="other")
+        target = self.add(Channel, client_id=client_id, branch_id=other_branch.id, name="Linked outside filter")
+        roots = [side["channel"]]
+        for index in range(5):
+            roots.append(self.add(Channel, client_id=client_id, branch_id=branch_id, name=f"QA root {index}"))
+        expected = {}
+        for root in roots:
+            null_target = self.add(DeviceOutput, root_channel_id=root.id, name="Unassigned",
+                                   display_order=2, channel_id=None)
+            self.add(DeviceOutput, root_channel_id=root.id, name="Foreign", display_order=1,
+                     channel_id=self.res["B"]["channel"].id)
+            same_owner = self.add(DeviceOutput, root_channel_id=root.id, name="Disabled",
+                                  display_order=0, channel_id=target.id, enabled=False)
+            expected[root.id] = [same_owner.id, null_target.id]
+        self.db.commit()
+        self.db.rollback()
+        sql = []
+
+        def collect(_conn, _cursor, statement, _params, _context, _many):
+            sql.append(statement)
+
+        # Without the snapshot witness the existing per-row projection remains
+        # available. Compare the complete response for the same persisted data.
+        with patch.object(tenant_responses, "_projection_graph_scope", return_value=nullcontext()):
+            expected_response = self.request("GET", "/api/channels/", params={"branch_id": branch_id})
+        event.listen(self.engine, "before_cursor_execute", collect)
+        try:
+            actual_response = self.request("GET", "/api/channels/", params={"branch_id": branch_id})
+        finally:
+            event.remove(self.engine, "before_cursor_execute", collect)
+        self.assertEqual(expected_response.status_code, 200, expected_response.text)
+        self.assertEqual(actual_response.status_code, 200, actual_response.text)
+        self.assertEqual(actual_response.json(), expected_response.json())
+        self.assertEqual({row["id"] for row in actual_response.json()}, expected.keys())
+        for row in actual_response.json():
+            self.assertEqual([item["id"] for item in row["device_outputs"]], expected[row["id"]])
+            self.assertFalse(row["device_outputs"][0]["enabled"])
+            self.assertEqual(row["device_outputs"][0]["channel_id"], target.id)
+            self.assertIsNone(row["device_outputs"][1]["channel_id"])
+        output_reads = [statement for statement in sql
+                        if re.search(r"^FROM device_outputs\b", statement, re.MULTILINE)]
+        self.assertEqual(len(output_reads), 2, "One eligible collection query and one graph preload for all roots")
+        self.assertTrue(any("ORDER BY device_outputs.root_channel_id, device_outputs.display_order" in query
+                            for query in output_reads))
+        self.assertEqual(self.engine.pool.checkedout(), 0)
 
     @unittest.skipUnless(int(os.environ.get('CHANNEL_PLAYBACK_QA_ROWS', '0')) >= 1_000_000,
                          'Explicit million-row synthetic QA required')

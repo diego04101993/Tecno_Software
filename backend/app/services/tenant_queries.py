@@ -366,19 +366,26 @@ def _read_projection_predicate(statement, cls, db, profile, client_id, branch_id
 
 
 def readable_query(statement, model, *, db=None, profile="READ", client_id=None, branch_id=None,
-                   content_keys: set[tuple[str, str]] | None = None):
+                   content_keys: set[tuple[str, str]] | None = None, exact_id: str | None = None):
     """Add integrity and opaque-media eligibility before SQL pagination.
 
     Filesystem aliases cannot be compared safely as SQL strings. Their complete
     eligible ID set is computed before executing the result/count/page query.
     Runtime playback can supply the exact content keys already in its query.
+    An exact ID restricts both the response and rows considered for media eligibility.
     This function grants no actor authorization and does not change write paths.
     """
     name = model if isinstance(model, str) else model.__name__
+    if exact_id is not None and name == "ContentItem":
+        if not client_id or content_keys is not None:
+            raise conflict()
+        content_keys = {(client_id, exact_id)}
     if content_keys is not None and (name != "ContentItem" or profile != "RUNTIME"):
         raise conflict()
     cls = model_class(name)
     statement = statement.where(_read_projection_predicate(statement, cls, db, profile, client_id, branch_id))
+    if exact_id is not None:
+        statement = statement.where(cls.id == exact_id)
     if name in {"ContentItem", "DatasetImport"}:
         if db is None:
             raise conflict()
@@ -396,9 +403,13 @@ def readable_query(statement, model, *, db=None, profile="READ", client_id=None,
             raise conflict()
         from app.services.media_references import readable_payload_ids
         cache = db.info.setdefault("a9_payload_ids", {}) if db.info.get("a9_snapshot") else {}
-        if name not in cache:
-            cache[name] = readable_payload_ids(db, name, fields)
-        statement = statement.where(cls.id.in_(cache[name]))
+        if exact_id is not None:
+            eligible_ids = readable_payload_ids(db, name, fields, exact_id=exact_id)
+        else:
+            if name not in cache:
+                cache[name] = readable_payload_ids(db, name, fields)
+            eligible_ids = cache[name]
+        statement = statement.where(cls.id.in_(eligible_ids))
     # Reports must count exactly the same eligible content that serializers may
     # name. An unsafe media reference cannot contribute an anonymous extra count.
     if name in {"AudioPlaybackEvent", "AudioPlaylistItem", "CampaignPlaylistItem", "CampaignSequenceItem"}:

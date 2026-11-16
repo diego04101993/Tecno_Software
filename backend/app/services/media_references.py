@@ -1476,7 +1476,7 @@ def read_payload_media_owned(db: Session, client_id: str, value, *, context=None
         MediaReadDecision.SAFE_EXTERNAL, MediaReadDecision.SAFE_LOCAL_OWNED}
 
 
-def readable_payload_ids(db: Session, model_name: str, fields) -> list[str]:
+def readable_payload_ids(db: Session, model_name: str, fields, *, exact_id: str | None = None) -> list[str]:
     """Complete opaque-field media allowlist, applied in SQL before pagination.
 
     Layout revisions are handled widget by widget by the editor adapter, not by
@@ -1486,8 +1486,10 @@ def readable_payload_ids(db: Session, model_name: str, fields) -> list[str]:
     from app.services.tenant_relations import model_class
     model = model_class(model_name)
     owners = read_media_reference_owners(db, get_settings().MEDIA_ROOT)
-    rows = db.connection().execute(select(model.id, _owner(model, model_name),
-                                         *(getattr(model, field) for field in fields)))
+    statement = select(model.id, _owner(model, model_name), *(getattr(model, field) for field in fields))
+    if exact_id is not None:
+        statement = statement.where(model.id == exact_id)
+    rows = db.connection().execute(statement)
     return [row[0] for row in rows if row[1] and all(read_payload_media_owned(
         db, row[1], value, references=owners,
         context=(MediaReadContext.TYPED_URL if field.endswith("_url")

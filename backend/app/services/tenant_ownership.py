@@ -167,9 +167,7 @@ class TenantGraph:
             raise conflict()
         return RowRef(name, state.identity[0])
 
-    def snapshot(self, row):
-        from sqlalchemy import select
-        ref = self.reference(row)
+    def _active_snapshot_rows(self):
         rows = self._snapshot_rows
         if rows is not None:
             bind, connection_transaction, session_transaction = self._snapshot_scope
@@ -179,9 +177,33 @@ class TenantGraph:
                     or not connection_transaction.is_active or not session_transaction.is_active
                     or bind.in_nested_transaction() or self.session.in_nested_transaction()):
                 self.discard_snapshot_rows()
-                rows = None
-            elif ref in rows:
-                return rows[ref]
+                return None
+        return rows
+
+    def preload_snapshots(self, model, identities):
+        """Fetch persisted facts in batches inside the verified read snapshot."""
+        from sqlalchemy import select
+        rows = self._active_snapshot_rows()
+        if rows is None:
+            return
+        cls = model_class(model)
+        columns = tuple(getattr(cls, key) for key in model_spec(model).columns)
+        refs = {identity: RowRef(model, identity) for identity in identities if identity is not None}
+        missing = sorted(identity for identity, ref in refs.items() if ref not in rows)
+        with self.session.no_autoflush:
+            for start in range(0, len(missing), 500):
+                batch = missing[start:start + 500]
+                records = self.session.execute(select(*columns).where(cls.id.in_(batch))).mappings()
+                found = {record["id"]: freeze(dict(record)) for record in records}
+                for identity in batch:
+                    rows[refs[identity]] = found.get(identity)
+
+    def snapshot(self, row):
+        from sqlalchemy import select
+        ref = self.reference(row)
+        rows = self._active_snapshot_rows()
+        if rows is not None and ref in rows:
+            return rows[ref]
         cls = model_class(ref.model)
         spec = model_spec(ref.model)
         with self.session.no_autoflush:

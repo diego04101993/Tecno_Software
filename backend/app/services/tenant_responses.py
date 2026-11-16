@@ -117,13 +117,13 @@ def tenant_safe_response(graph: TenantGraph, ref, context, projection, *, profil
     return output
 
 
-def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_playback=None):
+def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_playback=None,
+                    _eligible_device_outputs=None):
     """Copy an already scoped row and neutralize approved optional relations.
 
     This is response integrity, not authorization. Query eligibility must have
     run before paging; a detail caller receives a generic 404 if ineligible.
     """
-    from types import SimpleNamespace
     from fastapi import HTTPException
     from sqlalchemy import select
     from app.services.tenant_queries import readable_query
@@ -135,13 +135,27 @@ def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_
             select(model.id), model, db=db, profile=profile, client_id=client_id)))
     if row.id not in cache[key]:
         raise HTTPException(status_code=404, detail="Resource not found")
+    return _project_readable_model(row, schema, db, profile=profile,
+                                   channel_playback=channel_playback,
+                                   channel_outputs=_eligible_device_outputs)
+
+
+def _read_graph(db):
     if db.info.get("a9_snapshot"):
         graph = db.info.get("a9_read_graph")
         if graph is None:
             graph = TenantGraph(db, snapshot_transaction=db.info.get("a9_graph_snapshot_transaction"))
             db.info["a9_read_graph"] = graph
-    else:
-        graph = TenantGraph(db)
+        return graph
+    return TenantGraph(db)
+
+
+def _project_readable_model(row, schema, db, *, profile="READ",
+                            channel_playback=None, channel_outputs=None):
+    """Project an ORM row whose SQL eligibility has already been established."""
+    from types import SimpleNamespace
+    model = type(row)
+    graph = _read_graph(db)
     invalid = graph.invalid_relations(graph.reference(row), profile=profile,
                                       context=SimpleNamespace(branch_id=None))
     changes = {edge.field: None for edge in invalid}
@@ -153,21 +167,67 @@ def safe_model_read(row, schema, db, *, client_id=None, profile="READ", channel_
         changes["current_playback"] = (playback_label_for_read(row, db) if channel_playback is None
                                        else channel_playback.get(row.id))
         if "device_outputs" in schema.model_fields:
-            from app.models.entities import DeviceOutput
             from app.schemas.domain import DeviceOutputRead
-            outputs = db.scalars(readable_query(select(DeviceOutput), DeviceOutput, db=db,
-                                                client_id=row.client_id).where(
-                DeviceOutput.root_channel_id == row.id).order_by(DeviceOutput.display_order))
+            if channel_outputs is None:
+                from sqlalchemy import select
+                from app.models.entities import DeviceOutput
+                from app.services.tenant_queries import readable_query
+                outputs = db.scalars(readable_query(select(DeviceOutput), DeviceOutput, db=db,
+                                                    client_id=row.client_id).where(
+                    DeviceOutput.root_channel_id == row.id).order_by(DeviceOutput.display_order))
             # Materialize the checked collection before Pydantic can lazy-load
             # the raw relationship. Never replace the relationship on the ORM.
             copied = {name: getattr(row, name) for name in schema.model_fields
                       if name != "device_outputs" and hasattr(row, name)}
             copied["computed_status"] = row.computed_status
-            copied["device_outputs"] = [safe_model_read(output, DeviceOutputRead, db,
-                                                        client_id=row.client_id) for output in outputs]
+            if channel_outputs is None:
+                copied["device_outputs"] = [safe_model_read(output, DeviceOutputRead, db, client_id=row.client_id)
+                                            for output in outputs]
+            else:
+                # The collection query already applied both integrity and the
+                # root's expected owner. Keep the same per-row graph projection.
+                copied["device_outputs"] = [_project_readable_model(output, DeviceOutputRead, db)
+                                            for output in channel_outputs]
             return schema.model_validate(copied).model_copy(deep=True, update=changes)
     # Pydantic's deep copy disconnects nested dictionaries/lists from ORM JSON.
     return schema.model_validate(row).model_copy(deep=True, update=changes)
+
+
+def _project_channel_collection(channels, schema, db, playback):
+    from collections import defaultdict
+    from sqlalchemy import select, tuple_
+    from app.models.entities import Channel, DeviceOutput
+    from app.services.tenant_ownership import RowRef
+    from app.services.tenant_queries import readable_query
+
+    roots = {channel.id: channel.client_id for channel in channels}
+    root_pairs = list(roots.items())
+    output_query = readable_query(select(DeviceOutput), DeviceOutput, db=db).order_by(
+        DeviceOutput.root_channel_id, DeviceOutput.display_order)
+    outputs = defaultdict(list)
+    target_ids = set(roots)
+    output_ids = set()
+    for start in range(0, len(root_pairs), 500):
+        root_ids = select(Channel.id).where(tuple_(Channel.id, Channel.client_id).in_(root_pairs[start:start + 500]))
+        for output in db.scalars(output_query.where(DeviceOutput.root_channel_id.in_(root_ids))):
+            outputs[output.root_channel_id].append(output)
+            output_ids.add(output.id)
+            if output.channel_id is not None:
+                target_ids.add(output.channel_id)
+
+    graph = _read_graph(db)
+    graph.preload_snapshots("DeviceOutput", output_ids)
+    graph.preload_snapshots("Channel", target_ids)
+    channel_rows = [row for identity in target_ids
+                    if (row := graph.snapshot(RowRef("Channel", identity))) is not None]
+    branch_ids = {row["branch_id"] for row in channel_rows if row["branch_id"] is not None}
+    graph.preload_snapshots("Branch", branch_ids)
+    clients = {row["client_id"] for row in channel_rows}
+    clients.update(row["client_id"] for identity in branch_ids
+                   if (row := graph.snapshot(RowRef("Branch", identity))) is not None)
+    graph.preload_snapshots("Client", clients)
+    return [safe_model_read(channel, schema, db, channel_playback=playback,
+                            _eligible_device_outputs=outputs[channel.id]) for channel in channels]
 
 
 def latest_heartbeats_query(channel_ids, *, dialect_name="postgresql"):
@@ -341,6 +401,10 @@ def read_snapshot(*, response_model=None):
                                         and (state := orm_inspect(item, raiseerr=False)) is not None
                                         and state.persistent]
                             playback = playback_labels_for_read(channels, db) if channels else None
+                            from app.schemas.domain import ChannelRead
+                            if (item_schema is ChannelRead and channels and len(channels) == len(items)
+                                    and db.info.get("a9_graph_snapshot_transaction") is not None):
+                                return _project_channel_collection(channels, item_schema, db, playback)
                             return [project(item, item_schema, playback) for item in items]
                         state = orm_inspect(value, raiseerr=False)
                         if state is not None and state.persistent:

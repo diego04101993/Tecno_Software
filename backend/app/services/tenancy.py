@@ -87,7 +87,8 @@ def schedule_read_integrity():
     )
 
 
-def safe_tenant_resource(db: Session, model, resource_id: str | None, client_id: str):
+def safe_tenant_resource(db: Session, model, resource_id: str | None, client_id: str,
+                         *, scope_media_to_resource: bool = False):
     if not resource_id:
         return None
     from app.services.tenant_queries import readable_query
@@ -95,7 +96,10 @@ def safe_tenant_resource(db: Session, model, resource_id: str | None, client_id:
     # Touch aggregates sanitize optional navigation targets and children
     # individually, preserving the valid remainder of a historical experience.
     profile = "READ" if model in {TouchExperience, KioskScreen} else "RUNTIME"
-    if runtime_reads(db) is None:
+    if scope_media_to_resource:
+        statement = readable_query(select(model), model, db=db, profile=profile, client_id=client_id,
+                                   exact_id=resource_id)
+    elif runtime_reads(db) is None:
         statement = readable_query(select(model).where(model.id == resource_id), model,
                                    db=db, profile=profile, client_id=client_id)
     else:
