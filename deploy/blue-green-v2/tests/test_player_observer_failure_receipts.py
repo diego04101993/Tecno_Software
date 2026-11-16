@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import player_observer as observer
 import player_observer_diagnostics as diagnostics
+import player_observer_monotonic as monotonic_observer
 from release_state import Stop, write_private_atomic
 
 
@@ -36,6 +37,7 @@ class ObserverFailureReceiptTests(unittest.TestCase):
             "--edge-id", EDGE, "--baseline", str(self.baseline), "--socket", str(self.root / "edge.sock"),
             "--autosave", str(self.root / "autosave.json"), "--opened-at", ORIGIN.isoformat(),
             "--started-at", ORIGIN.isoformat(), "--finished-at", (ORIGIN + timedelta(seconds=120)).isoformat(),
+            "--opened-monotonic-ns", "1", "--started-monotonic-ns", "2", "--finished-monotonic-ns", "120000000002",
         ]
         expected = {"container_id": BACKEND, "image_id": "image-backend", "restart_count": 0,
                     "pid": 103, "started_at": ORIGIN.isoformat()}
@@ -44,6 +46,8 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         state_reader.return_value.load.return_value = state
         self.state_reader = state_reader
         stack.enter_context(patch.object(observer, "phase3_context", return_value={}))
+        stack.enter_context(patch.object(observer, "phase3_time_namespace", return_value="time:[1]"))
+        stack.enter_context(patch.object(observer, "monotonic_ns", return_value=200_000_000_000))
         stack.enter_context(patch.object(observer, "CaddyEdge"))
         self.ingress = stack.enter_context(patch.object(observer, "verify_phase3_ingress",
             return_value=("boot", 4, 5, int(ORIGIN.timestamp()) * 1_000_000_000)))
@@ -63,7 +67,13 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         self.read_capture = stack.enter_context(patch.object(observer, "capture_input", return_value=[b"fixture\n"]))
         record = {"payload": {"baseline_refs": ["hmac1", "hmac2"], "heartbeats": [{"device_ref": "hmac1"}],
                              "http_409": 0, "http_5xx": 0, "incompatible": 0, "playback_201": 0, "result": "FAIL"}}
-        self.adjudicate = stack.enter_context(patch.object(observer, "decide_phase3", return_value=(record, False)))
+        self.adjudicate = stack.enter_context(patch.object(monotonic_observer, "adjudicate_monotonic", return_value=(record, False)))
+
+        def reject(_capture, logs, *_args, **_kwargs):
+            list(logs)
+            return self.adjudicate.return_value
+
+        self.adjudicate.side_effect = reject
         self.fallback = self.root / "fallback"
         self.fallback.mkdir(mode=0o700)
         stack.enter_context(patch.object(diagnostics, "mkdtemp", return_value=str(self.fallback)))
@@ -109,6 +119,12 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         result = self.run_observer(self.argv + [SECRET])
         self.check_failure(result, stage="parse_arguments", reason="OBSERVER_ARGUMENTS_INVALID", code=2, fallback=True)
 
+    def test_phase3_rejects_utc_only_window(self):
+        argv = self.argv[:self.argv.index("--opened-monotonic-ns")]
+        self.check_failure(self.run_observer(argv), stage="parse_arguments", reason="OBSERVER_ARGUMENTS_INVALID",
+                           code=2, fallback=True)
+        self.state_reader.assert_not_called()
+
     def test_invalid_scope_is_rejected_before_loading_state(self):
         argv = self.argv.copy()
         argv[argv.index(PG)] = "invalid-id"
@@ -135,6 +151,23 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         self.read_capture.side_effect = Stop("CAPTURE_STREAM_INVALID")
         self.check_failure(self.run_observer(), stage="read_capture", reason="CAPTURE_STREAM_INVALID")
         self.assertFalse(self.destination.exists())
+
+    def test_pipe_watchdog_failure_uses_original_diagnostic_path(self):
+        self.read_capture.side_effect = Stop("PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
+        record = self.check_failure(self.run_observer(), stage="read_capture", reason="PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
+        self.assertEqual(record["classification"], "OBSERVER_TIMEOUT_OR_CLOCK_FAILURE")
+        self.assertFalse(self.destination.exists())
+
+    def test_direct_descriptor_accepts_the_original_ready_frame_from_supervisor(self):
+        ready = '{"type":"ready","started_ns":1}'
+        self.assertEqual(self.run_observer(self.argv + ["--capture-ready-json", ready])[0], 2)
+        self.assertEqual(self.read_capture.call_args.kwargs["ready_line"], ready.encode() + b"\n")
+
+    def test_ready_argument_cannot_inject_a_second_frame(self):
+        ready = '{"type":"ready","started_ns":1}\n{"type":"done"}'
+        result = self.run_observer(self.argv + ["--capture-ready-json", ready])
+        self.check_failure(result, stage="read_capture", reason="CAPTURE_READY_INVALID")
+        self.read_capture.assert_not_called()
 
     def test_logs_command_error_preserves_streams_without_mixing_them_in_the_diagnostic(self):
         inspect = self.docker.side_effect
@@ -171,7 +204,32 @@ class ObserverFailureReceiptTests(unittest.TestCase):
                 self.adjudicate.side_effect = error
                 self.check_failure(self.run_observer(), stage="adjudicate", reason=reason)
                 self.root.joinpath("player.json.failure.json").unlink()
-                self.root.joinpath("player.json.docker-logs.json").unlink()
+                self.root.joinpath("player.json.requests.json").unlink()
+
+    def test_request_evidence_is_durable_before_failure_diagnostic(self):
+        trace = "00000000-0000-4000-8000-000000000001"
+
+        def fail(*_args, audit, **_kwargs):
+            audit.append({"REQUEST_ID": trace, "ACK_RECEIVED_AT": ORIGIN.isoformat()})
+            raise Stop("EDGE_WIRE_CORRELATION_INCOMPLETE")
+
+        self.adjudicate.side_effect = fail
+        record = self.check_failure(self.run_observer(), stage="adjudicate", reason="EDGE_WIRE_CORRELATION_INCOMPLETE")
+        path = self.root / "player.json.requests.json"
+        if os.name == "posix":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        evidence = json.loads(path.read_bytes())
+        self.assertEqual(evidence["requests"], [{"REQUEST_ID": trace, "ACK_RECEIVED_AT": ORIGIN.isoformat()}])
+        self.assertEqual(record["request_evidence"], {"file": path.name, "records": 1})
+
+    def test_existing_request_evidence_blocks_and_is_preserved(self):
+        path = self.root / "player.json.requests.json"
+        path.write_bytes(b"earlier evidence")
+        record = self.check_failure(self.run_observer(), stage="write_request_evidence",
+                                    reason="OBSERVER_EVIDENCE_FILE_EXISTS")
+        self.assertEqual(record["request_evidence"], {"status": "WRITE_FAILED", "records": 0})
+        self.assertEqual(path.read_bytes(), b"earlier evidence")
+        self.assertFalse(self.destination.exists())
 
     def test_failed_recheck_preserves_counts_already_adjudicated(self):
         token = self.ingress.return_value
@@ -191,6 +249,28 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         argv = self.argv[:self.argv.index("phase3-observe")]
         argv[argv.index(str(self.destination))] = str(path)
         return argv + ["phase3-baseline"]
+
+    def test_live_baseline_signs_clock_sample_taken_before_query(self):
+        key = b"k" * 32
+        self.key.write_bytes(key)
+        order = []
+
+        def read_clock():
+            order.append("clock")
+            return 123
+
+        def postgres(container, sql):
+            self.assertEqual((container, sql), (PG, observer.BASELINE_QUERY))
+            order.append("query")
+            return [json.dumps({"as_of": ORIGIN.isoformat(), "devices": []}).encode()]
+
+        with patch.object(observer, "monotonic_ns", side_effect=read_clock), \
+             patch.object(observer, "postgres_rows", side_effect=postgres):
+            code, _, _ = self.run_observer(self.baseline_args(self.destination))
+        self.assertEqual((code, order), (0, ["clock", "query"]))
+        payload = observer.verified_payload("PHASE3_BASELINE", json.loads(self.destination.read_bytes()), key, {},
+                                            {"baseline_at", "baseline_refs", "baseline_monotonic_ns", "time_namespace"})
+        self.assertEqual((payload["baseline_monotonic_ns"], payload["time_namespace"]), (123, "time:[1]"))
 
     def test_missing_receipt_directory_uses_private_fallback(self):
         path = self.root / "absent" / "baseline-result.json"
@@ -260,3 +340,38 @@ class ObserverFailureReceiptTests(unittest.TestCase):
         record = self.check_failure(self.run_observer(), stage="read_capture", reason="CAPTURE_STREAM_INVALID", fallback=True)
         self.assertEqual(existing.read_bytes(), b"preserved")
         self.assertEqual(record["diagnostic_write_errors"], ["OBSERVER_EVIDENCE_FILE_EXISTS"])
+
+
+class Phase3PipeWatchdogTests(unittest.TestCase):
+    def test_stalled_start_is_limited_by_opened_time(self):
+        opened = 20_000_000_000
+        stream = SimpleNamespace(fileno=lambda: 8)
+        with patch.object(observer, "monotonic_ns", return_value=opened + 2_000_000_000), \
+             patch.object(observer, "select", return_value=([], [], [])) as select_call:
+            with self.assertRaisesRegex(Stop, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED"):
+                observer.capture_input(stream, opened_monotonic_ns=opened, time_namespace="time:[1]")
+        select_call.assert_called_once_with([8], [], [], 178.0)
+
+    def test_ready_clock_tightens_deadline_and_wait_remains_absolute(self):
+        opened = 20_000_000_000
+        clock = {"type": "monotonic_clock", "ready_monotonic_ns": opened - 7_000_000_000,
+                 "deadline_monotonic_ns": opened + 158_000_000_000, "time_namespace": "time:[1]"}
+        ready = observer.phase3_ready_line('{"type":"ready","started_ns":1}')
+        clock_line = json.dumps(clock).encode() + b"\n"
+        stream = SimpleNamespace(fileno=lambda: 8)
+        for pre_read, block in ((None, ready + clock_line), (ready, clock_line)):
+            with self.subTest(pre_read=pre_read is not None):
+                with patch.object(observer, "monotonic_ns", return_value=opened + 2_000_000_000), \
+                     patch.object(observer, "select", side_effect=[([8], [], []), ([], [], [])]) as select_call, \
+                     patch.object(observer.os, "read", return_value=block):
+                    with self.assertRaisesRegex(Stop, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED"):
+                        observer.capture_input(stream, opened_monotonic_ns=opened, time_namespace="time:[1]", ready_line=pre_read)
+                self.assertEqual([call.args[-1] for call in select_call.call_args_list], [178.0, 171.0])
+
+    def test_fragmented_binary_pipe_preserves_exact_lines(self):
+        stream = SimpleNamespace(fileno=lambda: 8)
+        with patch.object(observer, "monotonic_ns", return_value=1), \
+             patch.object(observer, "select", return_value=([8], [], [])), \
+             patch.object(observer.os, "read", side_effect=[b"fi", b"rst\nsecond\nlas", b"t", b""]):
+            lines = observer.capture_input(stream, opened_monotonic_ns=1, time_namespace="time:[1]")
+        self.assertEqual(lines, [b"first\n", b"second\n", b"last"])

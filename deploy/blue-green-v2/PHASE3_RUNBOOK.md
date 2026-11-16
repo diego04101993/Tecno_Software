@@ -414,7 +414,7 @@ PY
 coproc PHASE3_CAPTURE {
   exec {HANDOFF_IN}>&- {HANDOFF_OUT}<&-
   docker_local exec "$COLLECTOR_ID" python -I -B /observe.py \
-    "$EDGE_PROXY_IF" 172.30.250.2 "$BACKEND_PROXY_IP" 165
+    "$EDGE_PROXY_IF" 172.30.250.2 "$BACKEND_PROXY_IP" 165 --phase3-monotonic
 }
 CAPTURE_PID=$PHASE3_CAPTURE_PID
 exec 3<&"${PHASE3_CAPTURE[0]}"
@@ -457,18 +457,59 @@ Para comprobar los headers, usar un GET de solo lectura a `/api/player/time?bgv2
   --expected-client "$PROBE_EXPECTED_CLIENT" --evidence-dir "$WORK"
 ```
 
-`PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. El padre confiable entrega al adjudicador el pipe privado completo y la ventana de al menos 120 segundos, iniciada después de `OPENED_AT` y de la señal `ready`. Usar `--opened-at` en UTC de la misma máquina, posterior al mtime del marcador. El baseline debe tener menos de 120 s al abrir. `FINISHED_AT` queda cubierto por el último registro del colector. Los IDs y la captura sin redacción no salen del pipe. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. `2` o `1` obligan a ejecutar de inmediato la reversión de infraestructura de la sección 6 desde la sesión preparada. No continuar los controles de handoff tras ese resultado. Guardar `phase3-player.json` privado y hash.
+`PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. Después del primer HTTP válido, el padre confiable entrega al adjudicador el pipe privado completo y los tres marcadores de `CLOCK_MONOTONIC`. La apertura proviene de `T_INGRESS_READY`. El inicio se toma en el host al lanzar esta observación y el fin es exactamente 120 s después de ese inicio. El colector debe cubrir la apertura y toda la ventana. La admisión empieza en el inicio inclusive y termina en el fin exclusivo. Una solicitud admitida puede completar mientras dure el colector ya autorizado de 165 s, contado desde su arranque. El ACK completo y su unión PostgreSQL exacta siguen siendo obligatorios. Las horas UTC acompañan los recibos para auditoría. El baseline debe tener como máximo 120 s al abrir, medidos con el mismo reloj monotónico del observador.
+
+Los IDs de dispositivos y la captura sin redacción permanecen en memoria. Guardar `phase3-player.json`, su hash y el archivo privado `phase3-player.json.requests.json` con atribuciones y seudónimos. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. Con `2` o `1`, preservar primero el diagnóstico privado y ejecutar de inmediato la reversión de la sección 6 desde la sesión preparada.
 
 ```bash
-{
-  printf '%s\n' "$CAPTURE_READY"
-  cat <&3
-} | /usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
+PLAYER_WINDOW=$(/usr/bin/python3 -I -B - "$WORK/phase3-timeline.jsonl" <<'PY'
+from datetime import datetime, timedelta, timezone
+import json
+import os
+import stat
+import sys
+from time import monotonic_ns
+
+path = sys.argv[1]
+fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW)
+with os.fdopen(fd, "a+", encoding="utf-8") as timeline:
+    info = os.fstat(timeline.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit("PLAYER_WINDOW_TIMELINE_PERMISSIONS")
+    timeline.seek(0)
+    rows = [json.loads(line) for line in timeline]
+    opens = [r["monotonic_ns"] for r in rows if r["event"] == "T_INGRESS_READY"]
+    first = [r["monotonic_ns"] for r in rows if r["event"] == "T_FIRST_HTTP_200"]
+    started_ns = monotonic_ns()
+    if (len(opens) != 1 or len(first) != 1 or type(opens[0]) is not int or type(first[0]) is not int
+            or not 0 < opens[0] <= first[0] <= started_ns
+            or any(r["event"] == "T_PLAYER_OBSERVATION_STARTED" for r in rows)):
+        raise SystemExit("PLAYER_WINDOW_TIMELINE_INVALID")
+    started_at = datetime.now(timezone.utc)
+    length = timedelta(seconds=120)
+    timeline.write(json.dumps({"event": "T_PLAYER_OBSERVATION_STARTED", "utc": started_at.isoformat(),
+                               "monotonic_ns": started_ns}, sort_keys=True) + "\n")
+    timeline.flush()
+    os.fsync(timeline.fileno())
+    print(opens[0], started_ns, started_ns + 120_000_000_000, started_at.isoformat(),
+          (started_at + length).isoformat())
+PY
+)
+read -r OPENED_MONOTONIC_NS STARTED_MONOTONIC_NS FINISHED_MONOTONIC_NS STARTED_AT FINISHED_AT <<< "$PLAYER_WINDOW"
+if /usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
     --postgres-id "$PG_ID" --key "$KEY_FILE" --receipt "$WORK/phase3-player.json" phase3-observe \
     --edge-id "$EDGE_ID" --baseline "$WORK/phase3-baseline.json" \
     --opened-at "$OPENED_AT" --started-at "$STARTED_AT" --finished-at "$FINISHED_AT" \
-    --socket "$EDGE_RUN/admin.sock" --autosave "$EDGE_CFG/caddy/autosave.json"
-wait "$CAPTURE_PID"
+    --opened-monotonic-ns "$OPENED_MONOTONIC_NS" --started-monotonic-ns "$STARTED_MONOTONIC_NS" \
+    --finished-monotonic-ns "$FINISHED_MONOTONIC_NS" \
+    --socket "$EDGE_RUN/admin.sock" --autosave "$EDGE_CFG/caddy/autosave.json" \
+    --capture-ready-json "$CAPTURE_READY" <&3; then
+  wait "$CAPTURE_PID"
+else
+  PLAYER_OBSERVER_RC=$?
+  exec 3<&-
+  exit "$PLAYER_OBSERVER_RC"
+fi
 exec 3<&-
 ```
 

@@ -10,20 +10,22 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import re
+from select import select
 import subprocess
 import sys
-from time import time_ns
+from time import monotonic_ns, time_ns
 
 from docker_logs import collect_docker_logs
 from gates import PlayerGate, attribute_heartbeats, device_ref, identifier, legacy_blue_endpoint, sign_receipt, utc, verified_payload
 from player_observer_diagnostics import InvalidObserverArguments, ObserverArgumentParser, ObserverDiagnostics
-from release_state import StateStore, canonical, decode, read_private, require, require_private, sync_dir
+from release_state import StateStore, Stop, canonical, decode, read_private, require, require_private, sync_dir
 from routectl import BLUE_PAIR, CaddyEdge, Controller
 
 
 PATHS = {"heartbeat": 200, "playback-events": 201}
 NANOSECONDS = 1_000_000_000
 MAX_ROWS = 100_000
+CAPTURE_PIPE_WATCHDOG_NS = 180 * NANOSECONDS
 
 
 BASELINE_QUERY = """
@@ -88,8 +90,17 @@ def phase3_context(state, postgres_id):
             "identity_hash": ready["identity_hash"], "postgres_id": postgres_id}
 
 
-def capture_phase3_baseline(read, state, key, postgres_id):
-    return sign_receipt("PHASE3_BASELINE", {**phase3_context(state, postgres_id), **baseline_devices(read, key)}, key)
+def capture_phase3_baseline(read, state, key, postgres_id, *, baseline_monotonic_ns=None, time_namespace=None):
+    """Bind a live baseline to the local monotonic clock, preserving archive replay."""
+    require((baseline_monotonic_ns is None) == (time_namespace is None), "PHASE3_BASELINE_CLOCK_INVALID")
+    clock = {}
+    if time_namespace is not None:
+        require(type(baseline_monotonic_ns) is int and baseline_monotonic_ns > 0
+                and type(time_namespace) is str and re.fullmatch(r"time:\[[1-9][0-9]*\]", time_namespace),
+                "PHASE3_BASELINE_CLOCK_INVALID")
+        clock = {"baseline_monotonic_ns": baseline_monotonic_ns, "time_namespace": time_namespace}
+    return sign_receipt("PHASE3_BASELINE", {**phase3_context(state, postgres_id), **clock,
+                                           **baseline_devices(read, key)}, key)
 
 
 def from_ns(value):
@@ -249,6 +260,7 @@ def observed_evidence(capture, logs, query, key, slot, generation, upstream, sta
 
 
 def decide_phase3(capture, logs, query, baseline, context, key, started, finished, opened_at, *, diagnostics=None):
+    """Replay an archived Phase 3 observation using its original contract."""
     data = verified_payload("PHASE3_BASELINE", baseline, key, context, {"baseline_at", "baseline_refs"})
     baseline_hash = PlayerGate.baseline_hash(data)
     start, end, opened, before = map(utc, (started, finished, opened_at, data["baseline_at"]))
@@ -329,7 +341,44 @@ def save_receipt(destination, receipt):
         os.unlink(path)
 
 
-def capture_input(stream):
+def phase3_pipe_watchdog(stream, opened_ns, time_namespace, ready_line=None):
+    """Bound transport independently of the shorter request-evidence deadline."""
+    deadline = opened_ns + CAPTURE_PIPE_WATCHDOG_NS
+    fd = stream.fileno()
+    pending = b""
+    captured = [] if ready_line is None else [ready_line]
+    while True:
+        remaining = deadline - monotonic_ns()
+        require(remaining > 0, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
+        readable, _, _ = select([fd], [], [], remaining / NANOSECONDS)
+        require(bool(readable) and monotonic_ns() < deadline, "PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED")
+        block = os.read(fd, 65536)
+        if not block:
+            if pending:
+                require(len(captured) <= MAX_ROWS, "CAPTURE_STREAM_INVALID")
+                captured.append(pending)
+            return captured
+        rows = (pending + block).split(b"\n")
+        pending = rows.pop()
+        for row in rows:
+            require(len(captured) <= MAX_ROWS and len(row) < 2048, "CAPTURE_STREAM_INVALID")
+            captured.append(row + b"\n")
+            if len(captured) == 2:
+                try:
+                    clock = decode(row)
+                except Stop:
+                    continue
+                if (type(clock) is dict and clock.get("type") == "monotonic_clock"
+                        and clock.get("time_namespace") == time_namespace):
+                    ready_ns = clock.get("ready_monotonic_ns")
+                    if type(ready_ns) is int and 0 < ready_ns <= opened_ns:
+                        deadline = ready_ns + CAPTURE_PIPE_WATCHDOG_NS
+        require(len(pending) <= 2048, "CAPTURE_STREAM_INVALID")
+
+
+def capture_input(stream, *, opened_monotonic_ns=None, time_namespace=None, ready_line=None):
+    if opened_monotonic_ns is not None:
+        return phase3_pipe_watchdog(stream, opened_monotonic_ns, time_namespace, ready_line)
     captured = []
     for index, line in enumerate(iter(lambda: stream.readline(2049), b"")):
         require(index <= MAX_ROWS and len(line) <= 2048, "CAPTURE_STREAM_INVALID")
@@ -338,7 +387,7 @@ def capture_input(stream):
 
 
 def edge_logs(edge_id, started, receipt_path, *, diagnostics=None):
-    since = (utc(started) - timedelta(seconds=2)).isoformat()
+    since = (utc(started) - timedelta(seconds=2)).isoformat() if started is not None else None
     receipt = Path(receipt_path)
     evidence = receipt.with_name(receipt.name + ".docker-logs.json")
     def preserve(logs):
@@ -366,6 +415,31 @@ def verify_phase3_ingress(edge, state, context):
     return edge.boot_token(), marker.st_dev, marker.st_ino, marker.st_mtime_ns
 
 
+def phase3_time_namespace():
+    return os.readlink("/proc/self/ns/time")
+
+
+def phase3_ready_line(pre_read_ready):
+    if pre_read_ready is None:
+        return None
+    row = pre_read_ready.encode()
+    require(0 < len(row) < 2048 and b"\r" not in row and b"\n" not in row, "CAPTURE_READY_INVALID")
+    ready = decode(row)
+    require(type(ready) is dict and set(ready) == {"type", "started_ns"} and ready["type"] == "ready",
+            "CAPTURE_READY_INVALID")
+    from_ns(ready["started_ns"])
+    return row + b"\n"
+
+
+def save_phase3_request_evidence(receipt, audit, diagnostic):
+    destination = Path(receipt)
+    path = destination.with_name(destination.name + ".requests.json")
+    count = len(audit["requests"])
+    diagnostic.request_evidence = {"status": "WRITE_FAILED", "records": count}
+    save_receipt(path, audit)
+    diagnostic.request_evidence = {"file": path.name, "records": count}
+
+
 def _parser():
     parser = ObserverArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", required=True)
@@ -384,6 +458,9 @@ def _parser():
     observe.add_argument("--socket", required=True)
     observe.add_argument("--autosave", required=True)
     observe.add_argument("--opened-at", required=True)
+    observe.add_argument("--capture-ready-json")
+    for marker in ("opened", "started", "finished"):
+        observe.add_argument(f"--{marker}-monotonic-ns", type=int, required=True)
     return parser
 
 
@@ -432,8 +509,12 @@ def main(argv=None):
         before = identities()
         if args.action in ("baseline", "phase3-baseline"):
             diagnostic.advance("capture_baseline")
-            receipt = (capture_phase3_baseline(read, state, key, args.postgres_id) if phase3
-                       else capture_baseline(read, state, key))
+            if phase3:
+                time_namespace = phase3_time_namespace()
+                receipt = capture_phase3_baseline(read, state, key, args.postgres_id,
+                                                  baseline_monotonic_ns=monotonic_ns(), time_namespace=time_namespace)
+            else:
+                receipt = capture_baseline(read, state, key)
             diagnostic.record_baseline_count(receipt["payload"])
             diagnostic.advance("recheck_endpoints_and_state")
             require(before == identities() and store.load() == state, "OBSERVER_IDENTITY_OR_ROUTING_CHANGED")
@@ -448,21 +529,44 @@ def main(argv=None):
             return read_only_query(read, pairs)
 
         if phase3:
+            from player_observer_monotonic import MonotonicWindow, adjudicate_monotonic
+
             diagnostic.advance("verify_initial_ingress")
             edge = CaddyEdge(args.socket, args.autosave)
             token = verify_phase3_ingress(edge, state, context)
-            marker_at, opened_at, started_at = from_ns(token[-1]), utc(args.opened_at), utc(args.started_at)
-            diagnostic.set_window(marker_at=marker_at, opened_at=opened_at, started_at=started_at)
-            require(marker_at <= opened_at <= started_at, "PHASE3_INGRESS_TIME_INVALID")
+            audit_times = {"opened_at": args.opened_at, "started_at": args.started_at, "finished_at": args.finished_at}
+            diagnostic.set_window(marker_at=from_ns(token[-1]), **{name: utc(value) for name, value in audit_times.items()})
+            window = MonotonicWindow(args.opened_monotonic_ns, args.started_monotonic_ns, args.finished_monotonic_ns)
+            window.validate()
+            require(args.started_monotonic_ns <= monotonic_ns(), "OBSERVER_WINDOW_START_IN_FUTURE")
+            time_namespace = phase3_time_namespace()
             diagnostic.advance("read_capture")
-            capture = capture_input(sys.stdin.buffer)
+            capture = capture_input(sys.stdin.buffer, opened_monotonic_ns=window.opened_ns, time_namespace=time_namespace,
+                                    ready_line=phase3_ready_line(args.capture_ready_json))
             diagnostic.counts["capture_records"] = len(capture)
-            diagnostic.advance("collect_edge_logs")
-            logs = edge_logs(args.edge_id, args.started_at, args.receipt, diagnostics=diagnostic)
+            def available_edge_logs():
+                diagnostic.advance("collect_edge_logs")
+                lines = edge_logs(args.edge_id, None, args.receipt, diagnostics=diagnostic)
+                diagnostic.advance("adjudicate")
+                yield from lines
+
             diagnostic.advance("adjudicate")
-            receipt, accepted = decide_phase3(capture, logs, query, baseline, context, key,
-                                              args.started_at, args.finished_at, args.opened_at, diagnostics=diagnostic)
+            audit = {"version": 1, "window_monotonic_ns": {"opened": args.opened_monotonic_ns,
+                     "start": args.started_monotonic_ns, "finish": args.finished_monotonic_ns}, "requests": []}
+            try:
+                receipt, accepted = adjudicate_monotonic(capture, available_edge_logs(), query, baseline, context, key, window,
+                                                        time_namespace=time_namespace, audit_times=audit_times,
+                                                        diagnostics=diagnostic, audit=audit["requests"])
+            except (Exception, KeyboardInterrupt):
+                try:
+                    save_phase3_request_evidence(args.receipt, audit, diagnostic)
+                except Exception:
+                    # The diagnostic still reports the original failed stage.
+                    pass
+                raise
             diagnostic.record_adjudication(receipt)
+            diagnostic.advance("write_request_evidence")
+            save_phase3_request_evidence(args.receipt, audit, diagnostic)
             diagnostic.advance("recheck_ingress")
             require(verify_phase3_ingress(edge, state, context) == token, "PHASE3_INGRESS_CHANGED")
         else:
@@ -483,7 +587,9 @@ def main(argv=None):
         diagnostic.advance("recheck_endpoints_and_state")
         require(before == identities() and store.load() == state, "OBSERVER_IDENTITY_OR_ROUTING_CHANGED")
         diagnostic.advance("verify_window_end")
-        require(utc(args.finished_at) <= from_ns(time_ns()), "OBSERVER_WINDOW_END_IN_FUTURE")
+        window_ended = (args.finished_monotonic_ns <= monotonic_ns() if phase3
+                        else utc(args.finished_at) <= from_ns(time_ns()))
+        require(window_ended, "OBSERVER_WINDOW_END_IN_FUTURE")
         diagnostic.advance("write_player_receipt")
         save_receipt(args.receipt, receipt)
         diagnostic.advance("report_player_result")

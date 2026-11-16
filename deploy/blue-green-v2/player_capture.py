@@ -10,10 +10,11 @@ from collections import deque
 import ctypes
 import json
 import os
+import re
 import socket
 import struct
 import sys
-from time import monotonic, time_ns
+from time import monotonic, monotonic_ns, time_ns
 from uuid import UUID
 
 
@@ -24,6 +25,8 @@ MAX_ACTIVE = 1024
 ETH_ALL = 3
 SOL_PACKET = 263
 PACKET_STATISTICS = 6
+PHASE3_CAPTURE_SECONDS = 165
+NS_PER_SECOND = 1_000_000_000
 
 
 class CaptureError(ValueError):
@@ -47,9 +50,15 @@ def fields(head, selected):
     return result
 
 
+def observation_stamp():
+    observed_monotonic_ns = monotonic_ns()
+    return time_ns(), observed_monotonic_ns
+
+
 class Conversation:
-    def __init__(self, emit):
+    def __init__(self, emit, *, phase3_monotonic=False):
         self.emit = emit
+        self.phase3_monotonic = phase3_monotonic
         self.requests = deque()
         self.request = Stream(self, True)
         self.response = Stream(self, False)
@@ -60,7 +69,10 @@ class Conversation:
         candidates = list(self.requests)
         if self.response.current is not None:
             candidates.append(self.response.current)
-        return [{key: item[key] for key in ("trace", "endpoint", "started_ns")} for item in candidates if item.get("trace")]
+        keys = ("trace", "endpoint", "started_ns")
+        if self.phase3_monotonic:
+            keys += ("request_start_monotonic_ns",)
+        return [{key: item[key] for key in keys} for item in candidates if item.get("trace")]
 
 
 class Stream:
@@ -75,8 +87,10 @@ class Stream:
         self.current = None
         self.remaining = 0
         self.phase = "head"
+        self.request_start = None
+        self.response_complete = None
 
-    def feed_tcp(self, seq, syn, payload):
+    def feed_tcp(self, seq, syn, payload, observed=None):
         if syn:
             expected = (seq + 1) & 0xffffffff
             if self.next_seq is None:
@@ -84,32 +98,51 @@ class Stream:
             seq = expected
         if self.next_seq is None or self.conversation.disabled:
             return
-        self.insert(seq, payload)
+        if self.conversation.phase3_monotonic and observed is None:
+            observed = observation_stamp()
+        self.insert(seq, payload, observed)
         while self.pending:
             for start in self.pending:
                 if self.offset(start) <= 0:
                     break
             else:
                 break
-            self.insert(start, self.pending.pop(start))
+            self.insert(start, *self.pending.pop(start))
 
     def offset(self, seq):
         return ((seq - self.next_seq + 0x80000000) & 0xffffffff) - 0x80000000
 
-    def insert(self, seq, payload):
+    def insert(self, seq, payload, observed):
         offset = self.offset(seq)
         if offset > 0:
             if not payload:
                 return
             require(len(self.pending) < 64 and offset + len(payload) <= 131072, "TCP_GAP_LIMIT")
             old = self.pending.get(seq)
-            require(old is None or old == payload, "AMBIGUOUS_TCP_OVERLAP")
-            self.pending[seq] = payload
+            require(old is None or old[0] == payload, "AMBIGUOUS_TCP_OVERLAP")
+            if old is None:
+                self.pending[seq] = payload, observed
             return
         payload = payload[-offset:]
         if payload:
+            fragments = self.observed_fragments(payload, observed)
             self.next_seq = (self.next_seq + len(payload)) & 0xffffffff
-            self.feed_http(payload)
+            for left, right, stamp in fragments:
+                self.feed_http(payload[left:right], stamp)
+
+    def observed_fragments(self, payload, observed):
+        """Retain when already buffered bytes were first observed."""
+        fragments = [(0, len(payload), observed)]
+        if not self.conversation.phase3_monotonic:
+            return fragments
+        for start, (queued, stamp) in self.pending.items():
+            offset = self.offset(start)
+            left, right = max(0, offset), min(len(payload), offset + len(queued))
+            if left >= right:
+                continue
+            require(payload[left:right] == queued[left - offset:right - offset], "AMBIGUOUS_TCP_OVERLAP")
+            fragments = earlier_fragment(fragments, left, right, stamp)
+        return fragments
 
     def finish(self):
         if self.current is not None:
@@ -122,9 +155,13 @@ class Stream:
                 require(type(channel) is str and str(UUID(channel)) == channel
                         and isinstance(ack["received_at"], str) and len(ack["received_at"]) <= 40, "BAD_ACK_FIELDS")
                 event.update(channel_id=channel, received_at=ack["received_at"])
+            if self.conversation.phase3_monotonic:
+                utc_ns, mono_ns = self.response_complete
+                event.update(response_complete_ns=utc_ns, response_complete_monotonic_ns=mono_ns)
             self.conversation.emit(event)
         self.body.clear()
         self.current = None
+        self.response_complete = None
         self.phase = "head"
 
     def headers(self, head):
@@ -145,7 +182,12 @@ class Stream:
             if endpoint:
                 trace = values.get(b"x-request-id", b"").decode("ascii")
                 require(str(UUID(trace)) == trace, "BAD_EDGE_TRACE")
-                record.update(trace=trace, endpoint=endpoint, started_ns=time_ns())
+                record.update(trace=trace, endpoint=endpoint)
+                if self.conversation.phase3_monotonic:
+                    utc_ns, mono_ns = self.request_start
+                    record.update(started_ns=utc_ns, request_start_monotonic_ns=mono_ns)
+                else:
+                    record["started_ns"] = time_ns()
             self.conversation.requests.append(record)
         else:
             require(len(line) >= 2 and line[0] == b"HTTP/1.1" and len(line[1]) == 3 and line[1].isdigit()
@@ -178,8 +220,16 @@ class Stream:
         if self.phase == "body" and self.remaining == 0:
             self.finish()
 
-    def feed_http(self, data):
+    def feed_http(self, data, observed=None):
+        phase3 = self.conversation.phase3_monotonic
+        if phase3 and observed is None:
+            observed = observation_stamp()
         while data and not self.conversation.disabled:
+            if phase3:
+                if self.request and self.phase == "head" and not self.header:
+                    self.request_start = observed
+                if not self.request and (self.response_complete is None or observed[1] > self.response_complete[1]):
+                    self.response_complete = observed
             if self.phase in ("body", "chunk-body"):
                 take = min(self.remaining, len(data))
                 if self.current and self.current["endpoint"] == "heartbeat" and self.current["status"] == 200:
@@ -220,6 +270,21 @@ class Stream:
                 require(0 < len(size) <= 12 and all(c in b"0123456789abcdefABCDEF" for c in size), "BAD_HTTP_CHUNK_SIZE")
                 self.remaining = int(size, 16)
                 self.phase = "chunk-body" if self.remaining else "trailers"
+
+
+def earlier_fragment(fragments, left, right, stamp):
+    result = []
+    for start, stop, previous in fragments:
+        begin, end = max(start, left), min(stop, right)
+        if begin >= end or previous[1] <= stamp[1]:
+            result.append((start, stop, previous))
+            continue
+        if start < begin:
+            result.append((start, begin, previous))
+        result.append((begin, end, stamp))
+        if end < stop:
+            result.append((end, stop, previous))
+    return result
 
 
 def unique(pairs):
@@ -301,24 +366,37 @@ def install_send_guard(libc, fd):
     require(libc.prctl(22, 2, ctypes.byref(seccomp), 0, 0) == 0, "PASSIVE_SOCKET_GUARD_FAILED")
 
 
-def observe(interface, edge, backend, port, seconds, emit):
+def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=False):
     edge, backend = map(socket.inet_aton, (edge, backend))
     require(edge != backend and 0 < port < 65536 and 1 <= seconds <= 600, "INVALID_CAPTURE_SCOPE")
+    if phase3_monotonic:
+        require(seconds == PHASE3_CAPTURE_SECONDS, "INVALID_PHASE3_CAPTURE_LIFETIME")
+        namespace = os.readlink("/proc/self/ns/time")
+        require(re.fullmatch(r"time:\[\d+\]", namespace), "INVALID_CAPTURE_TIME_NAMESPACE")
     # Open with protocol zero so no packet queues before the filter is installed.
     with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0) as capture:
         constrain(capture, interface, edge, backend, port)
         capture.settimeout(0.1)
-        started = time_ns()
-        emit({"type": "ready", "started_ns": started})
-        deadline = monotonic() + seconds
+        if phase3_monotonic:
+            started, ready_ns = observation_stamp()
+            deadline_ns = ready_ns + seconds * NS_PER_SECOND
+            emit({"type": "ready", "started_ns": started})
+            emit({"type": "monotonic_clock", "ready_monotonic_ns": ready_ns,
+                  "deadline_monotonic_ns": deadline_ns, "time_namespace": namespace})
+        else:
+            emit({"type": "ready", "started_ns": time_ns()})
+            deadline = monotonic() + seconds
         flows = {}
         def emit_response(event):
             emit({"type": "response", **event})
-        while monotonic() < deadline:
+        while (monotonic_ns() < deadline_ns if phase3_monotonic else monotonic() < deadline):
             try:
                 frame = capture.recv(65550)
             except TimeoutError:
                 continue
+            observed = observation_stamp() if phase3_monotonic else None
+            if observed is not None and observed[1] >= deadline_ns:
+                break
             src, src_port, dst_port, seq, flags, payload = parse_packet(frame)
             outbound = src == edge
             flow_port = src_port if outbound else dst_port
@@ -326,13 +404,13 @@ def observe(interface, edge, backend, port, seconds, emit):
             if outbound and syn:
                 require(len(flows) < MAX_ACTIVE or flow_port in flows, "ACTIVE_FLOW_LIMIT")
                 if flow_port not in flows:
-                    flows[flow_port] = Conversation(emit_response)
+                    flows[flow_port] = Conversation(emit_response, phase3_monotonic=phase3_monotonic)
             flow = flows.get(flow_port)
             if flow is None:
                 # A socket predating observer startup cannot be attributed.
                 continue
             stream = flow.request if outbound else flow.response
-            stream.feed_tcp(seq, syn, payload)
+            stream.feed_tcp(seq, syn, payload, observed=observed)
             if flags & 1:
                 flow.half_closed.add(outbound)
             if flags & 4 or len(flow.half_closed) == 2:
@@ -343,7 +421,10 @@ def observe(interface, edge, backend, port, seconds, emit):
             for event in flow.outstanding():
                 emit({"type": "incomplete", **event})
         packets, drops = struct.unpack("II", capture.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
-        emit({"type": "done", "ended_ns": time_ns(), "kernel_packets": packets, "kernel_dropped": drops})
+        done = {"type": "done", "ended_ns": time_ns(), "kernel_packets": packets, "kernel_dropped": drops}
+        if phase3_monotonic:
+            done["ended_monotonic_ns"] = monotonic_ns()
+        emit(done)
         require(drops == 0, "CAPTURE_KERNEL_DROPS")
 
 
@@ -353,10 +434,11 @@ def main():
     parser.add_argument("edge_ip")
     parser.add_argument("backend_ip")
     parser.add_argument("seconds", type=int)
+    parser.add_argument("--phase3-monotonic", action="store_true")
     args = parser.parse_args()
     try:
         observe(args.interface, args.edge_ip, args.backend_ip, 8000, args.seconds,
-                lambda event: print(json.dumps(event), flush=True))
+                lambda event: print(json.dumps(event), flush=True), phase3_monotonic=args.phase3_monotonic)
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
         print('{"type":"failed"}', flush=True)
         return 1

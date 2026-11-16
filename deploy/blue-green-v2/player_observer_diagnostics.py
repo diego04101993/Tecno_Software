@@ -37,17 +37,25 @@ PHASE3_BACKEND_EPOCH_CHANGED PHASE3_ENDPOINT_UNHEALTHY PHASE3_INGRESS_CHANGED
 PHASE3_INGRESS_TIME_INVALID PHASE3_POSTGRES_ID_MISMATCH PLAYER_BASELINE_INVALID PRIVATE_PATH_PERMISSIONS
 PRIVATE_PATH_WRONG_TYPE RECEIPT_CONTEXT_MISMATCH RELEASE_STATE_MISSING ROUTE_SLOT_ENDPOINT_MISMATCH
 STATE_CHECKSUM_MISMATCH UNAUTHENTICATED_RECEIPT WIRE_REQUEST_OUTSIDE_WINDOW
+PLAYER_MONOTONIC_WINDOW_INVALID PLAYER_MONOTONIC_CLOCK_INVALID PLAYER_MONOTONIC_CAPTURE_SCOPE_INVALID
+PLAYER_MONOTONIC_CAPTURE_INCOMPLETE PLAYER_MONOTONIC_REQUEST_START_INVALID PLAYER_MONOTONIC_TERMINAL_INVALID
+PLAYER_MONOTONIC_EDGE_WITHOUT_WIRE PLAYER_MONOTONIC_TERMINAL_INCOMPLETE PLAYER_MONOTONIC_BASELINE_INVALID
+PHASE3_BASELINE_CLOCK_INVALID OBSERVER_WINDOW_START_IN_FUTURE PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED
+WRONG_HEARTBEAT_ORIGIN INVALID_HEARTBEAT_CHANNEL INVALID_DEVICE_ID
 """.split())
 CLOCK_REASONS = frozenset("""
 CAPTURE_COVERAGE_INCOMPLETE CAPTURE_EVENT_PREDATES_CAPTURE DOCKER_LOG_WINDOW_INVALID
 EDGE_LOG_TIMESTAMP_INVALID HEARTBEAT_ACK_OUTSIDE_WINDOW INVALID_CAPTURE_TIMESTAMP
 INVALID_OBSERVATION_WINDOW INVALID_PHASE3_OBSERVATION_WINDOW INVALID_TIMESTAMP
 OBSERVER_WINDOW_END_IN_FUTURE PHASE3_INGRESS_TIME_INVALID WIRE_REQUEST_OUTSIDE_WINDOW
+PLAYER_MONOTONIC_WINDOW_INVALID PLAYER_MONOTONIC_CLOCK_INVALID PLAYER_MONOTONIC_CAPTURE_SCOPE_INVALID
+PLAYER_MONOTONIC_REQUEST_START_INVALID PLAYER_MONOTONIC_TERMINAL_INVALID PLAYER_MONOTONIC_BASELINE_INVALID
+PHASE3_BASELINE_CLOCK_INVALID OBSERVER_WINDOW_START_IN_FUTURE PLAYER_CAPTURE_PIPE_WATCHDOG_EXPIRED
 """.split())
-RECEIPT_STAGES = {"write_baseline_receipt", "write_player_receipt", "write_edge_log_evidence"}
+RECEIPT_STAGES = {"write_baseline_receipt", "write_player_receipt", "write_edge_log_evidence", "write_request_evidence"}
 BASELINE_INPUT_REASONS = {"BASELINE_DOES_NOT_MATCH_SWITCH", "INVALID_RECEIPT", "INVALID_RECEIPT_KEY",
                           "PLAYER_BASELINE_INVALID", "RECEIPT_CONTEXT_MISMATCH", "UNAUTHENTICATED_RECEIPT"}
-TOOL_SOURCES = {"player_observer.py", "player_observer_diagnostics.py", "docker_logs.py",
+TOOL_SOURCES = {"player_observer.py", "player_observer_diagnostics.py", "player_observer_monotonic.py", "docker_logs.py",
                 "release_state.py", "gates.py", "routectl.py", "edge_boot.py"}
 
 
@@ -125,6 +133,7 @@ class ObserverDiagnostics:
         self.monotonic_started_ns = monotonic_ns()
         self.counts = {}
         self.edge_log_streams = None
+        self.request_evidence = None
         self.window = None
 
     def advance(self, stage):
@@ -170,7 +179,8 @@ class ObserverDiagnostics:
                   "primary_receipt_durability": ("UNCONFIRMED" if self.stage in {"write_baseline_receipt", "write_player_receipt"}
                                                  else "WRITTEN" if self.stage in {"report_baseline", "report_player_result"}
                                                  else "NOT_ATTEMPTED"),
-                  "edge_log_streams": self.edge_log_streams, "diagnostic_write_errors": []}
+                  "edge_log_streams": self.edge_log_streams, "request_evidence": self.request_evidence,
+                  "diagnostic_write_errors": []}
         path = self._persist(record)
         try:
             if path is None:
