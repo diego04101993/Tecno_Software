@@ -1,10 +1,10 @@
-# Phase 3 de Blue-Green V2.6
+# Phase 3 de Blue-Green V2.6.5
 
 **El pre-stage y el handoff requieren autorizaciones separadas.** El pre-stage termina en `READY_FOR_DOWNTIME_WINDOW=YES` con Edge cerrado. Sólo el handoff autorizado puede trasladar 80/443, la escritura TLS o la IP de confianza. Phase 3 termina con `ACTIVE_API_SLOT=BLUE` y `ACTIVE_FRONTEND_SLOT=BLUE`. El backend R3 conserva su contenedor y redes. El frontend BLUE sirve la imagen R3 exacta. El frontend histórico se conserva para reversión. Phase 4 y Videowall GREEN quedan fuera de esta intervención.
 
 ## 1. Precheck y calificación de imágenes en solo lectura
 
-Verificar los hashes aprobados del tooling V2.6. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.6`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
+Verificar los hashes aprobados del tooling V2.6.5. Instalar esta revisión bajo `/opt/tecnocontrol-bgv2/v2.6.5`, fuera de `/opt/tecnocontrol`. Ejecutar sólo después de autorización independiente, como root en el propio host Linux, con Python 3.12.3 y el socket Docker local. Antes de mutar Docker, fijar mediante inspección las identidades completas de los servicios `backend`, `frontend` y `postgres` en el proyecto Compose `tecnocontrol`, exactamente un contenedor running por rol. Comprobar salud R3/PostgreSQL, SHA del Caddyfile histórico, Git principal R3, dump histórico, volúmenes, redes, propietarios actuales de TCP 80/443 e índice 019 válido. El verificador 019 es sólo lectura. No ejecutar 019.
 
 Registrar el ID y la configuración completa del frontend histórico, sus dos redes, IDs de red, aliases, IPs y todos los `HostIp/HostPort` publicados. Fijar el backend y los volúmenes `tecnocontrol_backend_uploads`, `tecnocontrol_caddy_data`, `tecnocontrol_caddy_config` y `tecnocontrol_postgres_data`. La identidad de proxy observada debe seguir siendo `172.30.250.2`. Medir el endpoint privado del backend desde Docker, con expectativa histórica `172.30.250.3:8000`, y exigir que sólo ese contenedor lo posea. No confiar en una IP histórica que discrepe de la medición. Conservar el frontend histórico, los manifests y los recursos de reversión intactos.
 
@@ -187,19 +187,27 @@ El signer abre un prompt oculto para un JWT administrativo existente. No pegarlo
 
 Preparar el colector con permisos mínimos y comprobar su entorno en el namespace de Edge. El filtro se armará en el endpoint final `.2` durante el handoff autorizado. Conservar la preparación dentro de la vida del colector y comprobar otra vez su disponibilidad antes de la ventana. El pre-stage no captura un baseline, no abre una ventana de observación y no genera tráfico Player. [Operación del observador](PLAYER_OBSERVER.md)
 
-```sh
+```bash
 # Imagen Python ya cacheada y calificada localmente. El backend R3 es apto
 # si provee Python y sleep con el contrato del colector.
+CAPTURE_IMAGE_ID=$(docker_local image inspect --format '{{.Id}}' "$CAPTURE_IMAGE")
+[[ $CAPTURE_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]]
 COLLECTOR_ID=$(docker_local create --pull=never --name "$COLLECTOR_NAME" \
   --network "container:$EDGE_ID" --cap-drop ALL --cap-add NET_RAW \
   --security-opt no-new-privileges --read-only \
   --mount "type=bind,source=$TOOL/player_capture.py,target=/observe.py,readonly" \
-  --entrypoint /bin/sh "$CAPTURE_IMAGE" -ec 'exec sleep 900')
+  --entrypoint /bin/sh "$CAPTURE_IMAGE_ID" -ec 'exec sleep 900')
+[[ $COLLECTOR_ID =~ ^[0-9a-f]{64}$ ]]
 docker_local start "$COLLECTOR_ID"
 docker_local exec "$COLLECTOR_ID" python -I -B -c 'import fcntl, socket, struct'
+/usr/bin/python3 -B "$TOOL/player_observer_launcher.py" \
+  --collector-id "$COLLECTOR_ID" --collector-image "$CAPTURE_IMAGE_ID" --collector-restart-count 0 \
+  --clock-receipt "$WORK/phase3-clock-probe.json" probe
 ```
 
-Cerrar el pre-stage con R3 sano, frontend histórico como dueño de 80/443 y escritor TLS, Edge con `INGRESS_READY=NO`, smokes privados en PASS, colector preparado y capacidad aprobada. Registrar `READY_FOR_DOWNTIME_WINDOW=YES` en un recibo privado y STOP. Guardar las identidades y la evidencia de reversión para la autorización posterior.
+El probe comprueba el soporte de `nsenter` y ejecuta el ingreso real al namespace de tiempo del PID exacto del colector. Exige `TIME_NAMESPACE_MATCH=YES` y offsets monotónicos iguales. Conservar `phase3-clock-probe.json` privado con las identidades, PID, `StartedAt` y offsets observados. Si el comando falta, `setns` falla o cambia la identidad del colector, conservar el diagnóstico y detener el pre-stage con R3 público. Mantener el ID completo de la imagen y del colector para la autorización posterior.
+
+Cerrar el pre-stage con R3 sano, frontend histórico como dueño de 80/443 y escritor TLS, Edge con `INGRESS_READY=NO`, smokes privados en PASS, colector preparado, probe válido y capacidad aprobada. Registrar `READY_FOR_DOWNTIME_WINDOW=YES` en un recibo privado, reportar `READY_FOR_PHASE3_HANDOFF=YES` y STOP. Guardar las identidades y la evidencia de reversión para la autorización posterior.
 
 ## 4. Ventana de traspaso con autorización independiente
 
@@ -250,9 +258,14 @@ HANDOFF_PREPARED_SHA256=$(
 Justo antes de detener el histórico, capturar `BASELINE_ACTIVE` fresco mediante `player_devices.id`. El recibo liga PostgreSQL y el backend exactos a generación 0. Arrancar la captura en el endpoint final dentro del namespace de Edge con filtro bloqueado por IP/puerto, permisos mínimos y un pipe privado. El colector debe emitir `ready` antes de abrir ingreso. Si se supera el presupuesto de handoff, revertir.
 
 ```sh
-/usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
+/usr/bin/python3 -B "$TOOL/player_observer_launcher.py" \
+  --collector-id "$COLLECTOR_ID" --collector-image "$CAPTURE_IMAGE_ID" --collector-restart-count 0 \
+  --preflight-receipt "$WORK/phase3-clock-probe.json" --clock-receipt "$WORK/phase3-clock-baseline.json" baseline -- \
+  --state-dir "$STATE_DIR" \
   --postgres-id "$PG_ID" --key "$KEY_FILE" --receipt "$WORK/phase3-baseline.json" phase3-baseline
 ```
+
+El launcher confirma otra vez la época del colector fijada por el probe antes de permitir la lectura del baseline. Si caducó o se reemplazó el colector, detener el intento antes del downtime y volver a calificar el colector en pre-stage con un recibo nuevo.
 
 El único cambio de dueño es frontend histórico → Edge. Mantener backend, PostgreSQL, uploads, frontend-blue y el proceso Edge ya validado. Congelar los comandos en la intervención y registrar eventos UTC y monotónicos. Si falta una comprobación o excede el presupuesto de 30 s hasta el primer HTTP válido, pasar inmediatamente a la sección 6. No ocultar fallos ni recalcular el inicio. No ejecutar `compose up`, `restart` de Edge ni ningún smoke largo dentro de la ventana.
 
@@ -434,8 +447,6 @@ wait "$HANDOFF_ROUTING_CHILD"
 unset HANDOFF_ROUTING_CHILD
 printf '%s\n' "$HANDOFF_RESULT" > "$WORK/ingress-recovery.json"
 OPENED_AT=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-STARTED_AT=$OPENED_AT
-FINISHED_AT=$(date -u -d "$STARTED_AT + 120 seconds" +%Y-%m-%dT%H:%M:%S.%NZ)
 PUBLIC_HTTP_BUDGET=$(handoff_budget 10)
 first_public_200 "$PUBLIC_HTTP_BUDGET"
 mark_phase3 T_FIRST_HTTP_200
@@ -457,51 +468,19 @@ Para comprobar los headers, usar un GET de solo lectura a `/api/player/time?bgv2
   --expected-client "$PROBE_EXPECTED_CLIENT" --evidence-dir "$WORK"
 ```
 
-`PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. Después del primer HTTP válido, el padre confiable entrega al adjudicador el pipe privado completo y los tres marcadores de `CLOCK_MONOTONIC`. La apertura proviene de `T_INGRESS_READY`. El inicio se toma en el host al lanzar esta observación y el fin es exactamente 120 s después de ese inicio. El colector debe cubrir la apertura y toda la ventana. La admisión empieza en el inicio inclusive y termina en el fin exclusivo. Una solicitud admitida puede completar mientras dure el colector ya autorizado de 165 s, contado desde su arranque. El ACK completo y su unión PostgreSQL exacta siguen siendo obligatorios. Las horas UTC acompañan los recibos para auditoría. El baseline debe tener como máximo 120 s al abrir, medidos con el mismo reloj monotónico del observador.
+`PHASE3_REAL_PLAYER_CONTINUITY_GATE` usa sólo tráfico real. Después del primer HTTP válido, el launcher verifica al colector y vuelve a ingresar exclusivamente a su namespace de tiempo. El hijo verificado lee `T_INGRESS_READY` en la línea temporal y lleva la apertura a su dominio `CLOCK_MONOTONIC` aplicando la diferencia exacta de offsets. Registra el inicio en ese mismo dominio y fija el fin exactamente 120 s después. Los marcadores de downtime del host conservan sus coordenadas originales. El colector debe cubrir la apertura y toda la ventana. La admisión empieza en el inicio inclusive y termina en el fin exclusivo. Una solicitud admitida puede completar mientras dure el colector ya autorizado de 165 s, contado desde su arranque. El ACK completo y su unión PostgreSQL exacta siguen siendo obligatorios. Los timestamps UTC acompañan los recibos para auditoría. El baseline debe tener como máximo 120 s al abrir, medidos con el mismo reloj monotónico del observador. El watchdog del pipe conserva sus 180 s.
 
 Los IDs de dispositivos y la captura sin redacción permanecen en memoria. Guardar `phase3-player.json`, su hash y el archivo privado `phase3-player.json.requests.json` con atribuciones y seudónimos. Los valores de salida son `0` evidencia válida, `2` gate negativo y `1` prueba incompleta. Con `2` o `1`, preservar primero el diagnóstico privado y ejecutar de inmediato la reversión de la sección 6 desde la sesión preparada.
 
 ```bash
-PLAYER_WINDOW=$(/usr/bin/python3 -I -B - "$WORK/phase3-timeline.jsonl" <<'PY'
-from datetime import datetime, timedelta, timezone
-import json
-import os
-import stat
-import sys
-from time import monotonic_ns
-
-path = sys.argv[1]
-fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW)
-with os.fdopen(fd, "a+", encoding="utf-8") as timeline:
-    info = os.fstat(timeline.fileno())
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
-        raise SystemExit("PLAYER_WINDOW_TIMELINE_PERMISSIONS")
-    timeline.seek(0)
-    rows = [json.loads(line) for line in timeline]
-    opens = [r["monotonic_ns"] for r in rows if r["event"] == "T_INGRESS_READY"]
-    first = [r["monotonic_ns"] for r in rows if r["event"] == "T_FIRST_HTTP_200"]
-    started_ns = monotonic_ns()
-    if (len(opens) != 1 or len(first) != 1 or type(opens[0]) is not int or type(first[0]) is not int
-            or not 0 < opens[0] <= first[0] <= started_ns
-            or any(r["event"] == "T_PLAYER_OBSERVATION_STARTED" for r in rows)):
-        raise SystemExit("PLAYER_WINDOW_TIMELINE_INVALID")
-    started_at = datetime.now(timezone.utc)
-    length = timedelta(seconds=120)
-    timeline.write(json.dumps({"event": "T_PLAYER_OBSERVATION_STARTED", "utc": started_at.isoformat(),
-                               "monotonic_ns": started_ns}, sort_keys=True) + "\n")
-    timeline.flush()
-    os.fsync(timeline.fileno())
-    print(opens[0], started_ns, started_ns + 120_000_000_000, started_at.isoformat(),
-          (started_at + length).isoformat())
-PY
-)
-read -r OPENED_MONOTONIC_NS STARTED_MONOTONIC_NS FINISHED_MONOTONIC_NS STARTED_AT FINISHED_AT <<< "$PLAYER_WINDOW"
-if /usr/bin/python3 -B "$TOOL/player_observer.py" --state-dir "$STATE_DIR" \
+if /usr/bin/python3 -B "$TOOL/player_observer_launcher.py" \
+    --collector-id "$COLLECTOR_ID" --collector-image "$CAPTURE_IMAGE_ID" --collector-restart-count 0 \
+    --preflight-receipt "$WORK/phase3-clock-probe.json" --clock-receipt "$WORK/phase3-clock-observe.json" \
+    observe --timeline "$WORK/phase3-timeline.jsonl" -- \
+    --state-dir "$STATE_DIR" \
     --postgres-id "$PG_ID" --key "$KEY_FILE" --receipt "$WORK/phase3-player.json" phase3-observe \
     --edge-id "$EDGE_ID" --baseline "$WORK/phase3-baseline.json" \
-    --opened-at "$OPENED_AT" --started-at "$STARTED_AT" --finished-at "$FINISHED_AT" \
-    --opened-monotonic-ns "$OPENED_MONOTONIC_NS" --started-monotonic-ns "$STARTED_MONOTONIC_NS" \
-    --finished-monotonic-ns "$FINISHED_MONOTONIC_NS" \
+    --opened-at "$OPENED_AT" \
     --socket "$EDGE_RUN/admin.sock" --autosave "$EDGE_CFG/caddy/autosave.json" \
     --capture-ready-json "$CAPTURE_READY" <&3; then
   wait "$CAPTURE_PID"

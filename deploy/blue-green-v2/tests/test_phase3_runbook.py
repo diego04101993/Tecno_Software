@@ -72,6 +72,30 @@ class Phase3RunbookTest(unittest.TestCase):
                           "prepare-handoff", "phase3-baseline", "T_FRONTEND_STOP", "PHASE3_REAL_PLAYER_CONTINUITY_GATE",
                           "ALL_BASELINE_CONTINUOUS")
 
+    def test_phase3_observer_uses_time_namespace_launcher_for_every_action(self):
+        prestage, handoff = RUNBOOK.split("## 4. Ventana de traspaso con autorización independiente", 1)
+        launcher = '/usr/bin/python3 -B "$TOOL/player_observer_launcher.py"'
+        inspection = '''CAPTURE_IMAGE_ID=$(docker_local image inspect --format '{{.Id}}' "$CAPTURE_IMAGE")'''
+        identity = '--collector-id "$COLLECTOR_ID" --collector-image "$CAPTURE_IMAGE_ID" --collector-restart-count 0'
+        probe_receipt = '"$WORK/phase3-clock-probe.json"'
+        preflight = f"--preflight-receipt {probe_receipt}"
+        self.assert_order(prestage, inspection, 'COLLECTOR_ID=$(docker_local create',
+                          '--entrypoint /bin/sh "$CAPTURE_IMAGE_ID"', 'docker_local start "$COLLECTOR_ID"',
+                          'docker_local exec "$COLLECTOR_ID"', launcher, identity,
+                          f"--clock-receipt {probe_receipt} probe", "READY_FOR_PHASE3_HANDOFF=YES")
+        commands = "\n".join(BLOCKS)
+        self.assertEqual(commands.count(launcher), 3)
+        self.assertNotIn('"$TOOL/player_observer.py"', commands)
+        self.assert_order(handoff, launcher, identity, preflight,
+                          '--clock-receipt "$WORK/phase3-clock-baseline.json" baseline --',
+                          '--receipt "$WORK/phase3-baseline.json" phase3-baseline', "T_FRONTEND_STOP",
+                          '"$EDGE_PROXY_IF" 172.30.250.2 "$BACKEND_PROXY_IP" 165 --phase3-monotonic',
+                          "mark_phase3 T_FIRST_HTTP_200", launcher, identity, preflight,
+                          '--clock-receipt "$WORK/phase3-clock-observe.json"',
+                          'observe --timeline "$WORK/phase3-timeline.jsonl" --', "phase3-observe",
+                          '--capture-ready-json "$CAPTURE_READY" <&3', 'wait "$CAPTURE_PID"')
+        self.assertNotRegex(commands, r"--(?:opened|started|finished)-monotonic-ns|--(?:started|finished)-at")
+
     @unittest.skipUnless(bash(), "Bash is required for shell snippet validation")
     def test_shell_blocks_parse(self):
         self.assertGreaterEqual(len(BLOCKS), 8)
