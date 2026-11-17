@@ -1,4 +1,4 @@
-"""Route-only controller for Blue-Green V2. It cannot start or stop a slot."""
+"""Control Blue-Green V2 routing and Edge configuration without starting or stopping slots."""
 
 import argparse
 import contextlib
@@ -16,7 +16,9 @@ from gates import legacy_blue_endpoint, utc, verify_legacy_blue_manifest
 from legacy_frontend_blue import READY_ADOPTION
 
 from release_state import (
-    IDENTITY_FIELDS, ROLES, SLOTS, StateStore, Stop, canonical, decode, digest, exclusive_lock, now, read_private,
+    EDGE_CONFIG_ROLLBACK, EDGE_CONFIG_UPDATE, IDENTITY_FIELDS, ROLES, SLOTS, StateStore, Stop,
+    canonical, decode, digest, edge_config_revision, edge_config_rollback_target, exclusive_lock,
+    next_edge_config_revision, next_routing_generation, now, pending_event_type, read_private,
     require, require_private, same_runtime_epoch, sync_dir, validate_hash, validate_release, write_private_atomic,
 )
 from routectl_lock_status import writer_status
@@ -33,6 +35,10 @@ STATUS_TRANSITION = "STATUS_TRANSITION_IN_PROGRESS"
 
 class StatusTransition(Stop):
     """The sampled routing artifacts do not yet describe one committed view."""
+
+    def __init__(self, code, *, pending=None):
+        super().__init__(code)
+        self.pending = pending
 
 
 def upstream(role, slot):
@@ -347,7 +353,7 @@ class CaddyEdge:
 
 
 class Controller:
-    """Desired release state changes only through proven route transitions."""
+    """Commit only verified changes to routing or Edge configuration."""
 
     def __init__(self, store, edge, probe, ready_gate, player_gate):
         self.store = store
@@ -597,7 +603,7 @@ class Controller:
         require_private(self.store.directory, directory=True)
         state = self.store.load()
         if state["pending"] is not None:
-            raise StatusTransition("PENDING_INTENT")
+            raise StatusTransition("PENDING_INTENT", pending=pending_event_type(state))
         edge_identity, admission = self.edge.status_identity()
         if edge_identity is not None and admission is None:
             raise StatusTransition("INGRESS_NOT_READY")
@@ -634,11 +640,16 @@ class Controller:
         try:
             state = self.status()
         except StatusTransition as exc:
-            return {"STATUS": STATUS_TRANSITION, "REASON": str(exc), **ownership}
+            return {"STATUS": STATUS_TRANSITION, "REASON": str(exc), "PENDING_EVENT_TYPE": exc.pending, **ownership}
         except (Stop, OSError, ValueError, KeyError, TypeError, IndexError) as exc:
             reason = str(exc) if isinstance(exc, Stop) else "ROUTECTL_LOCAL_IO_OR_INPUT_FAILED"
             return {"STATUS": "FAIL", "REASON": reason, **ownership}
-        return {"STATUS": "PASS", "STATE_SHA256": digest(state), "state": state, **ownership}
+        route = state["routing"]
+        return {"STATUS": "PASS", "STATE_SHA256": digest(state), "state": state, **ownership,
+                "ACTIVE_API_SLOT": route["active"]["api"], "ACTIVE_FRONTEND_SLOT": route["active"]["frontend"],
+                "ROUTING_GENERATION": route["generation"], "EDGE_CONFIG_REVISION": edge_config_revision(state),
+                "EDGE_CONFIG_HASH": route["config_hash"], "AUTOSAVE_HASH": route["config_hash"],
+                "PENDING_EVENT_TYPE": None}
 
     def prepare(self, slot, release):
         require(slot in SLOTS, "UNKNOWN_SLOT")
@@ -699,7 +710,7 @@ class Controller:
             self.store.save(state)
             return state
 
-    def switch_api(self, slot, baseline_receipt, clock_receipt=None):
+    def switch_api(self, slot, baseline_receipt, clock_receipt=None, *, expected_edge_config_revision=None):
         require(slot in SLOTS, "UNKNOWN_SLOT")
         with self._locked():
             state = self.store.load()
@@ -709,13 +720,28 @@ class Controller:
                     "API_SWITCH_NOT_ALLOWED")
             entry = state["slots"][slot]
             require(entry is not None and entry["phase"] == "READY", "SLOT_NOT_READY")
+            monotonic = getattr(self.player_gate, "require_monotonic", False)
+            revision = edge_config_revision(state)
+            pin_config = "edge_config_revision" in state or expected_edge_config_revision is not None
+            if pin_config:
+                from edge_telemetry import telemetry_enabled
+
+                require(monotonic and revision > 0 and telemetry_enabled(effective.config, effective.hosts),
+                        "PLAYER_EDGE_TELEMETRY_NOT_COMMITTED")
+                require(expected_edge_config_revision is None
+                        or type(expected_edge_config_revision) is int and expected_edge_config_revision == revision,
+                        "PLAYER_EDGE_CONFIG_REVISION_MISMATCH")
             context = {
                 "slot": slot, "prior_slot": active["api"], "previous_generation": effective.generation,
                 "identity_hash": entry["ready"]["api"]["identity_hash"], "release": entry["release"],
             }
             baseline_hash = self.player_gate.capture_baseline(baseline_receipt, context)
             require(baseline_hash is not None, "PLAYER_BASELINE_RECEIPT_REJECTED")
-            if getattr(self.player_gate, "require_monotonic", False):
+            if pin_config:
+                self.player_gate.baseline_clock(baseline_receipt, clock_receipt,
+                                                expected_edge_config_revision=revision,
+                                                expected_edge_config_hash=effective.hash)
+            elif monotonic:
                 self.player_gate.baseline_clock(baseline_receipt, clock_receipt)
             return self._switch(state, effective, etag, "API", {**active, "api": slot},
                                 baseline_hash=baseline_hash)
@@ -738,6 +764,8 @@ class Controller:
                     accepted = False
                 else:
                     accepted = self.player_gate(receipt, transition, routing_context=context)
+            elif "edge_config_revision" in state:
+                accepted = False
             else:
                 accepted = self.player_gate(receipt, transition)
             if accepted is not True:
@@ -775,9 +803,113 @@ class Controller:
             self.store.save(state)
             return state
 
+    def config_update(self):
+        return self._change_edge_config(EDGE_CONFIG_UPDATE)
+
+    def config_rollback(self):
+        return self._change_edge_config(EDGE_CONFIG_ROLLBACK)
+
+    def _edge_config_payload(self, state, effective, operation):
+        from edge_telemetry import telemetry_rollback, telemetry_update
+
+        active = effective.active
+        require(active["api"] == active["frontend"], "EDGE_CONFIG_REQUIRES_STEADY_ROUTING")
+        if operation == EDGE_CONFIG_UPDATE:
+            updated = telemetry_update(effective.config, effective.hosts)
+            revision = next_edge_config_revision(state)
+        else:
+            target = edge_config_rollback_target(state)
+            require(operation == EDGE_CONFIG_ROLLBACK and target is not None, "NO_EDGE_CONFIG_ROLLBACK_TARGET")
+            updated = telemetry_rollback(effective.config, effective.hosts)
+            previous = RouteConfig(self.store.load_config(target["previous_hash"]), effective.hosts)
+            require(previous.changed(active, effective.generation).hash == digest(updated),
+                    "EDGE_CONFIG_ROLLBACK_SCOPE_CHANGED")
+            revision = target["previous_revision"]
+        candidate = RouteConfig(updated, effective.hosts)
+        require(candidate.active == active and candidate.generation == effective.generation
+                and candidate.targets == effective.targets and candidate.proxies == effective.proxies
+                and candidate.hash != effective.hash, "EDGE_CONFIG_ROUTING_CHANGED")
+        return candidate, revision
+
+    def _edge_boot_id(self):
+        identity, _ = self.edge.status_identity()
+        require(identity is not None or self.edge.socket_path is None, "EDGE_BOOT_ID_REQUIRED")
+        return identity[3].decode("ascii").strip() if identity is not None else None
+
+    def _change_edge_config(self, operation):
+        with self._locked():
+            state = self.store.load()
+            boot_id = self._edge_boot_id()
+            effective, etag = self._current(state)
+            require(self.store.load_config(effective.hash) == effective.config, "SEALED_CONFIG_CHANGED")
+            candidate, revision = self._edge_config_payload(state, effective, operation)
+            for role, slot in effective.active.items():
+                self._assert_ready(state, role, slot, mark_failed=False)
+            require(self.store.seal_config(candidate.config) == candidate.hash, "SEALED_CONFIG_CHANGED")
+            require(self._edge_boot_id() == boot_id, "EDGE_BOOT_CHANGED")
+            event = {"type": operation, "reason": "TELEMETRY", "previous_revision": edge_config_revision(state),
+                     "new_revision": revision, "routing_generation": effective.generation, "active": effective.active,
+                     "previous_hash": effective.hash, "next_hash": candidate.hash, "previous_autosave_hash": effective.hash,
+                     "next_autosave_hash": candidate.hash, "expected_etag": etag, "payload_sha256": candidate.hash,
+                     "timestamp": now(), "edge_boot_id": boot_id,
+                     "previous_record_hash": digest(state["history"][-1]) if state["history"] else None}
+            event["event_hash"] = digest(event)
+            state["pending"] = {"stage": "PREPARED", "event": event}
+            self.store.save(state)
+            require(self.store.load() == state and self._edge_boot_id() == boot_id, "STOP_AMBIGUOUS")
+            state["pending"]["stage"] = "DISPATCHED"
+            self.store.save(state)
+            status = self.edge.patch(candidate.config, etag)
+            if status == 412:
+                require(self.store.load() == state, "STOP_AMBIGUOUS")
+                state["pending"]["stage"] = "REJECTED"
+                self.store.save(state)
+                raise Stop("EDGE_ETAG_COLLISION")
+            require(200 <= status < 300, "EDGE_MUTATION_REJECTED_RECONCILE")
+            return self._reconcile_edge_config(state, must_commit=True)["state"]
+
+    def _sealed_edge_config_event(self, state):
+        event = state["pending"]["event"]
+        previous = RouteConfig(self.store.load_config(event["previous_hash"]), self.edge.hosts)
+        candidate, revision = self._edge_config_payload(state, previous, event["type"])
+        require(previous.active == event["active"] and previous.generation == event["routing_generation"]
+                and revision == event["new_revision"] and candidate.hash == event["next_hash"]
+                and candidate.config == self.store.load_config(candidate.hash), "EDGE_CONFIG_EVENT_PAYLOAD_CHANGED")
+        self._require_legacy_binding(state, candidate)
+        self._verify_route_bindings(state, candidate)
+        return previous, candidate
+
+    def _record_edge_config(self, state, result):
+        require(self.store.load() == state, "STOP_AMBIGUOUS")
+        event = state["pending"]["event"]
+        revision = edge_config_revision(state)
+        if result == "COMMITTED":
+            state["routing"]["config_hash"] = event["next_hash"]
+            revision = event["new_revision"]
+        state["edge_config_revision"] = revision
+        state["history"].append({"event": event, "result": result, "recorded_at": now()})
+        state["pending"] = None
+        self.store.save(state)
+
+    def _reconcile_edge_config(self, state, *, must_commit=False):
+        previous, candidate = self._sealed_edge_config_event(state)
+        effective, etag = self.edge.effective()
+        persisted = self.edge.persisted()
+        last, last_etag = self.edge.effective()
+        require(etag == last_etag and effective.hash == persisted.hash == last.hash, "STOP_AMBIGUOUS")
+        stage = state["pending"]["stage"]
+        if stage == "DISPATCHED" and effective.hash == candidate.hash:
+            self._record_edge_config(state, "COMMITTED")
+            return {"result": "COMMIT", "state": state}
+        if not must_commit and stage in ("PREPARED", "REJECTED") and effective.hash == previous.hash:
+            self._record_edge_config(state, "ROLLED_BACK")
+            return {"result": "ROLLBACK", "state": state}
+        # A disconnected client cannot prove a dispatched PATCH will never apply.
+        raise Stop("STOP_AMBIGUOUS")
+
     def _switch(self, state, effective, etag, operation, target, baseline_hash=None, player_gate_hash=None):
         self._verify_promotion(state, operation, target)
-        generation = len(state["history"]) + 1
+        generation = next_routing_generation(state)
         updated = effective.changed(target, generation)
         self.store.seal_config(updated.config)
         release = state["slots"][target["api"]]["release"]
@@ -788,6 +920,8 @@ class Controller:
             "expected_etag": etag, "previous_hash": effective.hash, "next_hash": updated.hash,
             "baseline_hash": baseline_hash, "player_gate_hash": player_gate_hash,
         }
+        if "edge_config_revision" in state:
+            intent["previous_record_hash"] = digest(state["history"][-1])
         intent["intent_hash"] = digest(intent)
         state["pending"] = {"stage": "PREPARED", "intent": intent}
         self.store.save(state)
@@ -849,6 +983,8 @@ class Controller:
             self._current(state)
             return {"result": "IN_SYNC", "state": state}
         pending = state["pending"]
+        if "event" in pending:
+            return self._reconcile_edge_config(state, must_commit=must_commit)
         intent = pending["intent"]
         effective, _ = self.edge.effective()
         persisted = self.edge.persisted()
@@ -964,6 +1100,7 @@ def main():
     api = subparsers.add_parser("switch-api")
     api.add_argument("slot", choices=SLOTS)
     api.add_argument("baseline_receipt")
+    api.add_argument("--expected-edge-config-revision", type=int, required=True)
     ready = subparsers.add_parser("ready")
     ready.add_argument("role", choices=ROLES)
     ready.add_argument("slot", choices=SLOTS)
@@ -971,7 +1108,8 @@ def main():
     frontend = subparsers.add_parser("switch-frontend")
     frontend.add_argument("slot", choices=SLOTS)
     frontend.add_argument("receipt")
-    for action in ("status", "reconcile", "rollback", "recover-ingress", "supervise-ingress", "close-ingress"):
+    for action in ("status", "reconcile", "rollback", "config-update", "config-rollback",
+                   "recover-ingress", "supervise-ingress", "close-ingress"):
         subparsers.add_parser(action)
     args = parser.parse_args()
     try:
@@ -1018,11 +1156,12 @@ def main():
             result = controller.switch_frontend(args.slot, _json(args.receipt))
         elif action == "switch-api":
             result = controller.switch_api(args.slot, _json(args.baseline_receipt),
-                                           _json(args.baseline_receipt + ".clock.json"))
+                                           _json(args.baseline_receipt + ".clock.json"),
+                                           expected_edge_config_revision=args.expected_edge_config_revision)
         elif hasattr(args, "slot"):
             result = getattr(controller, action.replace("-", "_"))(args.slot)
         else:
-            result = getattr(controller, action)()
+            result = getattr(controller, action.replace("-", "_"))()
         print(json.dumps(result, indent=None if action == "execute-handoff" else 2, sort_keys=True))
     except (Stop, OSError, ValueError) as exc:
         # Never expose exception bodies from Docker, the admin socket or input files.

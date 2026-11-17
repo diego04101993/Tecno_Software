@@ -1,4 +1,4 @@
-"""Recover the committed routing generation without admitting public requests."""
+"""Recover the committed Edge configuration while ingress is closed."""
 
 import copy
 import re
@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from time import monotonic, sleep
 
-from release_state import ROLES, Stop, decode, require, validate_hash, validate_release
+from release_state import ROLES, Stop, decode, digest, edge_config_revision, require, validate_hash, validate_release
 from routectl import ADMIN_ADDRESS, BLUE_PAIR, RouteConfig
 
 
@@ -143,10 +143,17 @@ class ColdStart:
         if pending is None:
             if saved is None or saved.hash == committed.hash:
                 return "COMMITTED"
-            ancestors = {item["intent"]["previous_hash"] for item in state["history"]}
-            require(saved.generation < committed.generation and saved.hash in ancestors
-                    and self.store.load_config(saved.hash) == saved.config, "STOP_AMBIGUOUS")
+            route_ancestors = {row["intent"]["previous_hash"] for row in state["history"] if "intent" in row}
+            config_ancestors = {row["event"]["previous_hash"] for row in state["history"]
+                                if "event" in row and row["result"] == "COMMITTED"}
+            older_route = saved.generation < committed.generation and saved.hash in (route_ancestors | config_ancestors)
+            older_config = (saved.generation == committed.generation and saved.active == committed.active
+                            and saved.hash in config_ancestors)
+            require((older_route or older_config) and self.store.load_config(saved.hash) == saved.config,
+                    "STOP_AMBIGUOUS")
             return "RESTORED_COMMITTED"
+        if "event" in pending:
+            return self._reconcile_edge_config_journal(state, saved)
         intent = pending["intent"]
         if pending["stage"] in ("PREPARED", "REJECTED"):
             require(saved is None or saved.hash == committed.hash, "STOP_AMBIGUOUS")
@@ -163,6 +170,27 @@ class ColdStart:
             raise Stop("SWITCH_IDENTITY_CHECK_FAILED") from None
         self.controller._record(state, "COMMITTED")
         return "COMMIT"
+
+    def _reconcile_edge_config_journal(self, state, saved):
+        previous, candidate = self.controller._sealed_edge_config_event(state)
+        require(saved is not None, "STOP_AMBIGUOUS")
+        effective, etag = self.edge.raw_effective()
+        effective_hash = digest(effective)
+        pending = state["pending"]
+        start_boot = pending["event"]["edge_boot_id"]
+        current_boot = self.controller._edge_boot_id()
+        fresh_bootstrap = (effective_hash == digest(BOOTSTRAP) and start_boot is not None
+                           and current_boot is not None and current_boot != start_boot)
+        before_dispatch = pending["stage"] in ("PREPARED", "REJECTED")
+        if saved.hash == previous.hash and (fresh_bootstrap or before_dispatch and effective_hash == previous.hash):
+            # A proven new Caddy boot cannot apply a PATCH left in the old process.
+            self.controller._record_edge_config(state, "ROLLED_BACK")
+            return "ROLLBACK"
+        require(pending["stage"] == "DISPATCHED" and saved.hash == candidate.hash
+                and (fresh_bootstrap or effective_hash == candidate.hash), "STOP_AMBIGUOUS")
+        if fresh_bootstrap:
+            self._load(candidate.config, etag)
+        return self.controller._reconcile_edge_config(state, must_commit=True)["result"]
 
     def recover(self, expected_boot=None):
         with self.controller._locked():
@@ -195,6 +223,8 @@ class ColdStart:
             require(self.store.load() == state, "EDGE_BOOT_STATE_CHANGED")
             self.edge.open_ingress(desired.hash)
             result = {"ingress_ready": True, "generation": desired.generation, "result": outcome}
+            if "edge_config_revision" in state:
+                result["edge_config_revision"] = edge_config_revision(state)
             if reattestation is not None:
                 result["legacy_blue_reattest"] = reattestation
             return result
@@ -278,6 +308,7 @@ class ColdStart:
                 continue
             reattestation = result.get("legacy_blue_reattest")
             event = f" {reattestation}" if reattestation is not None else ""
-            print(f"INGRESS_READY=YES GENERATION={result['generation']}{event}", flush=True)
+            print(f"INGRESS_READY=YES GENERATION={result['generation']} "
+                  f"EDGE_CONFIG_REVISION={result.get('edge_config_revision', 0)}{event}", flush=True)
             return
         raise Stop("EDGE_BOOT_CHANGED" if self.edge.boot_token() != boot else "EDGE_CLOSED_RECOVERY_TIMEOUT")

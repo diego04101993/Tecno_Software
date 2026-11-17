@@ -12,7 +12,7 @@ from release_state import Stop, require
 WRITER_COMMANDS = frozenset({
     "initialize", "preview", "prepare-handoff", "execute-handoff", "recover-ingress", "close-ingress",
     "supervise-ingress", "prepare", "start", "invalidate", "retire", "ready", "switch-api", "switch-frontend",
-    "reconcile", "rollback",
+    "reconcile", "rollback", "config-update", "config-rollback",
 })
 VALUE_OPTIONS = frozenset({
     "--state-dir", "--socket", "--autosave", "--bindings", "--key", "--edge-name",

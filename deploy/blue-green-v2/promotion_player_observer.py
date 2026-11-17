@@ -14,7 +14,7 @@ from player_observer import (
 )
 from player_observer_launcher import EPOCH_FIELDS, _inspect_collector, _proc_clock
 from player_observer_monotonic import MINIMUM_WINDOW_NS, MonotonicWindow, observe_committed_slot
-from promotion_observer_context import FrozenPromotion, file_epoch
+from promotion_observer_context import FrozenPromotion, file_epoch, require_promotion_telemetry
 from release_state import SLOTS, StateStore, decode, digest, read_private, require
 from routectl import CaddyEdge, Controller
 
@@ -97,6 +97,8 @@ def _baseline(args, diagnostic, controller, clock, read, key):
     report = controller.status_report()
     require(report["STATUS"] == "PASS", "OBSERVER_ROUTING_STATUS_NOT_PASS")
     state = report["state"]
+    effective, etag = controller.edge.effective()
+    revision = require_promotion_telemetry(state, effective, args.expected_edge_config_revision)
     active = state["routing"]["active"]
     require(state["pending"] is None and state["rollback"] is None and active["api"] == active["frontend"],
             "OBSERVER_REQUIRES_STEADY_PREDECESSOR")
@@ -111,13 +113,16 @@ def _baseline(args, diagnostic, controller, clock, read, key):
     diagnostic.record_baseline_count(baseline["payload"])
     require(baseline["payload"]["baseline_refs"], "PLAYER_PROMOTION_EMPTY_BASELINE")
     after = controller.status_report()
+    after_effective, after_etag = controller.edge.effective()
     require(after["STATUS"] == "PASS" and after["state"] == state
+            and after_effective.hash == effective.hash and after_etag == etag
             and file_epoch(controller.store.path) == epoch and read_private(args.bindings) == bindings,
             "OBSERVER_ROUTING_CONTEXT_CHANGED")
     require(_endpoints(args, backend, clock) == before and _clock_identity(args.clock_receipt) == clock,
             "OBSERVER_ENDPOINT_IDENTITY_INVALID")
     proof = sign_receipt("PROMOTION_BASELINE_CLOCK", {**clock, "baseline_sha256": digest(baseline),
-                         "baseline_monotonic_ns": sample, "edge_id": before[0][0], "postgres_id": args.postgres_id}, key)
+                         "baseline_monotonic_ns": sample, "edge_id": before[0][0], "postgres_id": args.postgres_id,
+                         "edge_config_revision": revision, "edge_config_hash": effective.hash}, key)
     diagnostic.advance("write_baseline_receipt")
     save_receipt(args.receipt + ".clock.json", proof)
     save_receipt(args.receipt, baseline)
@@ -132,12 +137,13 @@ def _attest_baseline(args, frozen, key, clock, window):
     gate = PlayerGate(key, require_monotonic=True)
     context = frozen.context
     transition = frozen.state["routing"]["api_transition"]
-    previous = frozen.state["history"][-1]["intent"]["previous_generation"]
+    intent = frozen.state["history"][-1]["intent"]
     data = verified_payload("BASELINE", baseline, key,
                             {"slot": context["slot"], "prior_slot": context["prior_slot"],
-                             "previous_generation": previous, "identity_hash": context["identity_hash"],
+                             "previous_generation": intent["previous_generation"], "identity_hash": context["identity_hash"],
                              "release": context["release"]}, {"baseline_at", "baseline_refs"})
-    proof = gate.baseline_clock(baseline, sidecar)
+    proof = gate.baseline_clock(baseline, sidecar, expected_edge_config_revision=context["edge_config_revision"],
+                                expected_edge_config_hash=intent["previous_hash"])
     require(gate.baseline_hash(data) == transition["baseline_hash"], "BASELINE_DOES_NOT_MATCH_SWITCH")
     require(all(proof[name] == value for name, value in clock.items())
             and proof["edge_id"] == args.edge_id and proof["postgres_id"] == args.postgres_id
@@ -168,7 +174,8 @@ def _read_window(args, diagnostic, frozen, window, namespace, read, refs, key, a
 
 def _observe(args, diagnostic, controller, clock, read, key):
     diagnostic.advance("verify_committed_routing")
-    frozen = FrozenPromotion.capture(controller, args.bindings, args.committed_state_sha256)
+    frozen = FrozenPromotion.capture(controller, args.bindings, args.committed_state_sha256,
+                                     expected_edge_config_revision=args.expected_edge_config_revision)
     window = MonotonicWindow(args.opened_monotonic_ns, args.started_monotonic_ns, args.finished_monotonic_ns)
     window.validate()
     require(window.start_ns <= monotonic_ns(), "OBSERVER_WINDOW_START_IN_FUTURE")
@@ -181,6 +188,7 @@ def _observe(args, diagnostic, controller, clock, read, key):
     endpoints = _endpoints(args, backend, clock)
     refs = set(baseline["baseline_refs"])
     proof = {"OBSERVER_MODE": "PROMOTION_MONOTONIC", "EXPECTED_GENERATION": frozen.context["generation"],
+             "EXPECTED_EDGE_CONFIG_REVISION": frozen.context["edge_config_revision"],
              "EXPECTED_SLOT": frozen.context["slot"], "EXPECTED_UPSTREAM": frozen.context["upstream"],
              "EXPECTED_BACKEND_CONTAINER": backend, "ROUTING_CONTEXT_SHA256": digest(frozen.context),
              "WINDOW_OPENED_MONOTONIC": window.opened_ns, "WINDOW_START_MONOTONIC": window.start_ns,

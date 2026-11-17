@@ -3,7 +3,18 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from release_state import SLOTS, Stop, decode, digest, read_private, require
+from edge_telemetry import telemetry_enabled
+from release_state import SLOTS, Stop, decode, digest, edge_config_revision, read_private, require
+
+
+def require_promotion_telemetry(state, effective, expected_revision):
+    """Require the explicitly approved telemetry revision and its exact effective seal."""
+    revision = edge_config_revision(state)
+    require(type(expected_revision) is int and type(revision) is int and 0 < revision == expected_revision,
+            "OBSERVER_EDGE_CONFIG_REVISION_MISMATCH")
+    require(state["routing"]["config_hash"] == effective.hash and telemetry_enabled(effective.config, effective.hosts),
+            "OBSERVER_TELEMETRY_CONFIG_NOT_EFFECTIVE")
+    return revision
 
 
 def committed_routing_context(state, effective):
@@ -34,10 +45,14 @@ def committed_routing_context(state, effective):
             and identity["upstream"] == upstream and upstream != prior_upstream
             and state["slots"][prior]["ready"]["api"]["identity"]["upstream"] == prior_upstream,
             "OBSERVER_COMMITTED_READY_BINDING_MISMATCH")
-    return {"generation": generation, "slot": slot, "upstream": upstream, "prior_slot": prior,
-            "prior_upstream": prior_upstream, "backend_container": identity["container_id"],
-            "release": entry["release"], "identity_hash": ready["identity_hash"],
-            "config_hash": route["config_hash"], "state_sha256": digest(state)}
+    context = {"generation": generation, "slot": slot, "upstream": upstream, "prior_slot": prior,
+               "prior_upstream": prior_upstream, "backend_container": identity["container_id"],
+               "release": entry["release"], "identity_hash": ready["identity_hash"],
+               "config_hash": route["config_hash"], "state_sha256": digest(state)}
+    if "edge_config_revision" in state:
+        revision = edge_config_revision(state)
+        context["edge_config_revision"] = require_promotion_telemetry(state, effective, revision)
+    return context
 
 
 def file_epoch(path):
@@ -57,7 +72,7 @@ class FrozenPromotion:
     etag: str
 
     @classmethod
-    def capture(cls, controller, bindings_path, expected_state_hash):
+    def capture(cls, controller, bindings_path, expected_state_hash, *, expected_edge_config_revision=None):
         state_epoch = file_epoch(controller.store.path)
         bindings_bytes = read_private(bindings_path)
         require(decode(bindings_bytes) == controller.probe.bindings, "OBSERVER_COMMITTED_READY_BINDING_MISMATCH")
@@ -68,6 +83,9 @@ class FrozenPromotion:
                 "OBSERVER_ROUTING_CONTEXT_CHANGED")
         effective, etag = controller.edge.effective()
         context = committed_routing_context(state, effective)
+        require((expected_edge_config_revision is None or type(expected_edge_config_revision) is int)
+                and context.get("edge_config_revision") == expected_edge_config_revision,
+                "OBSERVER_EDGE_CONFIG_REVISION_MISMATCH")
         edge_identity = controller.edge.status_identity()
         require(edge_identity[1] is not None and controller.edge.persisted(synchronize=False).hash == context["config_hash"],
                 "OBSERVER_ROUTING_STATUS_NOT_PASS")
@@ -78,7 +96,9 @@ class FrozenPromotion:
     def check_state(self):
         try:
             before = file_epoch(self.controller.store.path)
-            valid = (before == self.state_epoch and self.controller.store.load() == self.state
+            current = self.controller.store.load()
+            valid = (before == self.state_epoch and current == self.state
+                     and current.get("edge_config_revision") == self.context.get("edge_config_revision")
                      and read_private(self.bindings_path) == self.bindings_bytes
                      and file_epoch(self.controller.store.path) == before)
         except (OSError, Stop, ValueError):

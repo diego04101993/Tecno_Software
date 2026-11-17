@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from gates import PlayerGate, sign_receipt, utc
 from player_observer_monotonic import MonotonicWindow
-from promotion_observer_context import FrozenPromotion, committed_routing_context
+from promotion_observer_context import FrozenPromotion, committed_routing_context, require_promotion_telemetry
 import promotion_player_observer as observer
 from release_state import StateStore, Stop, canonical, digest, now, write_private_atomic
 from routectl import Controller
@@ -173,6 +173,70 @@ class PromotionContextTests(unittest.TestCase):
         self.assertEqual(next_state["routing"]["generation"], 3)
         self.assertFalse(self.gate(old_receipt, next_state["routing"]["api_transition"],
                                    routing_context=self.freeze(next_state).context))
+
+    def test_baseline_clock_pins_previous_seal_and_revision(self):
+        baseline, legacy = self.baseline()
+        old_hash = self.edge.effective()[0].hash
+        payload = {**legacy["payload"], "edge_config_revision": 1, "edge_config_hash": old_hash}
+        revised = sign_receipt("PROMOTION_BASELINE_CLOCK", payload, KEY)
+        kwargs = {"expected_edge_config_revision": 1, "expected_edge_config_hash": old_hash}
+        self.assertEqual(self.gate.baseline_clock(baseline, legacy), legacy["payload"])
+        self.assertEqual(self.gate.baseline_clock(baseline, revised, **kwargs), payload)
+        with self.assertRaisesRegex(Stop, "RECEIPT_CONTEXT_MISMATCH"):
+            self.gate.baseline_clock(baseline, legacy, **kwargs)
+        for changes in ({"edge_config_revision": True}, {"edge_config_revision": 2}, {"edge_config_hash": "f" * 64}):
+            receipt = sign_receipt("PROMOTION_BASELINE_CLOCK", {**payload, **changes}, KEY)
+            with self.subTest(changes=changes), self.assertRaises(Stop):
+                self.gate.baseline_clock(baseline, receipt, **kwargs)
+
+    def test_telemetry_preflight_requires_exact_positive_revision_and_effective_seal(self):
+        state = self.store.load()
+        effective = self.edge.effective()[0]
+        revised = {**state, "edge_config_revision": 1}
+        for candidate, expected in ((state, 1), (revised, 0), (revised, True), (revised, 2)):
+            with self.subTest(candidate_has_revision="edge_config_revision" in candidate, expected=expected):
+                with self.assertRaisesRegex(Stop, "OBSERVER_EDGE_CONFIG_REVISION_MISMATCH"):
+                    require_promotion_telemetry(candidate, effective, expected)
+        with patch("promotion_observer_context.telemetry_enabled", return_value=False):
+            with self.assertRaisesRegex(Stop, "OBSERVER_TELEMETRY_CONFIG_NOT_EFFECTIVE"):
+                require_promotion_telemetry(revised, effective, 1)
+        with patch("promotion_observer_context.telemetry_enabled", return_value=True):
+            self.assertEqual(require_promotion_telemetry(revised, effective, 1), 1)
+            bad_hash = {**revised, "routing": {**revised["routing"], "config_hash": "9" * 64}}
+            with self.assertRaisesRegex(Stop, "OBSERVER_TELEMETRY_CONFIG_NOT_EFFECTIVE"):
+                require_promotion_telemetry(bad_hash, effective, 1)
+
+    def test_revised_context_requires_approval_and_freezes_revision_during_window(self):
+        _, state = self.split()
+        revised = {**state, "edge_config_revision": 1}
+        report = {"STATUS": "PASS", "STATE_SHA256": digest(revised), "state": revised}
+        with (patch.object(self.controller, "status_report", return_value=report),
+              patch.object(self.store, "load", return_value=revised) as load,
+              patch("promotion_observer_context.telemetry_enabled", return_value=True)):
+            for expected in (None, True, 2):
+                with self.subTest(expected=expected), self.assertRaisesRegex(Stop, "OBSERVER_EDGE_CONFIG_REVISION_MISMATCH"):
+                    FrozenPromotion.capture(self.controller, self.bindings, digest(revised), expected_edge_config_revision=expected)
+            frozen = FrozenPromotion.capture(self.controller, self.bindings, digest(revised), expected_edge_config_revision=1)
+            self.assertEqual(frozen.context["edge_config_revision"], 1)
+            frozen.recheck()
+            with self.assertRaisesRegex(Stop, "OBSERVER_ROUTING_CONTEXT_CHANGED"):
+                load.return_value = {**revised, "edge_config_revision": 2}
+                frozen.check_state()
+
+    def test_revised_frontend_receipt_rejects_missing_or_unmatched_revision(self):
+        baseline, state = self.split()
+        revised = {**state, "edge_config_revision": 1}
+        with patch("promotion_observer_context.telemetry_enabled", return_value=True):
+            context = committed_routing_context(revised, self.edge.effective()[0])
+        legacy = self.receipt(baseline, revised, context)
+        transition = state["routing"]["api_transition"]
+        self.assertFalse(self.gate(legacy, transition, routing_context=context))
+        for revision, accepted in ((1, True), (2, False), (True, False)):
+            data = {**legacy["payload"]}
+            data["observation"] = {**data["observation"], "EXPECTED_EDGE_CONFIG_REVISION": revision}
+            receipt = sign_receipt("PLAYER", data, KEY)
+            with self.subTest(revision=revision):
+                self.assertIs(self.gate(receipt, transition, routing_context=context), accepted)
 
     def test_window_passes_iso_timestamp_to_the_existing_docker_log_reader(self):
         args = SimpleNamespace(capture_ready_json=None, edge_id="3" * 64, receipt="test.json",

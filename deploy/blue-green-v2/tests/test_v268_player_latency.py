@@ -273,9 +273,9 @@ class PromotionLatencyReceiptTests(unittest.TestCase):
                 args = SimpleNamespace(bindings="bindings", committed_state_sha256="state", opened_monotonic_ns=1,
                                        started_monotonic_ns=2, finished_monotonic_ns=120_000_000_002,
                                        opened_at=stamp, started_at=stamp, finished_at=stamp, receipt="receipt",
-                                       clock_receipt="clock")
+                                       clock_receipt="clock", expected_edge_config_revision=1)
                 routing = SimpleNamespace(context={"generation": 3, "slot": "GREEN", "upstream": "backend-green:8000",
-                                                   "backend_container": "a" * 64},
+                                                   "backend_container": "a" * 64, "edge_config_revision": 1},
                                           check_state=Mock(), recheck=Mock())
                 diagnostic = Mock()
                 diagnostic.fail.return_value = 2
@@ -299,6 +299,7 @@ class PromotionLatencyReceiptTests(unittest.TestCase):
                       patch.object(observer, "save_receipt") as write, redirect_stdout(output)):
                     self.assertEqual(observer._observe(args, diagnostic, Mock(), clock, Mock(), b"a" * 48), expected)
                 audit.assert_called_once()
+                self.assertEqual(audit.call_args.args[1]["EXPECTED_EDGE_CONFIG_REVISION"], 1)
                 self.assertIn("PLAYER_CONTINUITY_GATE=PASS_ALL_BASELINE", output.getvalue().splitlines())
                 self.assertIn(f"PLAYER_TIMEOUT_CONTRACTS_REAL={result}", output.getvalue().splitlines())
                 if expected:

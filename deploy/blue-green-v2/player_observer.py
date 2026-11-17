@@ -484,6 +484,7 @@ def _parser():
         promotion = actions.add_parser(action)
         for option in ("socket", "autosave", "bindings", "edge-name", "clock-receipt"):
             promotion.add_argument("--" + option, required=True)
+        promotion.add_argument("--expected-edge-config-revision", type=int, required=True)
         for role in ("blue", "frontend"):
             promotion.add_argument(f"--legacy-{role}-manifest")
             promotion.add_argument(f"--legacy-{role}-sha256")
@@ -508,6 +509,7 @@ def main(argv=None):
         require(sys.platform.startswith("linux") and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in ids),
                 "OBSERVER_REQUIRES_EXACT_LOCAL_IDENTITIES")
         if args.action.startswith("promotion-"):
+            require(args.expected_edge_config_revision > 0, "OBSERVER_EDGE_CONFIG_REVISION_MISMATCH")
             from promotion_player_observer import run_promotion
 
             return run_promotion(args, diagnostic)

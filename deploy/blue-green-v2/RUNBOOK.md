@@ -1,4 +1,4 @@
-# Blue-Green V2.6.8
+# Blue-Green V2.6.9
 
 Phases 1 and 2 cover local tooling and disposable QA. [Phase 3](PHASE3_RUNBOOK.md) describes adoption of the permanent ingress and requires separate authorization. Its only successful initial state is BLUE API and BLUE frontend. Production R3, PostgreSQL, uploads, backups and OBS6.4 remain protected throughout adoption.
 
@@ -32,6 +32,16 @@ The controller holds nonblocking, exclusive locks for the local state directory 
 | Copies disagree, hash or generation is unknown, or state is corrupt or stale | `STOP_AMBIGUOUS` or an explicit state-validation failure. |
 
 `reconcile` never issues a second route mutation. After a committed but failed change, `rollback` validates the prior process and uses a fresh explicit routing transaction. A failed recovery leaves evidence and requires operator review. Caddy autosave can fail after accepting live config. A successful HTTP response is insufficient.
+
+## Telemetry configuration transactions
+
+`routectl config-update` adds the reviewed V2.6.8 access-log metadata to the committed Edge configuration. `routectl config-rollback` restores the preceding sealed telemetry revision with the currently committed routes. Both require a steady pair, the existing state and Edge writer locks, and exact effective and persisted configuration. The controller constructs the payload from the committed seal and only permits the approved telemetry delta. The previous and desired SHA-256 values refer to canonical JSON. The Caddy ETag protects the write.
+
+The ledger treats a valid state without an Edge config revision as revision 0. A config update appends `EDGE_CONFIG_UPDATE` and allocates the next unused committed revision. A config rollback appends `EDGE_CONFIG_ROLLBACK` and selects the earlier revision without reusing its event or resetting the highest committed revision. Both events preserve routing generation and slot state. The existing route records stay intact. New records link to the previous complete history record after the first config event.
+
+Before the PATCH the controller durably records `PREPARED` and then `DISPATCHED`. A definite ETag collision records `REJECTED`. Reconcile a lost response with the exact effective and autosave hashes. With both on the new seal, commit once. A dispatched intent with both still on the old seal remains ambiguous in the same Edge process. Recovery can settle it as rolled back on a verified new bootstrap boot with the exact old autosave. A divergent or ambiguous view requires STOP. Do not send a second PATCH to resolve an uncertain first write. A cold Edge keeps ingress closed until it has recovered the latest committed config revision and verified autosave.
+
+`routectl status` reports both active slots, routing generation, Edge config revision, config hash, autosave hash and any pending event type. It is read-only. For a later authorized deployment, confirm the running supervisor can read the V2.6.9 ledger before activating telemetry. Verify effective, autosave and ledger agreement while both slots still point at the approved live release. The required promotion inputs include the explicit positive revision via `--expected-edge-config-revision`. The API baseline, switch and Player observation must agree on that revision.
 
 ## Cold start and admission
 
@@ -68,7 +78,7 @@ Edge records an opaque request ID, ingress, route generation, upstream, status a
 
 The observer starts the restricted collector before the API switch so it can see connections open, then waits for collector readiness. Use the `promotion-baseline` and `promotion-observe` actions of the [Player observer launcher](PLAYER_OBSERVER.md). They use the same monotonic adjudicator as Phase 3 and the time namespace of the exact collector. A signed baseline clock proof is required for the API switch. The frontend switch requires a signed observation of the committed generation, slot, upstream and READY backend. The gate derives eligibility from request start in `[start, finish)`, with at least 120 monotonic seconds and the existing terminal deadline. The collector has neither a Docker socket, DB access nor the signing key. A trusted parent passes its bounded metadata through a private pipe. Require the collector completion record with zero packet drops. On an incomplete or rejected observation, execute the explicit API rollback with frontend still on the predecessor. Keep packet data in memory.
 
-V2.6.8 requiere que la configuración efectiva, el autosave y el sello de Edge incluyan la telemetría de latencia antes de iniciar una promoción. Instalar los archivos por sí solo conserva el JSON activo anterior. Verificar esta condición en la preparación aprobada, con BLUE/BLUE y sin cambiar los upstreams. La revisión local no activa la configuración. Para la captura de promoción usar `--player-latency` con `--phase3-monotonic`. La captura de Phase 3 sigue usando `--phase3-monotonic`.
+For promotion capture, use `--player-latency` with `--phase3-monotonic`. Phase 3 continues to use `--phase3-monotonic`.
 
 ## Disposable QA and future adoption
 

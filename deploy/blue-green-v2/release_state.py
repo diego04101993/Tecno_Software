@@ -15,6 +15,13 @@ SLOTS = ("BLUE", "GREEN")
 ROLES = ("api", "frontend")
 PHASES = ("PREPARED", "STARTING", "READY", "ACTIVE", "STANDBY", "FAILED", "RETIRED")
 HEX64 = re.compile(r"[0-9a-f]{64}")
+EDGE_ETAG = re.compile(r'"/config/ [0-9a-f]{16}"')
+EDGE_CONFIG_UPDATE = "EDGE_CONFIG_UPDATE"
+EDGE_CONFIG_ROLLBACK = "EDGE_CONFIG_ROLLBACK"
+EDGE_CONFIG_EVENTS = (EDGE_CONFIG_UPDATE, EDGE_CONFIG_ROLLBACK)
+EVENT_STAGES = ("PREPARED", "DISPATCHED", "REJECTED")
+ROUTING_RESULTS = ("COMMITTED", "ROLLED_BACK", "COMMITTED_FAILED")
+CONFIG_RESULTS = ("COMMITTED", "ROLLED_BACK")
 IDENTITY_FIELDS = ("container_id", "pid", "start_ticks", "started_at", "image_id", "revision",
                    "tree", "restart_count", "oom_killed", "upstream", "runtime_hash",
                    "mounts_hash", "network_hash")
@@ -104,11 +111,15 @@ def same_runtime_epoch(left, right):
 
 
 def verify_intent(intent):
-    require(isinstance(intent, dict) and set(intent) == {
+    required = {
         "generation", "previous_generation", "operation", "from_slot", "to_slot",
         "timestamp", "release", "expected_etag", "previous_hash", "next_hash", "intent_hash",
         "baseline_hash", "player_gate_hash",
-    }, "INVALID_INTENT")
+    }
+    require(isinstance(intent, dict) and set(intent) in (required, required | {"previous_record_hash"}),
+            "INVALID_INTENT")
+    if "previous_record_hash" in intent:
+        validate_hash(intent["previous_record_hash"])
     unsigned = {key: value for key, value in intent.items() if key != "intent_hash"}
     require(digest(unsigned) == intent["intent_hash"], "INTENT_HASH_MISMATCH")
     require(type(intent["generation"]) is int and type(intent["previous_generation"]) is int
@@ -122,8 +133,8 @@ def verify_intent(intent):
         validate_hash(intent["player_gate_hash"])
     else:
         require(intent["player_gate_hash"] is None, "UNEXPECTED_PLAYER_GATE_HASH")
-    require(isinstance(intent["expected_etag"], str)
-            and re.fullmatch(r'"/config/ [0-9a-f]{16}"', intent["expected_etag"]), "INVALID_ETAG")
+    require(isinstance(intent["expected_etag"], str) and EDGE_ETAG.fullmatch(intent["expected_etag"]),
+            "INVALID_ETAG")
     validate_routes(intent["from_slot"])
     validate_routes(intent["to_slot"])
     validate_release(intent["release"])
@@ -142,11 +153,110 @@ def verify_intent(intent):
         require(previous["api"] != target["api"] == target["frontend"], "INVALID_ROLLBACK_INTENT")
 
 
+def edge_config_revision(state):
+    return state.get("edge_config_revision", 0)
+
+
+def next_routing_generation(state):
+    """Config attempts never consume a routing generation."""
+    return 1 + sum("intent" in record for record in state["history"])
+
+
+def next_edge_config_revision(state):
+    return 1 + sum("event" in record and record["result"] == "COMMITTED"
+                   and record["event"]["type"] == EDGE_CONFIG_UPDATE for record in state["history"])
+
+
+def edge_config_rollback_target(state):
+    """Find the committed update establishing the active configuration revision."""
+    revision = edge_config_revision(state)
+    return next((record["event"] for record in reversed(state["history"])
+                 if "event" in record and record["result"] == "COMMITTED"
+                 and record["event"]["type"] == EDGE_CONFIG_UPDATE
+                 and record["event"]["new_revision"] == revision), None)
+
+
+def pending_event_type(state):
+    pending = state["pending"]
+    if pending is None:
+        return None
+    if "event" in pending:
+        return pending["event"]["type"]
+    return pending["intent"]["operation"]
+
+
+def _validate_timestamp(value):
+    try:
+        utc = datetime.fromisoformat(value).utcoffset()
+    except (ValueError, TypeError):
+        utc = None
+    require(utc is not None and utc.total_seconds() == 0, "INVALID_EDGE_CONFIG_TIMESTAMP")
+
+
+def verify_edge_config_event(event):
+    required = {
+        "type", "reason", "previous_revision", "new_revision", "routing_generation", "active",
+        "previous_hash", "next_hash", "previous_autosave_hash", "next_autosave_hash", "expected_etag",
+        "payload_sha256", "timestamp", "previous_record_hash", "edge_boot_id", "event_hash",
+    }
+    require(type(event) is dict and set(event) == required, "INVALID_EDGE_CONFIG_EVENT")
+    require(event["type"] in EDGE_CONFIG_EVENTS and event["reason"] == "TELEMETRY",
+            "INVALID_EDGE_CONFIG_EVENT_TYPE")
+    require(all(type(event[key]) is int and event[key] >= 0
+                for key in ("previous_revision", "new_revision", "routing_generation")),
+            "INVALID_EDGE_CONFIG_REVISION")
+    validate_routes(event["active"])
+    require(event["active"]["api"] == event["active"]["frontend"], "EDGE_CONFIG_ROUTING_NOT_STABLE")
+    for key in ("previous_hash", "next_hash", "previous_autosave_hash", "next_autosave_hash",
+                "payload_sha256", "event_hash"):
+        validate_hash(event[key])
+    if event["previous_record_hash"] is not None:
+        validate_hash(event["previous_record_hash"])
+    require(event["previous_hash"] == event["previous_autosave_hash"]
+            and event["next_hash"] == event["next_autosave_hash"] == event["payload_sha256"]
+            and event["previous_hash"] != event["next_hash"], "EDGE_CONFIG_EVENT_HASH_MISMATCH")
+    require(isinstance(event["expected_etag"], str) and EDGE_ETAG.fullmatch(event["expected_etag"]),
+            "INVALID_ETAG")
+    boot = event["edge_boot_id"]
+    try:
+        valid_boot = boot is None or type(boot) is str and str(UUID(boot)) == boot
+    except ValueError:
+        valid_boot = False
+    require(valid_boot, "INVALID_EDGE_CONFIG_BOOT_ID")
+    _validate_timestamp(event["timestamp"])
+    require(digest({key: value for key, value in event.items() if key != "event_hash"}) == event["event_hash"],
+            "EDGE_CONFIG_EVENT_HASH_MISMATCH")
+
+
+def _validate_config_position(event, *, generation, active, revision, updates, previous_record_hash):
+    verify_edge_config_event(event)
+    require(event["routing_generation"] == generation and event["active"] == active,
+            "EDGE_CONFIG_EVENT_ROUTING_MISMATCH")
+    require(event["previous_record_hash"] == previous_record_hash, "HISTORY_RECORD_HASH_MISMATCH")
+    require(event["previous_revision"] == revision, "EDGE_CONFIG_EVENT_REVISION_MISMATCH")
+    if event["type"] == EDGE_CONFIG_UPDATE:
+        require(event["new_revision"] == len(updates) + 1, "EDGE_CONFIG_EVENT_REVISION_MISMATCH")
+    else:
+        origin = updates.get(revision)
+        require(origin is not None and event["new_revision"] == origin["previous_revision"],
+                "EDGE_CONFIG_ROLLBACK_TARGET_MISMATCH")
+        if event["routing_generation"] == origin["routing_generation"]:
+            require(event["previous_hash"] == origin["next_hash"] and event["next_hash"] == origin["previous_hash"],
+                    "EDGE_CONFIG_ROLLBACK_HASH_MISMATCH")
+
+
+def _validate_route_record_link(intent, has_config_history, previous_record_hash):
+    require(("previous_record_hash" in intent) == has_config_history
+            and (not has_config_history or intent["previous_record_hash"] == previous_record_hash),
+            "HISTORY_RECORD_HASH_MISMATCH")
+
+
 def validate_state(state):
     required = {
         "version", "slots", "routing", "rollback", "pending", "history",
     }
-    require(isinstance(state, dict) and set(state) in (required, required | {"legacy_blue"})
+    optional = {"legacy_blue", "edge_config_revision"}
+    require(isinstance(state, dict) and required <= set(state) <= required | optional
             and type(state["version"]) is int and state["version"] == 1, "INVALID_STATE")
     routing = state["routing"]
     require(isinstance(routing, dict) and set(routing) == {
@@ -228,45 +338,76 @@ def validate_state(state):
     else:
         require(rollback is None, "MISSING_API_TRANSITION")
 
+    _validate_history(state)
+
+
+def _validate_history(state):
+    routing = state["routing"]
     history = state["history"]
     require(isinstance(history, list), "INVALID_HISTORY")
     last_attempt = 0
     last_committed = 0
     last_hash = None
     last_routes = {"api": "BLUE", "frontend": "BLUE"}
+    previous_record_hash = None
+    has_config_history = False
+    revision = 0
+    updates = {}
     for record in history:
-        require(isinstance(record, dict) and set(record) == {"intent", "result", "recorded_at"}
-                and record["result"] in ("COMMITTED", "ROLLED_BACK", "COMMITTED_FAILED"),
+        require(isinstance(record, dict) and set(record) in ({"intent", "result", "recorded_at"},
+                                                             {"event", "result", "recorded_at"}),
                 "INVALID_HISTORY_ENTRY")
-        intent = record["intent"]
-        verify_intent(intent)
-        require(intent["generation"] == last_attempt + 1
-                and intent["previous_generation"] == last_committed
-                and intent["from_slot"] == last_routes, "HISTORY_GENERATION_MISMATCH")
+        if "event" in record:
+            require(record["result"] in CONFIG_RESULTS, "INVALID_HISTORY_ENTRY")
+            event = record["event"]
+            _validate_config_position(event, generation=last_committed, active=last_routes,
+                                      revision=revision, updates=updates, previous_record_hash=previous_record_hash)
+            _validate_timestamp(record["recorded_at"])
+            has_config_history = True
+        else:
+            require(record["result"] in ROUTING_RESULTS, "INVALID_HISTORY_ENTRY")
+            event = record["intent"]
+            verify_intent(event)
+            _validate_route_record_link(event, has_config_history, previous_record_hash)
+            require(event["generation"] == last_attempt + 1 and event["previous_generation"] == last_committed
+                    and event["from_slot"] == last_routes, "HISTORY_GENERATION_MISMATCH")
+            last_attempt = event["generation"]
         if last_hash is None:
-            last_hash = intent["previous_hash"]
-        require(intent["previous_hash"] == last_hash, "HISTORY_HASH_MISMATCH")
-        last_attempt = intent["generation"]
-        if record["result"] in ("COMMITTED", "COMMITTED_FAILED"):
-            last_committed = last_attempt
-            last_hash = intent["next_hash"]
-            last_routes = intent["to_slot"]
+            last_hash = event["previous_hash"]
+        require(event["previous_hash"] == last_hash, "HISTORY_HASH_MISMATCH")
+        if record["result"] != "ROLLED_BACK":
+            last_hash = event["next_hash"]
+            if "event" in record:
+                revision = event["new_revision"]
+                if event["type"] == EDGE_CONFIG_UPDATE:
+                    updates[revision] = event
+            else:
+                last_committed = event["generation"]
+                last_routes = event["to_slot"]
+        previous_record_hash = digest(record)
     require(last_committed == routing["generation"] and last_routes == routing["active"]
-            and (last_hash is None or last_hash == routing["config_hash"]),
-            "COMMITTED_HISTORY_MISMATCH")
+            and (last_hash is None or last_hash == routing["config_hash"]), "COMMITTED_HISTORY_MISMATCH")
+    require(("edge_config_revision" in state) == has_config_history and type(edge_config_revision(state)) is int
+            and edge_config_revision(state) == revision, "COMMITTED_EDGE_CONFIG_REVISION_MISMATCH")
 
     pending = state["pending"]
-    if pending is not None:
-        require(isinstance(pending, dict) and set(pending) == {"stage", "intent"}
-                and pending["stage"] in ("PREPARED", "DISPATCHED", "REJECTED"),
-                "INVALID_PENDING")
+    if pending is None:
+        return
+    require(isinstance(pending, dict) and set(pending) in ({"stage", "intent"}, {"stage", "event"})
+            and pending["stage"] in EVENT_STAGES, "INVALID_PENDING")
+    if "event" in pending:
+        event = pending["event"]
+        _validate_config_position(event, generation=last_committed, active=last_routes,
+                                  revision=revision, updates=updates, previous_record_hash=previous_record_hash)
+        require(event["previous_hash"] == routing["config_hash"], "PENDING_CONFIG_HASH_MISMATCH")
+    else:
         intent = pending["intent"]
         verify_intent(intent)
+        _validate_route_record_link(intent, has_config_history, previous_record_hash)
         require(intent["generation"] == last_attempt + 1
                 and intent["previous_generation"] == routing["generation"]
                 and intent["previous_hash"] == routing["config_hash"]
                 and intent["from_slot"] == routing["active"], "PENDING_GENERATION_MISMATCH")
-
 
 def require_private(path, directory=False):
     info = path.lstat()

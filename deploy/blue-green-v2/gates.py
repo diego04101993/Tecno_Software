@@ -892,14 +892,21 @@ class PlayerGate:
         except (GateError, TypeError, ValueError, KeyError):
             return None
 
-    def baseline_clock(self, baseline, clock_receipt):
-        clock = verified_payload("PROMOTION_BASELINE_CLOCK", clock_receipt, self.key,
-                                 {"baseline_sha256": digest(baseline)},
+    def baseline_clock(self, baseline, clock_receipt, *, expected_edge_config_revision=0, expected_edge_config_hash=None):
+        require(number(expected_edge_config_revision), "PLAYER_PROMOTION_BASELINE_CONFIG_INVALID")
+        context = {"baseline_sha256": digest(baseline)}
+        revised = expected_edge_config_revision != 0 or expected_edge_config_hash is not None
+        if revised:
+            require(number(expected_edge_config_revision, 1) and hex_digest(expected_edge_config_hash),
+                    "PLAYER_PROMOTION_BASELINE_CONFIG_INVALID")
+            context.update(edge_config_revision=expected_edge_config_revision, edge_config_hash=expected_edge_config_hash)
+        clock = verified_payload("PROMOTION_BASELINE_CLOCK", clock_receipt, self.key, context,
                                  {"baseline_monotonic_ns", "time_namespace", "collector_id", "collector_pid",
                                   "collector_started_at", "edge_id", "postgres_id"})
         require(number(clock["baseline_monotonic_ns"], 1) and number(clock["collector_pid"], 1)
                 and type(clock["time_namespace"]) is str and re.fullmatch(r"time:\[[1-9][0-9]*\]", clock["time_namespace"])
                 and all(hex_digest(clock[key]) for key in ("collector_id", "edge_id", "postgres_id"))
+                and (not revised or number(clock["edge_config_revision"], 1))
                 and baseline["payload"]["baseline_refs"], "PLAYER_PROMOTION_BASELINE_CLOCK_INVALID")
         utc(clock["collector_started_at"])
         return clock
@@ -910,6 +917,12 @@ class PlayerGate:
                     "EXPECTED_SLOT": routing["slot"], "EXPECTED_UPSTREAM": routing["upstream"],
                     "EXPECTED_BACKEND_CONTAINER": routing["backend_container"],
                     "ROUTING_CONTEXT_SHA256": digest(routing), "TIME_NAMESPACE_MATCH": "YES"}
+        if "edge_config_revision" in routing:
+            revision = routing["edge_config_revision"]
+            require(number(revision, 1) and isinstance(observation, dict)
+                    and number(observation.get("EXPECTED_EDGE_CONFIG_REVISION"), 1),
+                    "PLAYER_PROMOTION_OBSERVATION_CONTEXT_INVALID")
+            expected["EXPECTED_EDGE_CONFIG_REVISION"] = revision
         window_keys = ("WINDOW_OPENED_MONOTONIC", "WINDOW_START_MONOTONIC", "WINDOW_FINISH_MONOTONIC",
                        "TERMINAL_DEADLINE_MONOTONIC")
         require(type(observation) is dict and set(observation) == set(expected) | set(window_keys) |

@@ -1,6 +1,7 @@
 """Exercise monotonic promotion and passive Player latency on disposable Linux Docker."""
 
 import argparse
+from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from hashlib import sha256
@@ -21,12 +22,15 @@ from qa_player_observer import Capture, heartbeat, playback, read_capture_ready
 from qa_topology import Topology
 
 from docker_logs import verify_caddy_proxy_log
-from edge_boot import ColdStart
+from edge_boot import BOOTSTRAP, ColdStart
+from edge_config import bootstrap_config
+from edge_telemetry import telemetry_enabled
 from gates import PlayerGate
 from player_capture import PHASE3_CAPTURE_SECONDS
+from player_observer import capture_baseline
 from player_observer_launcher import promotion_switch_marker
 from promotion_observer_context import committed_routing_context
-from release_state import StateStore, Stop, canonical, decode, digest, read_private, write_private_atomic
+from release_state import StateStore, Stop, canonical, decode, digest, edge_config_revision, read_private, write_private_atomic
 from routectl import CaddyEdge, Controller
 
 
@@ -34,6 +38,9 @@ ROLES = ("api", "frontend")
 BLUE_PAIR = {"api": "BLUE", "frontend": "BLUE"}
 SPLIT_PAIR = {"api": "GREEN", "frontend": "BLUE"}
 GREEN_PAIR = {"api": "GREEN", "frontend": "GREEN"}
+LEGACY_TOOLING = "e2d265fe4b8a58d31c93a6beea9d5c32a11c6b4a"
+LEGACY_CADDYFILE_SHA256 = "47cb7aee49eef6d5e7bde05572ce1126f50ab832e23b0d686d624c96e26f3bd8"
+
 SAAS_GREEN = {
     "revision": "a1f986af239c26c22ff3bd9ff9a7a43c05d5ede9",
     "tree": "dc07aa473636b2a1d7cb5cdffe9a664243ef4e42",
@@ -135,11 +142,14 @@ class PromotionFixture:
         extend_disposable_players(self.db)
         for slot in RELEASES:
             self.topology.add_slot(slot, self.db)
-        self.http = self.topology.start_edge()
+        encoded = os.environ.get("BGV269_QA_LEGACY_CADDYFILE")
+        source = (b64decode(encoded, validate=True) if encoded else
+                  subprocess.check_output(["git", "show", LEGACY_TOOLING + ":deploy/blue-green-v2/Caddyfile.edge"],
+                                          cwd=DEPLOY_DIRECTORY.parents[1]))
+        assert sha256(source).hexdigest() == LEGACY_CADDYFILE_SHA256
+        self.http = self.topology.start_edge(caddyfile=source)
         self.topology.check_isolation()
-        edge = self.docker.inspect("container", self.topology.edge)
-        origin = Path("/proc") / str(edge["State"]["Pid"]) / "root"
-        self.wire = CaddyEdge(origin / "run/bgv2/admin.sock", origin / "config/caddy/autosave.json")
+        self.wire = self.edge_wire()
         self.key = os.urandom(48)
         self.probe = self.topology.probe()
         self.ready = {slot: {role: digest(self.probe(role, slot)) for role in ROLES} for slot in RELEASES}
@@ -156,6 +166,11 @@ class PromotionFixture:
         self.key_path = Path(self.secret_store.name) / "receipt.key"
         write_private_atomic(self.key_path, self.key, replace=False)
         self.epochs = self.identities()
+
+    def edge_wire(self):
+        edge = self.docker.inspect("container", self.topology.edge)
+        origin = Path("/proc") / str(edge["State"]["Pid"]) / "root"
+        return CaddyEdge(origin / "run/bgv2/admin.sock", origin / "config/caddy/autosave.json")
 
     def identities(self):
         return {pair: self.docker.identity(container) for pair, container in self.topology.containers.items()}
@@ -187,7 +202,8 @@ class PromotionFixture:
         return ["--state-dir", str(self.store.directory), "--postgres-id", self.db.pg, "--key", str(self.key_path),
                 "--receipt", str(receipt), action, "--socket", str(self.wire.socket_path),
                 "--autosave", str(self.wire.autosave_path), "--bindings", str(self.bindings),
-                "--edge-name", f"{self.docker.name}-edge", *args]
+                "--edge-name", f"{self.docker.name}-edge",
+                "--expected-edge-config-revision", str(self.config_revision), *args]
 
     def ready_green(self):
         self.controller.prepare("GREEN", RELEASES["GREEN"])
@@ -208,13 +224,88 @@ class PromotionFixture:
         return baseline, switched, stamp
 
     def advance(self, generation):
-        for index in range((generation - 1) // 2):
-            self.ready_green()
-            _, switched, _ = self.api_switch(f"warmup-{index}")
-            assert switched["routing"]["generation"] == index * 2 + 1
-            reverted = self.controller.rollback()
-            assert reverted["routing"]["active"] == BLUE_PAIR and reverted["routing"]["generation"] == index * 2 + 2
+        # Exercise the historical, pre-revision signed baseline contract
+        # while constructing the archived generation shape on disposable QA.
+        self.controller.player_gate = PlayerGate(self.key)
+        try:
+            for index in range((generation - 1) // 2):
+                self.ready_green()
+                baseline = capture_baseline(self.db.readonly, self.controller.status(), self.key)
+                assert len(baseline["payload"]["baseline_refs"]) == 17
+                switched = self.controller.switch_api("GREEN", baseline)
+                assert switched["routing"]["generation"] == index * 2 + 1
+                reverted = self.controller.rollback()
+                assert reverted["routing"]["active"] == BLUE_PAIR
+                assert reverted["routing"]["generation"] == index * 2 + 2
+        finally:
+            self.controller.player_gate = self.gate
         assert self.controller.status()["routing"]["generation"] == generation - 1
+
+    def apply_config(self):
+        before = self.controller.status()
+        old, _ = self.wire.effective()
+        assert old.active == BLUE_PAIR and "edge_config_revision" not in before
+        wire_source = self.docker.read(self.topology.edge, "caddy", "adapt", "--config", "/opt/bgv2/Caddyfile.edge",
+                                       "--adapter", "caddyfile").encode()
+        expected = bootstrap_config(wire_source).changed(BLUE_PAIR, old.generation)
+        updated = self.controller.config_update()
+        effective, _ = self.wire.effective()
+        self.config_revision = edge_config_revision(updated)
+        assert self.config_revision == 1 and effective.config == expected.config
+        assert self.wire.persisted(synchronize=False).config == expected.config
+        assert updated["routing"] == {**before["routing"], "config_hash": expected.hash}
+        assert updated["slots"] == before["slots"] and updated["history"][:-1] == before["history"]
+        assert telemetry_enabled(effective.config)
+        self.public_route("api", "BLUE", old.generation)
+        self.public_route("frontend", "BLUE", old.generation)
+        return before, updated, old.config
+
+    def config_rollback_control(self):
+        self.refresh_players()
+        self.advance(3)
+        before, updated, old = self.apply_config()
+        original = self.controller.config_rollback()
+        assert self.wire.effective()[0].config == self.wire.persisted(synchronize=False).config == old
+        assert original["routing"] == before["routing"] and edge_config_revision(original) == 0
+        assert original["history"][:-1] == updated["history"] and original["slots"] == before["slots"]
+        self.public_route("api", "BLUE", 2)
+        self.public_route("frontend", "BLUE", 2)
+        assert self.identities() == self.epochs
+        return {"result": "PASS", "rollback_revision": 0, "generation": 2, "api": "BLUE", "frontend": "BLUE"}
+
+    def reboot_and_status_control(self, committed):
+        prior_boot = self.wire.boot_token()
+        self.docker.run("restart", self.topology.edge)
+        self.topology.wait_bootstrap()
+        self.wire = self.edge_wire()
+        self.controller.edge = self.wire
+        assert self.wire.boot_token() != prior_boot
+        assert self.wire.raw_effective()[0] == BOOTSTRAP and not self.wire.ingress_open()
+        command = [sys.executable, "-B", str(DEPLOY_DIRECTORY / "routectl.py"),
+                   "--state-dir", str(self.store.directory), "--socket", str(self.wire.socket_path),
+                   "--autosave", str(self.wire.autosave_path), "--bindings", str(self.bindings),
+                   "--key", str(self.key_path), "--edge-name", f"{self.docker.name}-edge", "supervise-ingress"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as supervisor:
+            try:
+                assert wait_until(self.wire.ingress_open, timeout=25)
+                assert self.wire.effective()[0].hash == self.wire.persisted(synchronize=False).hash
+                assert telemetry_enabled(self.wire.effective()[0].config)
+                assert self.controller.status() == committed
+                fixed_paths = (self.store.path, self.wire.autosave_path, self.wire.ingress_marker)
+                frozen = [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in fixed_paths]
+                for _ in range(100):
+                    assert supervisor.poll() is None
+                    report = self.controller.status_report()
+                    assert report["STATUS"] == "PASS" and report["state"] == committed
+                    assert report["ROUTING_GENERATION"] == 2 and report["EDGE_CONFIG_REVISION"] == 1
+                    assert report["EDGE_CONFIG_HASH"] == report["AUTOSAVE_HASH"] == committed["routing"]["config_hash"]
+                assert [(path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                        for path in fixed_paths] == frozen
+            finally:
+                supervisor.terminate()
+                supervisor.communicate(timeout=10)
+        assert self.identities() == self.epochs
+        return {"reboot": "PASS", "status_reads": 100, "status_side_effects": "NONE"}
 
     def public_route(self, role, slot, generation):
         host, path = (API_HOST, "/api/player/time") if role == "api" else (APP_HOST, "/")
@@ -307,16 +398,19 @@ class PromotionFixture:
 
     def run(self, generation, *, missing=False):
         label = "missing-one" if missing else "green"
+        self.refresh_players()
+        self.advance(generation)
+        _, updated, _ = self.apply_config()
+        reboot = self.reboot_and_status_control(updated) if generation == 3 and not missing else None
         self.capture = MonotonicCapture(self.topology)
         self.preflight = self.evidence / "collector-preflight.json"
         command_result(self.launcher(self.preflight, "probe"))
-        self.refresh_players()
-        self.advance(generation)
         self.refresh_players()
         self.ready_green()
         self.capture.start()
         baseline, switched, stamp = self.api_switch(label)
         assert switched["routing"]["generation"] == generation
+        assert edge_config_revision(switched) == self.config_revision
         proof, elapsed, latency = self.playback_window(label, baseline, switched, stamp, missing=missing)
         transition = switched["routing"]["api_transition"]
         credited = {row["device_ref"] for row in proof["payload"]["heartbeats"]}
@@ -327,6 +421,7 @@ class PromotionFixture:
         routing = committed_routing_context(switched, self.wire.effective()[0])
         assert self.gate(proof, transition, routing_context=routing) is not missing
         observation = proof["payload"]["observation"]
+        assert observation["EXPECTED_EDGE_CONFIG_REVISION"] == self.config_revision
         start, finish = observation["WINDOW_START_MONOTONIC"], observation["WINDOW_FINISH_MONOTONIC"]
         assert finish - start >= 120_000_000_000
         replay_control = None
@@ -345,6 +440,7 @@ class PromotionFixture:
         else:
             committed = self.controller.switch_frontend("GREEN", proof)
             assert committed["routing"]["generation"] == generation + 1 and committed["routing"]["active"] == GREEN_PAIR
+            assert edge_config_revision(committed) == self.config_revision
             self.public_route("frontend", "GREEN", generation + 1)
             if generation == 7:
                 replay_control = self.reject_replayed_receipt(proof, generation)
@@ -360,6 +456,7 @@ class PromotionFixture:
                   "observer_generated_requests": 0, "valid_old_receipt_after_rollback": replay_control,
                   "PLAYER_CONTINUITY_GATE": "FAIL_MISSING_BASELINE" if missing else "PASS_ALL_BASELINE",
                   "edge_log_evidence": "SANITIZED_SEPARATE_STREAMS_MERGED_TIMELINE",
+                  "edge_config_revision": self.config_revision, "edge_config_reboot_and_status": reboot,
                   **{k: v for k, v in latency.items() if k.startswith(("REAL_", "PLAYER_"))}}
         save(self.evidence / "summary.json", result)
         print(json.dumps(result, sort_keys=True), flush=True)
@@ -371,6 +468,7 @@ def main():
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--generations", nargs="+", type=int, choices=(1, 3, 7), default=(1, 3, 7))
     parser.add_argument("--skip-negative", action="store_true")
+    parser.add_argument("--config-rollback-only", action="store_true")
     args = parser.parse_args()
     if not __debug__ or get_clock_info("monotonic").implementation != "clock_gettime(CLOCK_MONOTONIC)":
         raise RuntimeError("Disposable replay requires Linux CLOCK_MONOTONIC and enabled assertions")
@@ -379,6 +477,15 @@ def main():
     root.mkdir(mode=0o700)
     RELEASES["GREEN"] = SAAS_GREEN
     LocalDocker().verify_inputs()
+    if args.config_rollback_only:
+        fixture = PromotionFixture(root / "config-rollback")
+        try:
+            fixture.setup()
+            result = fixture.config_rollback_control()
+        finally:
+            fixture.close()
+        print(json.dumps({**result, "cleanup": "PASS"}, sort_keys=True), flush=True)
+        return
     cases = [(generation, False) for generation in args.generations]
     if not args.skip_negative:
         cases.append((1, True))

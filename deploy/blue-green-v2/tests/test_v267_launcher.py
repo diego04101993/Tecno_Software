@@ -140,7 +140,8 @@ class PromotionLauncherCLITests(unittest.TestCase):
                 "--clock-receipt", "/unused/clock.json", "--preflight-receipt", "/unused/probe.json"]
     shared = ["--state-dir", "/unused/state", "--postgres-id", ID, "--key", "/unused/key", "--receipt", "/unused/player"]
     routing = ["--socket", "/unused/socket", "--autosave", "/unused/autosave",
-               "--bindings", "/unused/bindings.json", "--edge-name", "private-edge"]
+               "--bindings", "/unused/bindings.json", "--edge-name", "private-edge",
+               "--expected-edge-config-revision", "1"]
     observe = ["--edge-id", ID, "--baseline", "/unused/baseline"]
 
     def test_cli_baseline_enters_verified_clock_with_injected_receipt(self):
@@ -151,6 +152,15 @@ class PromotionLauncherCLITests(unittest.TestCase):
         argv = launch.call_args.args[3]
         self.assertIn("promotion-baseline", argv)
         self.assertEqual(argv[argv.index("--clock-receipt") + 1], str(Path("/unused/clock.json")))
+
+    def test_cli_refuses_promotion_without_expected_config_revision(self):
+        for action, extra, tail in (("promotion-baseline", [], []),
+                                    ("promotion-observe", ["--timeline", "/unused/timeline"], self.observe)):
+            args = [*self.controls, action, *extra, "--", *self.shared, action, *self.routing[:-2], *tail]
+            with (self.subTest(action=action), patch.object(launcher, "launch_observer_in_collector_time_namespace") as launch,
+                  self.assertRaisesRegex(Stop, "^CLOCK_OBSERVER_COMMAND_INVALID$")):
+                launcher.main(args)
+            launch.assert_not_called()
 
     def test_cli_observe_uses_joined_child_and_refuses_override(self):
         args = [*self.controls, "promotion-observe", "--timeline", "/unused/timeline", "--", *self.shared,

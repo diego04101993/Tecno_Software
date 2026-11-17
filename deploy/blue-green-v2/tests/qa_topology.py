@@ -115,7 +115,7 @@ class Topology:
         return DockerProbe(self.bindings, "desktop-linux" if sys.platform == "win32" else "default",
                            edge_name=f"{self.docker.name}-edge")
 
-    def start_edge(self):
+    def start_edge(self, *, caddyfile=None):
         from edge_boot import ColdStart
         from release_state import StateStore
         from routectl import Controller
@@ -134,8 +134,9 @@ class Topology:
         self.docker.read(self.relay.relay, "sh", "-ec", "mkdir -p /config/caddy; chmod 700 /run/bgv2 /config /config/caddy /sealed")
         self.docker.run("start", self.edge)
         self.wait_bootstrap()
-        adapted = self.docker.read(self.edge, "caddy", "adapt", "--config", "/opt/bgv2/Caddyfile.edge",
-                                   "--adapter", "caddyfile")
+        source = "/opt/bgv2/Caddyfile.edge" if caddyfile is None else "/dev/stdin"
+        adapted = self.docker.read(self.edge, "caddy", "adapt", "--config", source, "--adapter", "caddyfile",
+                                   input=caddyfile)
         self.docker.read(self.relay.relay, "chmod", "700", "/sealed")
         baseline_receipt = self.docker.read(self.relay.relay, "python", "-B", "/tooling/edge_config.py",
             "--config-dir", "/config", "--baseline", "/sealed/edge-baseline.json", input=adapted.encode())
