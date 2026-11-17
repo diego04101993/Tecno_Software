@@ -15,10 +15,13 @@ import socket
 import struct
 import sys
 from time import monotonic, monotonic_ns, time_ns
+from urllib.parse import unquote_to_bytes
 from uuid import UUID
 
 
 TELEMETRY = {b"/api/player/heartbeat": "heartbeat", b"/api/player/playback-events": "playback-events"}
+NATIVE_RUNTIME = "runtime-config"
+PLAYER_LATENCY_CAPTURE = {"type": "player_latency_capture", "version": 1}
 HEADER_MAX = 32768
 ACK_MAX = 1024
 MAX_ACTIVE = 1024
@@ -56,9 +59,10 @@ def observation_stamp():
 
 
 class Conversation:
-    def __init__(self, emit, *, phase3_monotonic=False):
+    def __init__(self, emit, *, phase3_monotonic=False, player_latency=False):
         self.emit = emit
         self.phase3_monotonic = phase3_monotonic
+        self.player_latency = player_latency
         self.requests = deque()
         self.request = Stream(self, True)
         self.response = Stream(self, False)
@@ -177,7 +181,13 @@ class Stream:
         if self.request:
             require(len(line) == 3 and line[2] == b"HTTP/1.1" and len(self.conversation.requests) < 16,
                     "BAD_HTTP_REQUEST_SEQUENCE")
-            endpoint = TELEMETRY.get(line[1]) if line[0] == b"POST" else None
+            path = line[1]
+            if self.conversation.player_latency:
+                path = unquote_to_bytes(path.partition(b"?")[0])
+            endpoint = TELEMETRY.get(path) if line[0] == b"POST" else None
+            if (self.conversation.player_latency and line[0] == b"GET"
+                    and path == b"/api/player/runtime-config"):
+                endpoint = NATIVE_RUNTIME
             record = {"method": line[0]}
             if endpoint:
                 trace = values.get(b"x-request-id", b"").decode("ascii")
@@ -366,9 +376,10 @@ def install_send_guard(libc, fd):
     require(libc.prctl(22, 2, ctypes.byref(seccomp), 0, 0) == 0, "PASSIVE_SOCKET_GUARD_FAILED")
 
 
-def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=False):
+def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=False, player_latency=False):
     edge, backend = map(socket.inet_aton, (edge, backend))
     require(edge != backend and 0 < port < 65536 and 1 <= seconds <= 600, "INVALID_CAPTURE_SCOPE")
+    require(not player_latency or phase3_monotonic, "PLAYER_LATENCY_REQUIRES_MONOTONIC_CAPTURE")
     if phase3_monotonic:
         require(seconds == PHASE3_CAPTURE_SECONDS, "INVALID_PHASE3_CAPTURE_LIFETIME")
         namespace = os.readlink("/proc/self/ns/time")
@@ -383,12 +394,18 @@ def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=F
             emit({"type": "ready", "started_ns": started})
             emit({"type": "monotonic_clock", "ready_monotonic_ns": ready_ns,
                   "deadline_monotonic_ns": deadline_ns, "time_namespace": namespace})
+            if player_latency:
+                emit(PLAYER_LATENCY_CAPTURE)
         else:
             emit({"type": "ready", "started_ns": time_ns()})
             deadline = monotonic() + seconds
         flows = {}
+        def emit_event(kind, event):
+            event_kind = f"latency_{kind}" if event["endpoint"] == NATIVE_RUNTIME else kind
+            emit({"type": event_kind, **event})
+
         def emit_response(event):
-            emit({"type": "response", **event})
+            emit_event("response", event)
         while (monotonic_ns() < deadline_ns if phase3_monotonic else monotonic() < deadline):
             try:
                 frame = capture.recv(65550)
@@ -404,7 +421,8 @@ def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=F
             if outbound and syn:
                 require(len(flows) < MAX_ACTIVE or flow_port in flows, "ACTIVE_FLOW_LIMIT")
                 if flow_port not in flows:
-                    flows[flow_port] = Conversation(emit_response, phase3_monotonic=phase3_monotonic)
+                    flows[flow_port] = Conversation(emit_response, phase3_monotonic=phase3_monotonic,
+                                                    player_latency=player_latency)
             flow = flows.get(flow_port)
             if flow is None:
                 # A socket predating observer startup cannot be attributed.
@@ -415,11 +433,11 @@ def observe(interface, edge, backend, port, seconds, emit, *, phase3_monotonic=F
                 flow.half_closed.add(outbound)
             if flags & 4 or len(flow.half_closed) == 2:
                 for event in flow.outstanding():
-                    emit({"type": "incomplete", **event})
+                    emit_event("incomplete", event)
                 flows.pop(flow_port)
         for flow in flows.values():
             for event in flow.outstanding():
-                emit({"type": "incomplete", **event})
+                emit_event("incomplete", event)
         packets, drops = struct.unpack("II", capture.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
         done = {"type": "done", "ended_ns": time_ns(), "kernel_packets": packets, "kernel_dropped": drops}
         if phase3_monotonic:
@@ -435,10 +453,12 @@ def main():
     parser.add_argument("backend_ip")
     parser.add_argument("seconds", type=int)
     parser.add_argument("--phase3-monotonic", action="store_true")
+    parser.add_argument("--player-latency", action="store_true")
     args = parser.parse_args()
     try:
         observe(args.interface, args.edge_ip, args.backend_ip, 8000, args.seconds,
-                lambda event: print(json.dumps(event), flush=True), phase3_monotonic=args.phase3_monotonic)
+                lambda event: print(json.dumps(event), flush=True), phase3_monotonic=args.phase3_monotonic,
+                player_latency=args.player_latency)
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
         print('{"type":"failed"}', flush=True)
         return 1

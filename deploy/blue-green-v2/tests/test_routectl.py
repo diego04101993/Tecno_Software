@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from release_state import StateStore, Stop, canonical, decode, digest, exclusive_lock, now
-from routectl import ADMIN_ADDRESS, BLUE_PAIR, CaddyEdge, Controller, DEFAULT_HOSTS, STATUS_TRANSITION, upstream
+from routectl import ADMIN_ADDRESS, BLUE_PAIR, CaddyEdge, Controller, DEFAULT_HOSTS, RouteConfig, STATUS_TRANSITION, upstream
 
 
 class Killed(BaseException):
@@ -57,6 +57,65 @@ def edge_config():
             "redirect": {"listen": [":80"]},
         }}},
     }
+
+
+class RouteSlotLoggingTests(unittest.TestCase):
+    def setUp(self):
+        self.config = edge_config()
+        servers = self.config["apps"]["http"]["servers"]
+        for name, slot in (("public", "BLUE"), ("preview-blue", "BLUE"), ("preview-green", "GREEN")):
+            for route in servers[name]["routes"]:
+                self.handlers(route).insert(1, {"handler": "log_append", "key": "slot", "early": True, "value": slot})
+        self.public_api = self.handlers(servers["public"]["routes"][0])
+        self.preview_api = self.handlers(servers["preview-green"]["routes"][0])
+
+    @staticmethod
+    def handlers(role_route):
+        return role_route["handle"][0]["routes"][0]["handle"]
+
+    def test_slot_log_follows_only_the_switched_role_and_rolls_back(self):
+        original = canonical(self.config)
+        baseline = RouteConfig(self.config)
+        api_green = baseline.changed({"api": "GREEN", "frontend": "BLUE"}, 1)
+        fully_green = api_green.changed({"api": "GREEN", "frontend": "GREEN"}, 2)
+        rolled_back = fully_green.changed(BLUE_PAIR, 3)
+        for config in (baseline, api_green, fully_green, rolled_back):
+            self.assertEqual({role: log["value"] for role, log in config.slot_logs.items()}, config.active)
+        self.assertEqual(canonical(self.config), original)
+        for config in (api_green, fully_green, rolled_back):
+            self.assertEqual(config.config["apps"]["http"]["servers"]["preview-green"],
+                             self.config["apps"]["http"]["servers"]["preview-green"])
+
+    def test_telemetry_is_not_added_to_a_legacy_seal_on_switch(self):
+        old = RouteConfig(edge_config())
+        new = old.changed({"api": "GREEN", "frontend": "BLUE"}, 1)
+        self.assertEqual(new.slot_logs, {})
+        self.assertEqual(new.active, {"api": "GREEN", "frontend": "BLUE"})
+
+    def test_rejects_wrong_public_slot(self):
+        self.public_api[1]["value"] = "GREEN"
+        with self.assertRaisesRegex(Stop, "EDGE_SLOT_LOG_CHANGED"):
+            RouteConfig(self.config)
+
+    def test_rejects_wrong_preview_slot(self):
+        self.preview_api[1]["value"] = "BLUE"
+        with self.assertRaisesRegex(Stop, "PREVIEW_SLOT_LOG_CHANGED"):
+            RouteConfig(self.config)
+
+    def test_rejects_missing_preview_slot(self):
+        self.preview_api.pop(1)
+        with self.assertRaisesRegex(Stop, "PREVIEW_SLOT_LOG_CHANGED"):
+            RouteConfig(self.config)
+
+    def test_rejects_duplicate_or_late_slot_log(self):
+        change = self.public_api[1]
+        change["early"] = False
+        with self.assertRaisesRegex(Stop, "AMBIGUOUS_EDGE_SLOT_LOG"):
+            RouteConfig(self.config)
+        change["early"] = True
+        self.public_api.insert(2, change.copy())
+        with self.assertRaisesRegex(Stop, "AMBIGUOUS_EDGE_SLOT_LOG"):
+            RouteConfig(self.config)
 
 
 class Wire(CaddyEdge):

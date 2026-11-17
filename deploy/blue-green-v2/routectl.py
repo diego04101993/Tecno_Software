@@ -87,13 +87,14 @@ class RouteConfig:
             self.active = {}
             self.proxies = {}
             self.generation_logs = {}
+            self.slot_logs = {}
             self.targets = {(role, slot): upstream(role, slot) for role in ROLES for slot in SLOTS}
-            blue_api, _ = self._role_handlers(servers["preview-blue"], hosts["api"])
+            blue_api, _, _ = self._role_handlers(servers["preview-blue"], hosts["api"])
             blue_dial = self._dial(blue_api)
             if blue_dial != upstream("api", "BLUE"):
                 self.targets["api", "BLUE"] = legacy_blue_endpoint(blue_dial)
             for role, host in hosts.items():
-                proxy, generation_log = self._role_handlers(public, host)
+                proxy, generation_log, slot_log = self._role_handlers(public, host)
                 require(generation_log["value"] == str(self.generation), "EDGE_GENERATION_LOG_CHANGED")
                 self.proxies[role] = proxy
                 self.generation_logs[role] = generation_log
@@ -101,18 +102,25 @@ class RouteConfig:
                 dial = self._dial(proxy)
                 require(dial in choices, "UNKNOWN_PUBLIC_UPSTREAM")
                 self.active[role] = choices[dial]
+                if slot_log is not None:
+                    require(slot_log["value"] == self.active[role], "EDGE_SLOT_LOG_CHANGED")
+                    self.slot_logs[role] = slot_log
                 for slot in SLOTS:
                     preview = servers[f"preview-{slot.lower()}"]
                     require(preview["listen"] == [f"127.0.0.1:{preview_ports[slot]}"],
                             "PREVIEW_LISTENER_NOT_PRIVATE")
-                    preview_proxy, preview_generation = self._role_handlers(preview, host)
+                    preview_proxy, preview_generation, preview_slot = self._role_handlers(preview, host)
                     require(self._dial(preview_proxy) == self.target_for(role, slot),
                             "UNKNOWN_PREVIEW_UPSTREAM")
                     require(preview_generation["value"] == "preview",
                             "PREVIEW_GENERATION_LOG_CHANGED")
+                    require((preview_slot is None) == (slot_log is None)
+                            and (preview_slot is None or preview_slot["value"] == slot),
+                            "PREVIEW_SLOT_LOG_CHANGED")
                     public_shape = {key: value for key, value in proxy.items() if key != "upstreams"}
                     preview_shape = {key: value for key, value in preview_proxy.items() if key != "upstreams"}
                     require(public_shape == preview_shape, "PREVIEW_PROXY_POLICY_MISMATCH")
+            require(not self.slot_logs or set(self.slot_logs) == set(hosts), "EDGE_SLOT_LOG_SCOPE_CHANGED")
         except (KeyError, TypeError, AttributeError, ValueError) as exc:
             raise Stop("INVALID_EDGE_ROUTE_CONFIG") from exc
         self.public = public
@@ -130,9 +138,13 @@ class RouteConfig:
         proxies = [handler for handler in handlers if handler.get("handler") == "reverse_proxy"]
         generation_logs = [handler for handler in handlers if handler.get("handler") == "log_append"
                            and handler.get("key") == "route_generation"]
+        slot_logs = [handler for handler in handlers if handler.get("handler") == "log_append"
+                     and handler.get("key") == "slot"]
         require(len(proxies) == 1 and len(generation_logs) == 1,
                 "AMBIGUOUS_EDGE_ROUTE_HANDLERS")
-        return proxies[0], generation_logs[0]
+        require(len(slot_logs) <= 1 and all(handler.get("early") is True for handler in slot_logs),
+                "AMBIGUOUS_EDGE_SLOT_LOG")
+        return proxies[0], generation_logs[0], slot_logs[0] if slot_logs else None
 
     @staticmethod
     def _dial(proxy):
@@ -148,6 +160,9 @@ class RouteConfig:
         for role, slot in routes.items():
             result.proxies[role]["upstreams"][0]["dial"] = result.target_for(role, slot)
             result.generation_logs[role]["value"] = str(generation)
+            # A legacy sealed config carries no slot field. Preserve that seal's shape.
+            if role in result.slot_logs:
+                result.slot_logs[role]["value"] = slot
         return RouteConfig(result.config, self.hosts)
 
 
@@ -160,7 +175,7 @@ def bind_legacy_blue(config, manifest, expected_sha256):
         require(servers["public"].get("@id", "bgv2-generation-0") == "bgv2-generation-0",
                 "LEGACY_BLUE_BINDING_REQUIRES_INITIAL_GENERATION")
         for server in ("public", "preview-blue"):
-            proxy, _ = RouteConfig._role_handlers(servers[server], DEFAULT_HOSTS["api"])
+            proxy, _, _ = RouteConfig._role_handlers(servers[server], DEFAULT_HOSTS["api"])
             require(RouteConfig._dial(proxy) == upstream("api", "BLUE"), "LEGACY_BLUE_INITIAL_DIAL_INVALID")
             proxy["upstreams"][0]["dial"] = target
     except (KeyError, TypeError, AttributeError, ValueError):

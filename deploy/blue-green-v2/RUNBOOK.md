@@ -1,4 +1,4 @@
-# Blue-Green V2.6.7
+# Blue-Green V2.6.8
 
 Phases 1 and 2 cover local tooling and disposable QA. [Phase 3](PHASE3_RUNBOOK.md) describes adoption of the permanent ingress and requires separate authorization. Its only successful initial state is BLUE API and BLUE frontend. Production R3, PostgreSQL, uploads, backups and OBS6.4 remain protected throughout adoption.
 
@@ -67,6 +67,8 @@ For Players capture the established 120 s activity baseline before the API switc
 Edge records an opaque request ID, ingress, route generation, upstream, status and timing. Evidence excludes credentials, request bodies and raw Player IDs. The passive observer reads Edge records and bounded upstream ACK evidence collected independently of clients. The DB resolver uses a read-only transaction and requires a unique committed heartbeat row. A shared DB row by itself never qualifies as GREEN traffic. Keep the capture inside the trusted Edge namespace, restrict and lock its packet filter and treat capture gaps, unmatched records and ambiguous ACKs as failures. Review capture privilege and receipt handling before any production execution.
 
 The observer starts the restricted collector before the API switch so it can see connections open, then waits for collector readiness. Use the `promotion-baseline` and `promotion-observe` actions of the [Player observer launcher](PLAYER_OBSERVER.md). They use the same monotonic adjudicator as Phase 3 and the time namespace of the exact collector. A signed baseline clock proof is required for the API switch. The frontend switch requires a signed observation of the committed generation, slot, upstream and READY backend. The gate derives eligibility from request start in `[start, finish)`, with at least 120 monotonic seconds and the existing terminal deadline. The collector has neither a Docker socket, DB access nor the signing key. A trusted parent passes its bounded metadata through a private pipe. Require the collector completion record with zero packet drops. On an incomplete or rejected observation, execute the explicit API rollback with frontend still on the predecessor. Keep packet data in memory.
+
+V2.6.8 requiere que la configuración efectiva, el autosave y el sello de Edge incluyan la telemetría de latencia antes de iniciar una promoción. Instalar los archivos por sí solo conserva el JSON activo anterior. Verificar esta condición en la preparación aprobada, con BLUE/BLUE y sin cambiar los upstreams. La revisión local no activa la configuración. Para la captura de promoción usar `--player-latency` con `--phase3-monotonic`. La captura de Phase 3 sigue usando `--phase3-monotonic`.
 
 ## Disposable QA and future adoption
 

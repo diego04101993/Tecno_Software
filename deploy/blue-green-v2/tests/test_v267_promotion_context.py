@@ -183,16 +183,22 @@ class PromotionContextTests(unittest.TestCase):
         routing = SimpleNamespace(context={"slot": "GREEN"}, check_state=Mock())
         diagnostic = SimpleNamespace(advance=Mock(), counts={})
 
-        def logs(edge_id, started, path, *, diagnostics):
+        def logs(edge_id, started, path, *, diagnostics, promotion_latency):
+            self.assertTrue(promotion_latency)
             self.assertEqual(edge_id, args.edge_id)
             self.assertEqual(utc(started).isoformat(), "2026-11-16T19:59:59+00:00")
             self.assertEqual(path, args.receipt)
             self.assertIs(diagnostics, diagnostic)
             return ()
 
+        latency = {}
+        report = {"PLAYER_TIMEOUT_CONTRACTS_REAL": "FAIL_EVIDENCE"}
         with patch.object(observer, "capture_input", return_value=upstream), patch.object(observer, "edge_logs", logs), \
                 patch.object(observer, "monotonic_ns", return_value=window.finish_ns), \
+                patch.object(observer, "evaluate_player_latency", return_value=report), \
                 patch.object(observer, "observe_committed_slot", return_value=({}, True, window.finish_ns)) as core:
-            observed = observer._read_window(args, diagnostic, routing, window, "time:[101]", Mock(), set(), KEY, [])
+            observed = observer._read_window(args, diagnostic, routing, window, "time:[101]", Mock(), set(), KEY, [],
+                                             latency_audit=latency)
+        self.assertEqual(latency, report)
         self.assertEqual(observed, ({}, True, window.finish_ns))
         self.assertEqual(core.call_args.args[0], upstream)

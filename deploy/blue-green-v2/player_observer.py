@@ -7,6 +7,7 @@ already sanitized Docker logs in separate private evidence files.
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 import os
 from pathlib import Path
 import re
@@ -391,22 +392,35 @@ def capture_input(stream, *, opened_monotonic_ns=None, time_namespace=None, read
     return captured
 
 
-def edge_logs(edge_id, started, receipt_path, *, diagnostics=None):
+def edge_logs(edge_id, started, receipt_path, *, diagnostics=None, promotion_latency=False):
     since = (utc(started) - timedelta(seconds=2)).isoformat() if started is not None else None
     receipt = Path(receipt_path)
     evidence = receipt.with_name(receipt.name + ".docker-logs.json")
+    stream_incomplete = False
+
     def preserve(logs):
+        nonlocal stream_incomplete
         if diagnostics is not None:
             diagnostics.record_edge_streams(logs)
             diagnostics.advance("write_edge_log_evidence")
-        save_receipt(evidence, logs.evidence())
+        if promotion_latency:
+            from player_latency import sanitized_log_evidence
+            archive = sanitized_log_evidence(logs)
+            stream_incomplete = archive["stream_integrity"] != "PASS"
+        else:
+            archive = logs.evidence()
+        save_receipt(evidence, archive)
         if diagnostics is not None:
             diagnostics.advance("collect_edge_logs")
 
     capture = collect_docker_logs(lambda *args: local_docker(*args, check=False),
                                   edge_id, since=since, until=from_ns(time_ns()).isoformat(),
                                   preserve=preserve)
-    return capture.lines(edge_id)
+    lines = capture.lines(edge_id)
+    if stream_incomplete:
+        from player_latency import INCOMPLETE_LOG_STREAM
+        return chain(lines, (INCOMPLETE_LOG_STREAM,))
+    return lines
 
 
 def verify_phase3_ingress(edge, state, context):

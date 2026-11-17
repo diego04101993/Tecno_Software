@@ -7,6 +7,7 @@ from time import monotonic_ns
 from urllib.parse import unquote, urlsplit
 
 from gates import DockerProbe, PlayerGate, sign_receipt, utc, verified_payload
+from player_latency import evaluate_player_latency, split_capture
 from player_observer import (
     capture_baseline, capture_input, edge_logs, from_ns, local_docker, phase3_ready_line,
     postgres_rows, read_only_query, save_phase3_request_evidence, save_receipt,
@@ -145,7 +146,7 @@ def _attest_baseline(args, frozen, key, clock, window):
     return data, transition, gate
 
 
-def _read_window(args, diagnostic, frozen, window, namespace, read, refs, key, audit):
+def _read_window(args, diagnostic, frozen, window, namespace, read, refs, key, audit, *, latency_audit):
     diagnostic.advance("read_capture")
     frames = capture_input(sys.stdin.buffer, opened_monotonic_ns=window.opened_ns, time_namespace=namespace,
                            ready_line=phase3_ready_line(args.capture_ready_json), checkpoint=frozen.check_state)
@@ -157,9 +158,11 @@ def _read_window(args, diagnostic, frozen, window, namespace, read, refs, key, a
     # UTC bounds retrieve Docker log bytes. Only the wire's monotonic start grants eligibility.
     diagnostic.advance("collect_edge_logs")
     since = min(utc(args.opened_at), from_ns(ready["started_ns"])).isoformat()
-    logs = edge_logs(args.edge_id, since, args.receipt, diagnostics=diagnostic)
+    logs = tuple(edge_logs(args.edge_id, since, args.receipt, diagnostics=diagnostic, promotion_latency=True))
     diagnostic.advance("adjudicate")
-    return observe_committed_slot(frames, logs, lambda pairs: read_only_query(read, pairs), refs, frozen.context,
+    latency_audit.update(evaluate_player_latency(frames, logs, frozen.context, window))
+    continuity_frames, _ = split_capture(frames)
+    return observe_committed_slot(continuity_frames, logs, lambda pairs: read_only_query(read, pairs), refs, frozen.context,
                                   key, window, time_namespace=namespace, audit=audit)
 
 
@@ -183,10 +186,11 @@ def _observe(args, diagnostic, controller, clock, read, key):
              "WINDOW_OPENED_MONOTONIC": window.opened_ns, "WINDOW_START_MONOTONIC": window.start_ns,
              "WINDOW_FINISH_MONOTONIC": window.finish_ns, "TIME_NAMESPACE_MATCH": "YES",
              "TIME_NAMESPACE": clock["time_namespace"]}
-    audit = {"version": 1, **proof, "requests": []}
+    audit = {"version": 1, **proof, "requests": [], "player_latency": {}}
     try:
         evidence, accepted, deadline = _read_window(args, diagnostic, frozen, window, clock["time_namespace"],
-                                                     read, refs, key, audit["requests"])
+                                                     read, refs, key, audit["requests"],
+                                                     latency_audit=audit["player_latency"])
         diagnostic.advance("recheck_routing_and_endpoints")
         frozen.recheck()
         require(_endpoints(args, backend, clock) == endpoints and _clock_identity(args.clock_receipt) == clock,
@@ -209,10 +213,18 @@ def _observe(args, diagnostic, controller, clock, read, key):
     diagnostic.advance("write_request_evidence")
     save_phase3_request_evidence(args.receipt, audit, diagnostic)
     frozen.check_state()
-    diagnostic.advance("write_player_receipt")
-    save_receipt(args.receipt, receipt)
-    diagnostic.advance("report_player_result")
-    accepted = accepted and gate(receipt, transition, routing_context=frozen.context)
+    latency = audit["player_latency"]
+    latency_accepted = latency["PLAYER_TIMEOUT_CONTRACTS_REAL"] in ("PASS", "UNVERIFIED_NO_TRAFFIC")
+    if latency_accepted:
+        diagnostic.advance("write_player_receipt")
+        save_receipt(args.receipt, receipt)
+        diagnostic.advance("report_player_result")
+    continuity_accepted = accepted and gate(receipt, transition, routing_context=frozen.context)
+    print("PLAYER_CONTINUITY_GATE=" + ("PASS_ALL_BASELINE" if continuity_accepted else "FAIL"))
+    for name, value in latency.items():
+        if name.isupper():
+            print(f"{name}={value if value is not None else 'UNAVAILABLE'}")
+    accepted = continuity_accepted and latency_accepted
     print("PLAYER_OBSERVATION=PASS" if accepted else "PLAYER_OBSERVATION=FAIL")
     return 0 if accepted else diagnostic.fail(2)
 

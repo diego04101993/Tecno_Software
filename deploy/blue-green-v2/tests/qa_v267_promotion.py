@@ -1,4 +1,4 @@
-"""Exercise native monotonic promotion on a disposable local Linux Docker Engine."""
+"""Exercise monotonic promotion and passive Player latency on disposable Linux Docker."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -116,7 +116,7 @@ class MonotonicCapture(Capture):
         assert re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface)
         self.child = subprocess.Popen([
             *self.docker.command, "exec", self.container, "python", "-I", "-B", "/observe.py", interface,
-            self.expected["proxy_ip"], self.expected["ip"], str(self.seconds), "--phase3-monotonic",
+            self.expected["proxy_ip"], self.expected["ip"], str(self.seconds), "--phase3-monotonic", "--player-latency",
         ], env=self.docker.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         self.ready = read_capture_ready(self.child.stdout)
 
@@ -249,9 +249,11 @@ class PromotionFixture:
                 target = self.db.player_tokens[:-1] if missing else self.db.player_tokens
                 for token in target:
                     heartbeat(self.http, token)
+                self.http.request(API_HOST, "/api/player/runtime-config",
+                                  headers={"Authorization": "Bearer " + target[0]}).require(200)
                 playback(self.http, target[0])
                 self.public_route("api", "GREEN", switched["routing"]["generation"])
-                _, errors = observer.communicate(timeout=180)
+                output, errors = observer.communicate(timeout=180)
                 elapsed = monotonic_ns() - stamp
                 require_exit(observer.returncode, 2 if missing else 0, errors)
             finally:
@@ -267,7 +269,20 @@ class PromotionFixture:
         proof = read(receipt)
         requests = read(Path(str(receipt) + ".requests.json"))
         assert requests["requests"] and digest(requests) == proof["payload"]["observation"]["REQUEST_EVIDENCE_SHA256"]
-        return proof, elapsed
+        archive = read(Path(str(receipt) + ".docker-logs.json"))
+        assert archive["stream_integrity"] == "PASS" and set(archive["streams"]) == {"stdout", "stderr"}
+        assert archive["merged_timeline"] and "raw_encoding" not in archive
+        report = requests["player_latency"]
+        lines = output.decode().splitlines()
+        assert "PLAYER_TIMEOUT_CONTRACTS_REAL=PASS" in lines
+        if not missing:
+            assert "PLAYER_CONTINUITY_GATE=PASS_ALL_BASELINE" in lines
+        assert report["PLAYER_TIMEOUT_CONTRACTS_REAL"] == "PASS"
+        for metric, count, limit in (("HEARTBEAT", len(target), 5), ("RUNTIME", 1, 8), ("PLAYBACK", 1, 5)):
+            prefix = "REAL_" + metric + "_LATENCY_"
+            assert report[prefix + "COUNT"] == count and report[prefix + "STATUS"] == "PASS"
+            assert 0 < report[prefix + "MAX"] < limit * 1_000_000_000
+        return proof, elapsed, report
 
     def reject_replayed_receipt(self, proof, generation):
         reverted = self.controller.rollback()
@@ -302,7 +317,7 @@ class PromotionFixture:
         self.capture.start()
         baseline, switched, stamp = self.api_switch(label)
         assert switched["routing"]["generation"] == generation
-        proof, elapsed = self.playback_window(label, baseline, switched, stamp, missing=missing)
+        proof, elapsed, latency = self.playback_window(label, baseline, switched, stamp, missing=missing)
         transition = switched["routing"]["api_transition"]
         credited = {row["device_ref"] for row in proof["payload"]["heartbeats"]}
         baseline_refs = set(read(baseline)["payload"]["baseline_refs"])
@@ -342,7 +357,10 @@ class PromotionFixture:
                   "window_duration_monotonic_ns": finish - start,
                   "TIME_NAMESPACE_MATCH": "YES", "runtime_epochs_unchanged": True,
                   "final_active": BLUE_PAIR if missing else GREEN_PAIR, "final_generation": generation + 1,
-                  "observer_generated_requests": 0, "valid_old_receipt_after_rollback": replay_control}
+                  "observer_generated_requests": 0, "valid_old_receipt_after_rollback": replay_control,
+                  "PLAYER_CONTINUITY_GATE": "FAIL_MISSING_BASELINE" if missing else "PASS_ALL_BASELINE",
+                  "edge_log_evidence": "SANITIZED_SEPARATE_STREAMS_MERGED_TIMELINE",
+                  **{k: v for k, v in latency.items() if k.startswith(("REAL_", "PLAYER_"))}}
         save(self.evidence / "summary.json", result)
         print(json.dumps(result, sort_keys=True), flush=True)
         return result

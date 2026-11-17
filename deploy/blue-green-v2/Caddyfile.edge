@@ -43,10 +43,12 @@
 (upstream) {
 	header X-Request-ID {http.request.uuid}
 	log_append <route_generation {args[1]}
+	log_append <slot {args[3]}
 	log_append <ingress {args[2]}
 	log_append <received_at_ms {time.now.unix_ms}
 	log_append <request_id {http.request.uuid}
 	log_append upstream {http.reverse_proxy.upstream.hostport}
+	log_append upstream_duration_ms {http.reverse_proxy.upstream.duration_ms}
 	log_append proxy_ms {http.reverse_proxy.duration_ms}
 	log_append proxy_retries {http.reverse_proxy.retries}
 	log_append upstream_status {http.reverse_proxy.status_code}
@@ -63,6 +65,16 @@
 		header_up X-Request-ID {http.request.uuid}
 		header_down -X-Request-ID
 	}
+}
+
+(player-route-class) {
+	map "{http.request.method} {http.request.uri.path}" {player_route_class} {
+		"POST /api/player/heartbeat" PLAYER_HEARTBEAT
+		"GET /api/player/runtime-config" PLAYER_RUNTIME_CONFIG
+		"POST /api/player/playback-events" PLAYER_PLAYBACK_EVENT
+		default OTHER
+	}
+	log_append <route_class {player_route_class}
 }
 
 (api-class) {
@@ -92,7 +104,7 @@
 	@read expression `(method('GET', 'HEAD') && (path('/', '/api/player/time', '/api/auth/me', '/api/channels/', '/openapi.json', '/media/*') || path_regexp('preview_runtime', '^/api/channels/[0-9a-fA-F-]{36}/runtime-config$'))) && !header({'Upgrade': '*'})`
 	handle @read {
 		import api-class
-		import upstream {args[0]} preview {args[1]}
+		import upstream {args[0]} preview {args[1]} {args[2]}
 	}
 	handle {
 		respond 403
@@ -102,7 +114,7 @@
 (preview-frontend) {
 	@read expression `method('GET', 'HEAD') && !header({'Upgrade': '*'})`
 	handle @read {
-		import upstream {args[0]} preview {args[1]}
+		import upstream {args[0]} preview {args[1]} {args[2]}
 	}
 	handle {
 		respond 403
@@ -116,40 +128,46 @@ http://{$BGV2_API_HOST:api.tecnocontrolcloud.com}, http://{$BGV2_APP_HOST:app.te
 {$BGV2_API_HOST:api.tecnocontrolcloud.com} {
 	import tls-config
 	log
+	import player-route-class
 	import api-class
-	import upstream backend-blue:8000 0 public
+	import upstream backend-blue:8000 0 public BLUE
 }
 
 {$BGV2_APP_HOST:app.tecnocontrolcloud.com} {
 	import tls-config
 	log
-	import upstream frontend-blue:80 0 public
+	log_append <route_class OTHER
+	import upstream frontend-blue:80 0 public BLUE
 }
 
 https://{$BGV2_API_HOST:api.tecnocontrolcloud.com}:8443 {
 	bind 127.0.0.1
 	import tls-config
 	log
-	import preview-api backend-green:8000 preview-green
+	import player-route-class
+	import preview-api backend-green:8000 preview-green GREEN
 }
 
 https://{$BGV2_APP_HOST:app.tecnocontrolcloud.com}:8443 {
 	bind 127.0.0.1
 	import tls-config
 	log
-	import preview-frontend frontend-green:80 preview-green
+	log_append <route_class OTHER
+	import preview-frontend frontend-green:80 preview-green GREEN
 }
 
 https://{$BGV2_API_HOST:api.tecnocontrolcloud.com}:8444 {
 	bind 127.0.0.1
 	import tls-config
 	log
-	import preview-api backend-blue:8000 preview-blue
+	import player-route-class
+	import preview-api backend-blue:8000 preview-blue BLUE
 }
 
 https://{$BGV2_APP_HOST:app.tecnocontrolcloud.com}:8444 {
 	bind 127.0.0.1
 	import tls-config
 	log
-	import preview-frontend frontend-blue:80 preview-blue
+	log_append <route_class OTHER
+	import preview-frontend frontend-blue:80 preview-blue BLUE
 }
