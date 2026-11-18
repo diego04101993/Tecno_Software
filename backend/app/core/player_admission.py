@@ -1,9 +1,10 @@
 """Finite process-local admission; playback persistence has a separate lane.
 
-The expensive lane still has four permits. Round-robin queued classes prevent
-one polling route from owning the complete FIFO. No DB connection/thread token
-is acquired while a caller is waiting here. Only a disconnected, not-yet-
-admitted runtime GET may be abandoned. Admitted writes are never cancelled.
+The expensive lane still has four permits. Reserved shares protect heartbeat,
+runtime and the playback worker; idle shares remain borrowable. No DB
+connection/thread token is acquired while a caller is waiting here. A heartbeat
+past its server-side request budget cannot enter the handler. Admitted writes
+are never cancelled by a deadline.
 """
 import asyncio
 from collections import deque
@@ -12,13 +13,19 @@ from dataclasses import dataclass
 from threading import RLock
 import time
 import logging
+from typing import Callable
 
 from fastapi import HTTPException
+
+from app.core.player_diagnostics import admission_grant_recorder
 
 
 EXPENSIVE_CAPACITY = 4
 INGRESS_CAPACITY = 2
 HTTP_PENDING_PER_CLASS = 16
+HEARTBEAT_ADMISSION_CAPACITY = 2
+HEARTBEAT_MAX_WAITERS = 16
+HEARTBEAT_REQUEST_BUDGET_NS = 5_000_000_000
 INGRESS_PENDING = 64
 _KINDS = {
     "heartbeat": "heartbeat",
@@ -39,36 +46,77 @@ class _Waiter:
     future: asyncio.Future
     started_ns: int
     granted: bool = False
+    deadline_ns: int | None = None
+    granted_ns: int | None = None
+    on_granted: Callable[[int], None] | None = None
 
 
 class _FairGate:
-    def __init__(self, capacity, limits):
+    def __init__(self, capacity, limits, *, reservations=None):
         self.capacity = capacity
         self.limits = dict(limits)
+        self.reservations = {kind: 0 for kind in limits}
+        if reservations:
+            if set(reservations) - set(limits):
+                raise ValueError("Unknown reserved Player work class")
+            self.reservations.update(reservations)
+        if (any(type(value) is not int or value < 0 for value in self.reservations.values())
+                or sum(self.reservations.values()) > capacity):
+            raise ValueError("Reserved Player capacity exceeds the global budget")
         self.queues = {kind: deque() for kind in limits}
         self.order = deque(limits)
         self.active = 0
+        self.active_by_class = {kind: 0 for kind in limits}
         self.peak_pending = 0
         self.rejected = 0
         self.disconnected = 0
+        self.expired = 0
         self.lock = RLock()
 
     def _dispatch(self):
         while self.active < self.capacity:
+            now_ns = time.monotonic_ns()
+            for queue in self.queues.values():
+                while queue:
+                    head = queue[0]
+                    if head.future.done():
+                        queue.popleft()
+                    elif head.deadline_ns is not None and now_ns >= head.deadline_ns:
+                        queue.popleft()
+                        self.expired += 1
+                        head.future.set_exception(overloaded())
+                    else:
+                        break
             selected = None
-            for _ in range(len(self.order)):
-                kind = self.order[0]
-                self.order.rotate(-1)
-                queue = self.queues[kind]
-                while queue and queue[0].future.done():
-                    queue.popleft()
-                if queue:
-                    selected = queue.popleft()
+            # Recover a waiting class's reserved share before lending spare
+            # permits. Borrowers already running are never interrupted.
+            for reserved_only in (True, False):
+                for _ in range(len(self.order)):
+                    kind = self.order[0]
+                    self.order.rotate(-1)
+                    if (self.queues[kind] and (not reserved_only
+                            or self.active_by_class[kind] < self.reservations[kind])):
+                        selected = self.queues[kind].popleft()
+                        break
+                if selected is not None:
                     break
             if selected is None:
                 return
+            granted_ns = time.monotonic_ns()
+            if selected.deadline_ns is not None and granted_ns >= selected.deadline_ns:
+                self.expired += 1
+                selected.future.set_exception(overloaded())
+                continue
             selected.granted = True
+            selected.granted_ns = granted_ns
             self.active += 1
+            self.active_by_class[selected.kind] += 1
+            if selected.on_granted is not None:
+                try:
+                    selected.on_granted(granted_ns)
+                except BaseException:
+                    # Diagnostics cannot prevent delivery of an owned permit.
+                    pass
             selected.future.set_result(None)
 
     def snapshot(self):
@@ -76,17 +124,23 @@ class _FairGate:
             queued = {kind: sum(not item.future.done() for item in queue)
                       for kind, queue in self.queues.items()}
             return {"capacity": self.capacity, "active": self.active,
+                    "reserved": dict(self.reservations), "active_by_class": dict(self.active_by_class),
                     "waiters": sum(queued.values()), "by_class": queued,
                     "pending_limit": sum(self.limits.values()), "peak_waiters": self.peak_pending,
-                    "rejected": self.rejected, "disconnected_pending_get": self.disconnected}
+                    "rejected": self.rejected, "disconnected_pending_get": self.disconnected,
+                    "expired_before_handler": self.expired}
 
     @asynccontextmanager
-    async def admit(self, kind, request=None):
+    async def admit(self, kind, request=None, *, deadline_ns=None):
         loop = asyncio.get_running_loop()
-        item = _Waiter(kind, loop.create_future(), time.monotonic_ns())
+        item = _Waiter(kind, loop.create_future(), time.monotonic_ns(),
+                       deadline_ns=deadline_ns, on_granted=admission_grant_recorder())
         with self.lock:
             if kind not in self.queues:
                 raise RuntimeError("Unknown Player work class")
+            if deadline_ns is not None and item.started_ns >= deadline_ns:
+                self.expired += 1
+                raise overloaded()
             queued = sum(not waiter.future.done() for waiter in self.queues[kind])
             # Idle capacity can serve a request immediately; the finite bound
             # concerns callers that would actually have to wait.
@@ -101,7 +155,16 @@ class _FairGate:
             # request.is_disconnected consumes receive; use it ONLY for the
             # body-less GET route and only before any authentication or write.
             if request is None:
-                await item.future
+                if deadline_ns is None:
+                    await item.future
+                else:
+                    remaining = max(0, deadline_ns - time.monotonic_ns()) / 1_000_000_000
+                    try:
+                        await asyncio.wait_for(asyncio.shield(item.future), remaining)
+                    except TimeoutError:
+                        with self.lock:
+                            self.expired += 1
+                        raise overloaded() from None
             else:
                 while not item.future.done():
                     if await request.is_disconnected():
@@ -114,11 +177,16 @@ class _FairGate:
                 with self.lock:
                     self.disconnected += 1
                 raise HTTPException(499, "Client disconnected before admission")
+            if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
+                with self.lock:
+                    self.expired += 1
+                raise overloaded()
             yield
         finally:
             with self.lock:
                 if item.granted:
                     self.active -= 1
+                    self.active_by_class[item.kind] -= 1
                 else:
                     if not item.future.done():
                         item.future.cancel()
@@ -132,9 +200,9 @@ class _FairGate:
 class PlayerAdmission:
     def __init__(self):
         self.expensive = _FairGate(EXPENSIVE_CAPACITY, {
-            "heartbeat": HTTP_PENDING_PER_CLASS, "runtime": HTTP_PENDING_PER_CLASS,
+            "heartbeat": HEARTBEAT_MAX_WAITERS, "runtime": HTTP_PENDING_PER_CLASS,
             "playback_worker": 1,
-        })
+        }, reservations={"heartbeat": HEARTBEAT_ADMISSION_CAPACITY, "runtime": 1, "playback_worker": 1})
         self.ingress = _FairGate(INGRESS_CAPACITY, {"ingress": INGRESS_PENDING})
 
     def snapshot(self):
@@ -156,7 +224,13 @@ async def player_activity(request):
     controls = admissions(request.app)
     gate = controls.ingress if kind == "ingress" else controls.expensive
     observer = request if kind == "runtime" and request.method == "GET" else None
-    async with gate.admit(kind, observer):
+    deadline_ns = None
+    if kind == "heartbeat":
+        # This origin is captured by the always-on HTTP middleware, not a
+        # client-supplied header or the opt-in diagnostic trace.
+        started_ns = request.scope.get("_player_admission_started_ns", time.monotonic_ns())
+        deadline_ns = started_ns + HEARTBEAT_REQUEST_BUDGET_NS
+    async with gate.admit(kind, observer, deadline_ns=deadline_ns):
         yield
 
 
@@ -172,6 +246,7 @@ class PlaybackRecoveryMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
+            scope.setdefault("_player_admission_started_ns", time.monotonic_ns())
             try:
                 self.start()
             except RuntimeError:

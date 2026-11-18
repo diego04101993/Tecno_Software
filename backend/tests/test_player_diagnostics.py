@@ -84,6 +84,9 @@ class PlayerDiagnosticsTests(unittest.TestCase):
     def test_request_and_admission_counters_are_isolated_under_concurrency(self):
         self.run_case("concurrency")
 
+    def test_exact_grant_timestamp_follows_the_waiter_not_the_dispatching_request(self):
+        self.run_case("admission_grant_stamp")
+
     def test_process_sampler_starts_without_application_lifespan(self):
         self.run_case("sampler")
 
@@ -219,6 +222,12 @@ def _worker(scenario):
 
         testcase.assertIs(diagnostic.observed("AUTH")(original), original)
         testcase.assertIs(diagnostic.observed("AUTH")(original_async), original_async)
+        token = diagnostic._current_trace.set(diagnostic._Trace(
+            str(uuid4()), "/api/player/heartbeat", "POST"))
+        try:
+            testcase.assertIsNone(diagnostic.admission_grant_recorder())
+        finally:
+            diagnostic._current_trace.reset(token)
         before = {
             name: len(getattr(engine.dispatch, name))
             for name in ("before_cursor_execute", "after_cursor_execute", "begin", "commit", "rollback")
@@ -478,6 +487,49 @@ def _worker(scenario):
         testcase.assertEqual(diagnostic._process_snapshot(engine)["inflight"], 0)
         engine.dispose()
         return {"secrets_checked": len(secrets), "events": len(request_events())}
+
+    if scenario == "admission_grant_stamp":
+        testcase.assertIsNone(diagnostic.admission_grant_recorder())
+        waiting_trace = diagnostic._Trace(str(uuid4()), "/api/player/heartbeat", "POST", 100)
+        releasing_trace = diagnostic._Trace(str(uuid4()), "/api/player/runtime-config", "GET", 100)
+        waiting_trace.milestones["ADMISSION_WAIT_START"] = 110
+        token = diagnostic._current_trace.set(waiting_trace)
+        try:
+            recorder = diagnostic.admission_grant_recorder()
+        finally:
+            diagnostic._current_trace.reset(token)
+        testcase.assertTrue(callable(recorder))
+        token = diagnostic._current_trace.set(releasing_trace)
+        try:
+            # Dispatch occurs on the releasing request's context. The supplied
+            # timestamp is the grant instant, not the recorder's invocation time
+            # or the waiting coroutine's later wake-up time.
+            with patch.object(diagnostic.time, "monotonic_ns", return_value=200):
+                recorder(150)
+                recorder(170)  # preserve the first grant exactly
+                recorder(True)
+                recorder(90)
+                waiting_trace.checkpoint("ADMISSION_ACQUIRED")
+            testcase.assertNotIn("ADMISSION_GRANTED_MONOTONIC", releasing_trace.milestones)
+            with patch.object(diagnostic.time, "monotonic_ns", return_value=250):
+                row = waiting_trace.finish(200, True, True, False)
+            recorder(240)  # a finished trace is immutable
+        finally:
+            diagnostic._current_trace.reset(token)
+        milestones = row["milestones"]
+        testcase.assertEqual(milestones["ADMISSION_GRANTED_MONOTONIC"], 150)
+        testcase.assertEqual(milestones["ADMISSION_ACQUIRED"], 200)
+        testcase.assertEqual(milestones["ADMISSION_GRANTED_MONOTONIC"] -
+                             milestones["ADMISSION_WAIT_START"], 40)
+        testcase.assertEqual(milestones["ADMISSION_ACQUIRED"] -
+                             milestones["ADMISSION_GRANTED_MONOTONIC"], 50)
+        testcase.assertEqual(set(milestones), {
+            "REQUEST_ACCEPTED", "ADMISSION_WAIT_START", "ADMISSION_GRANTED_MONOTONIC",
+            "ADMISSION_ACQUIRED", "REQUEST_END",
+        })
+        engine.dispose()
+        return {"exact_grant_ns": 150, "wake_up_ns": 200,
+                "dispatch_context_isolated": True}
 
     if scenario == "concurrency":
         import anyio.to_thread

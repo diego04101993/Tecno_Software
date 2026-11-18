@@ -362,6 +362,36 @@ def admission_wait_start() -> _AdmissionTicket | None:
         return None
 
 
+def admission_grant_recorder() -> Callable[[int], None] | None:
+    """Bind an exact permit-grant timestamp to the enqueuing request.
+
+    Dispatch can run in another request's task when that task releases its
+    permit. Capture the trace now rather than reading its ContextVar there.
+    ADMISSION_ACQUIRED remains the later wake-up checkpoint, preserving the
+    existing span while allowing grant wait and event-loop resume delay to be
+    measured separately. This recorder never affects admission policy.
+    """
+    if not ENABLED:
+        return None
+    trace = _current_trace.get()
+    if trace is None:
+        return None
+
+    def record(granted_ns: int) -> None:
+        try:
+            if type(granted_ns) is not int:
+                return
+            with trace.lock:
+                if trace.finished or granted_ns < trace.start_ns:
+                    return
+                trace.milestones.setdefault("ADMISSION_GRANTED_MONOTONIC", granted_ns)
+        except BaseException:
+            # A diagnostic failure must not take or release a permit.
+            pass
+
+    return record
+
+
 def admission_acquired(ticket: _AdmissionTicket | None) -> None:
     if not ENABLED or ticket is None:
         return
