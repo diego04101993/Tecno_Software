@@ -1,4 +1,7 @@
 """SQL eligibility built before sorting, count, search and pagination."""
+from functools import lru_cache
+
+from app.core.player_diagnostics import observed
 from app.services.tenant_relations import (
     GLOBAL_ROLES, ROLES, conflict, model_class, model_spec, relation_spec, relations_for, validate_registry,
     COLLECTION_DEPENDENCIES,
@@ -345,26 +348,65 @@ def _is_canonical_projection(statement, cls):
         return False
 
 
+def _read_predicate_structure_witness():
+    """Immutable code/policy/binding facts only; never a database authority."""
+    from app.models import entities
+    from app.services import tenant_relations as registry
+
+    builders = (
+        "read_integrity_predicate", "_owner", "_branch", "_active", "_edge_predicate",
+        "_integrity", "_invalid_closure", "_is_canonical_projection",
+        "model_class", "model_spec", "relation_spec", "relations_for",
+    )
+    bindings = []
+    for spec in registry.MODEL_SPECS:
+        bound = getattr(entities, spec.name, None)
+        bindings.append((spec.name, id(bound), id(getattr(bound, "__table__", None)),
+                         tuple((column, id(getattr(bound, column, None))) for column in spec.columns)))
+    witness = (
+        tuple(registry.MODEL_SPECS), tuple(registry.RELATION_SPECS),
+        tuple(sorted(registry.MODELS.items())), tuple(sorted(registry.RELATIONS.items())),
+        tuple(COLLECTION_DEPENDENCIES), frozenset(GLOBAL_ROLES), frozenset(ROLES),
+        tuple(globals()[name] for name in builders), tuple(bindings),
+    )
+    hash(witness)
+    return witness
+
+
+@lru_cache(maxsize=128)
+def _shared_read_projection_expression(cls, profile, client_id, branch_id, witness):
+    """Reuse SQL construction; execute all ownership/media checks normally."""
+    return read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
+
+
 def _read_projection_predicate(statement, cls, db, profile, client_id, branch_id):
     cache = getattr(db, "info", {}).get("a9_read_predicates")
     from app.services.runtime_read import runtime_reads
     scope = runtime_reads(db)
     if scope is not None:
         cache = scope.predicates
-    # A response projection or runtime snapshot owns this cache. Only reuse
-    # integrity SQL for bare selects of the canonical table or its ID column.
-    # Actor authorization and statement-specific filters still run separately.
-    if (cache is not None and type(profile) is str and profile in ("READ", "RUNTIME")
+    # Preserve canonical-only reuse and every statement-specific fallback.
+    # This shares SQL expression structure, never eligibility or actor results.
+    if (type(profile) is str and profile in ("READ", "RUNTIME")
             and (client_id is None or type(client_id) is str)
             and (branch_id is None or type(branch_id) is str)
-            and _is_canonical_projection(statement, cls)):
+            and _is_canonical_projection(statement, cls)
+            and model_class(cls.__name__) is cls):
+        try:
+            witness = _read_predicate_structure_witness()
+        except (AttributeError, KeyError, TypeError):
+            return read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
         key = (cls, profile, client_id, branch_id)
-        if key not in cache:
-            cache[key] = read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
-        return cache[key]
+        if cache is not None:
+            if key not in cache:
+                cache[key] = _shared_read_projection_expression(
+                    cls, profile, client_id, branch_id, witness)
+            return cache[key]
+        return _shared_read_projection_expression(cls, profile, client_id, branch_id, witness)
     return read_integrity_predicate(cls, profile=profile, client_id=client_id, branch_id=branch_id)
 
 
+@observed("OWNERSHIP")
 def readable_query(statement, model, *, db=None, profile="READ", client_id=None, branch_id=None,
                    content_keys: set[tuple[str, str]] | None = None, exact_id: str | None = None):
     """Add integrity and opaque-media eligibility before SQL pagination.

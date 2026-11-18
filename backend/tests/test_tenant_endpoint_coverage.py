@@ -55,7 +55,8 @@ class A10CoverageGeneratorTests(TestCase):
         actual = {(r["METHOD"], r["PATH"], r["FUNCTION"].rsplit(".", 1)[-1])
                   for r in data["endpoints"]}
         self.assertEqual(actual, {(o.method, o.path, o.function) for o in OPERATIONS})
-        self.assertEqual(len(data["models"]), 40)
+        self.assertEqual(len(data["models"]), 41)
+        # Inbox scope IDs are historical evidence, not four additional live FKs.
         self.assertEqual(len(data["relations"]), 105)
         for relation in data["relations"]:
             self.assertEqual(relation["fingerprint"], relation["approved_fingerprint"])

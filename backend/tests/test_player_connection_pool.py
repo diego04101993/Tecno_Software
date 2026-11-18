@@ -1,7 +1,8 @@
 """Real HTTP lifecycle with a deliberately bounded, owned local PostgreSQL pool.
 
-No app startup, worker, migration or external database. The fixture creates
-only its own UUID schema in the explicitly verified disposable QA database.
+No app startup, videowall worker, migration or external database. The fixture
+creates only its own UUID schema in the explicitly verified disposable QA
+database and drains its playback consumer before global idle-pool assertions.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,7 @@ from unittest import IsolatedAsyncioTestCase, skipUnless
 from unittest.mock import patch
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
@@ -27,17 +28,17 @@ from app.services import media_references
 
 
 class PlayerActivityAdmissionTests(IsolatedAsyncioTestCase):
-    async def test_activity_shares_capacity_before_auth_and_time_remains_available(self):
+    async def test_expensive_four_and_durable_ingress_two_bound_auth_and_keep_time_available(self):
         app = FastAPI()
         app.include_router(player.router, prefix="/api/player")
         admitted = []
-        four_admitted = asyncio.Event()
+        budget_admitted = asyncio.Event()
         release = asyncio.Event()
 
-        async def pause_authentication():
-            admitted.append(None)
-            if len(admitted) == 4:
-                four_admitted.set()
+        async def pause_authentication(request: Request):
+            admitted.append(request.url.path)
+            if len(admitted) == 6:
+                budget_admitted.set()
             await release.wait()
             raise HTTPException(status_code=401, detail="Synthetic authentication rejection")
 
@@ -50,17 +51,24 @@ class PlayerActivityAdmissionTests(IsolatedAsyncioTestCase):
                     client.post("/api/player/heartbeat", json={"status": "online"}),
                     client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"}),
                 ])
+            # One extra request in each lane must wait before authentication.
+            requests.extend([
+                client.post("/api/player/heartbeat", json={"status": "online"}),
+                client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"}),
+            ])
             responses = asyncio.gather(*requests)
             try:
-                await asyncio.wait_for(four_admitted.wait(), timeout=3)
+                await asyncio.wait_for(budget_admitted.wait(), timeout=3)
                 time_response = await asyncio.wait_for(client.get("/api/player/time"), timeout=3)
                 self.assertEqual(time_response.status_code, 200)
-                self.assertEqual(len(admitted), 4, "Additional Player requests must wait before authentication")
+                self.assertEqual(admitted.count("/api/player/playback-events"), 2)
+                self.assertEqual(len(admitted) - admitted.count("/api/player/playback-events"), 4)
+                self.assertEqual(len(admitted), 6, "Both independent budgets must apply before authentication")
             finally:
                 release.set()
                 results = await asyncio.wait_for(responses, timeout=3)
-        self.assertEqual([response.status_code for response in results], [401] * 6)
-        self.assertEqual(len(admitted), 6, "Authentication failure must release capacity for waiting requests")
+        self.assertEqual([response.status_code for response in results], [401] * 8)
+        self.assertEqual(len(admitted), 8, "Authentication failure must release capacity for waiting requests")
 
 
 @skipUnless(os.environ.get("SECURITY_R5_TEST_DATABASE_URL"), "Owned local PostgreSQL QA required")
@@ -133,9 +141,20 @@ class PlayerConnectionPoolTests(GateFixture):
             "started_at": datetime.now(UTC).isoformat(), "status": "completed"})
 
     def assert_pool_returned(self):
+        from app.services.playback_inbox import stop_worker
+        # All individual/joined HTTP calls have completed at this boundary.
+        # The durable consumer may still own a legitimate short idle poll.
+        self.http.portal.call(stop_worker, self.http.app, self.engine)
         self.assertEqual(self.engine.pool.checkedout(), 0)
         self.assertEqual(self.checked_out, 0)
         self.assertEqual(self.pool_events["checkout"], self.pool_events["checkin"])
+
+    def test_idle_boundary_still_detects_an_unreturned_non_consumer_connection(self):
+        self.assert_pool_returned()
+        with self.engine.connect():
+            with self.assertRaises(AssertionError):
+                self.assert_pool_returned()
+        self.assert_pool_returned()
 
     def test_runtime_with_authentication_needs_only_one_checkout_at_a_time(self):
         response = self.call("runtime")

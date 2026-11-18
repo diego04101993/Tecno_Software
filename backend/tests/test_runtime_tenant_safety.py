@@ -7,9 +7,15 @@ from test_tenant_isolation import TenantFixture, HistoricalRelationFixture, Loca
 import os
 from unittest import skipUnless
 from app.models.entities import *
+from player_event_fixture import install_legacy_player_settlement
 
 
 class RuntimeTenantTests(TenantFixture):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(self.http)
+        install_legacy_player_settlement(self, self.http, self.engine)
+
     def runtime(self):
         response = self.request("GET", "/api/player/runtime-config", who="player_A")
         self.assertEqual(response.status_code, 200, response.text)

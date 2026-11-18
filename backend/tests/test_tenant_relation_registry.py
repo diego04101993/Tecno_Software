@@ -101,7 +101,7 @@ class TenantRelationRegistryTests(TestCase):
                     registry.validate_registry()
 
     def test_exact_catalog_and_all_operation_policies(self):
-        self.assertEqual(len(registry.MODEL_SPECS), 40)
+        self.assertEqual(len(registry.MODEL_SPECS), 41)
         self.assertEqual(len(registry.RELATION_SPECS), 105)
         self.assertTrue(registry.validate_registry())
         self.assertEqual(sum(e.on_delete == "CASCADE" for e in registry.RELATION_SPECS), 67)
@@ -123,6 +123,14 @@ class TenantRelationRegistryTests(TestCase):
 
     def test_all_model_owner_paths_reach_client_without_cycles(self):
         for model in registry.MODEL_SPECS:
+            if model.name == "PlayerPlaybackInbox":
+                # Private historical attribution has no live owner/context FK;
+                # all other authoritative model paths still reach Client.
+                self.assertEqual((model.owner_field, model.owner_target, model.owner_kind, model.branch_policy),
+                                 ("client_id", "Client", "direct-owner", "FIELD"))
+                self.assertEqual(model.orm_relationships, ())
+                self.assertEqual(registry.relations_for(model.name), ())
+                continue
             visited = set()
             while model.owner_kind != "root":
                 self.assertNotIn(model.name, visited)

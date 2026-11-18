@@ -1,5 +1,5 @@
-import asyncio
 import hashlib
+import logging
 import secrets
 from uuid import uuid4
 
@@ -14,6 +14,10 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_player_device, get_db
 from app.core.public_urls import build_public_base_url
+from app.core.player_diagnostics import (
+    admission_acquired, admission_released, admission_wait_start, observed,
+)
+from app.core.player_admission import player_activity, playback_worker_activity
 from app.models.entities import (
     Campaign,
     Channel,
@@ -40,18 +44,19 @@ from app.services.player_runtime import build_player_runtime_from_snapshot, buil
 router = APIRouter()
 
 
-# A single backend process runs the synchronous Player work. Admit it before
-# authentication acquires a connection so concurrent polling/telemetry can
-# leave capacity for administrative reads and the API's health checks.
+# The expensive budget remains four. Playback acceptance uses its own small
+# durable-ingress lane; its later materializer shares the expensive budget.
 _PLAYER_ACTIVITY_SLOTS = 4
 
 
 async def _admit_player_activity(request: Request):
-    slots = getattr(request.app.state, "player_activity_slots", None)
-    if slots is None:
-        slots = request.app.state.player_activity_slots = asyncio.Semaphore(_PLAYER_ACTIVITY_SLOTS)
-    async with slots:
-        yield
+    ticket = admission_wait_start()
+    try:
+        async with player_activity(request):
+            admission_acquired(ticket)
+            yield
+    finally:
+        admission_released(ticket)
 
 
 def _generate_player_token() -> str:
@@ -195,6 +200,7 @@ def _activate_player(payload: PlayerActivationRequest, db: Session) -> PlayerAct
 
 
 @router.get("/runtime-config", dependencies=[Depends(_admit_player_activity)])
+@observed("HANDLER")
 def get_runtime_config(
     request: Request,
     player_device: PlayerDevice = Depends(get_current_player_device),
@@ -217,6 +223,7 @@ def get_runtime_config(
 
 
 @router.post("/heartbeat", response_model=PlayerHeartbeatAck, dependencies=[Depends(_admit_player_activity)])
+@observed("HANDLER")
 def create_player_heartbeat(
     payload: PlayerHeartbeatCreate,
     player_device: PlayerDevice = Depends(get_current_player_device),
@@ -294,14 +301,48 @@ def create_player_heartbeat(
 
 @router.post("/playback-events", response_model=PlayerPlaybackEventAck, status_code=status.HTTP_201_CREATED,
              dependencies=[Depends(_admit_player_activity)])
+@observed("HANDLER")
 def create_player_playback_event(
     payload: PlayerPlaybackEventCreate,
+    request: Request,
     player_device: PlayerDevice = Depends(get_current_player_device),
     db: Session = Depends(get_db),
+) -> PlayerPlaybackEventAck:
+    from anyio import from_thread
+    from app.services.playback_inbox import enqueue, ensure_worker
+
+    channel = db.get(Channel, player_device.channel_id)
+    if not channel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    acknowledgment = enqueue(db, player_device, channel, payload)
+    engine = db.get_bind()
+    application = request.app
+    # Do not propagate this HTTP diagnostic ContextVar into the consumer. Its
+    # Session and transaction are independently owned inside the service.
+    try:
+        from_thread.run_sync(lambda: ensure_worker(
+            application, engine, _record_player_playback_event,
+            activity=lambda: playback_worker_activity(application)))
+    except RuntimeError:
+        # The event is already durable. A consumer wake is not its acceptance
+        # boundary; startup/health recovery can resume it without a new POST.
+        logging.getLogger(__name__).warning("PLAYBACK_INBOX_WAKE_DEFERRED")
+    return acknowledgment
+
+
+def _record_player_playback_event(
+    payload: PlayerPlaybackEventCreate,
+    player_device: PlayerDevice,
+    db: Session,
+    *,
+    event_id: str | None = None,
+    recorded_at: datetime | None = None,
+    before_commit=None,
 ) -> PlayerPlaybackEventAck:
     channel = db.get(Channel, player_device.channel_id)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    receipt_channel_id = channel.id
 
     payload = _sanitize_telemetry(payload, db, channel.client_id)
     values = dict(
@@ -318,14 +359,22 @@ def create_player_playback_event(
         status=payload.status,
         metadata_json=payload.metadata_json,
     )
-    ref = RowRef("PlayerPlaybackEvent", str(uuid4()))
+    ref = RowRef("PlayerPlaybackEvent", event_id or str(uuid4()))
     intents = (MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), ()),
                MutationIntent("CREATE", ref, tuple(values.items())))
     with player_write_guard(db, channel=channel, player_device=player_device,
-                            operation="create_player_playback_event", intents=intents):
+                            operation="create_player_playback_event", intents=intents,
+                            receipt_processing=before_commit is not None) as plan:
+        if before_commit is not None:
+            before_commit(plan)
         event = PlayerPlaybackEvent(id=ref.identity, **values)
+        if recorded_at is not None:
+            event.created_at = recorded_at
         db.add(event)
         db.commit()
-        db.refresh(event)
+        if recorded_at is None:
+            db.refresh(event)
 
-    return PlayerPlaybackEventAck(event_id=event.id, recorded_at=event.created_at, channel_id=channel.id)
+    return PlayerPlaybackEventAck(event_id=ref.identity,
+        recorded_at=recorded_at if recorded_at is not None else event.created_at,
+        channel_id=receipt_channel_id)

@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
+from app.core.player_diagnostics import observed
 from app.models.base import Base
 from app.models.entities import Client, ContentItem, Dataset, DatasetImport
 from app.services.media_storage import MediaPathError, StoredUpload, resolve_stored_media_path, validate_media_file
@@ -374,6 +375,7 @@ def _local_url(value: str) -> str | None:
     return None
 
 
+@observed("MEDIA_VALIDATION")
 def media_reference_owners(db: Session, root: Path, *, strict: bool = False) -> dict[Path, set[str | None]]:
     """Only persisted typed references establish ownership; free JSON never does."""
     references = defaultdict(set)
@@ -434,6 +436,7 @@ def media_protected_paths(db: Session, root: Path) -> set[Path]:
     return paths
 
 
+@observed("MEDIA_VALIDATION")
 def media_owned_by(db: Session, root: Path, path: Path, client_id: str,
                    references: dict[Path, set[str | None]] | None = None) -> bool:
     phase = db.info.get(_OWNERSHIP_VALIDATION_PHASE)
@@ -450,6 +453,7 @@ def media_owned_by(db: Session, root: Path, path: Path, client_id: str,
     return owners == {client_id}
 
 
+@observed("MEDIA_VALIDATION")
 def content_file_owned(db: Session, content: ContentItem) -> bool:
     if content.file_path is None:
         return True
@@ -1394,6 +1398,7 @@ def _remember_runtime_content_media(db, scope, row, root, references) -> bool:
     return allowed
 
 
+@observed("MEDIA_VALIDATION")
 def readable_media_ids(db: Session, model_name: str, *,
                        content_keys: set[tuple[str, str]] | None = None) -> list[str]:
     """Authoritative media ownership allowlist, built before a response query.
@@ -1444,6 +1449,7 @@ def readable_media_ids(db: Session, model_name: str, *,
     return [row[0] for row in rows if _readable_media_row(db, model_name, row, root, references)]
 
 
+@observed("MEDIA_VALIDATION")
 def read_payload_media_decision(db: Session, client_id: str, value, *, context=None, references=None):
     """Terminal aggregate result: any uncertain/foreign candidate rejects all."""
     from urllib.parse import quote
@@ -1476,6 +1482,7 @@ def read_payload_media_owned(db: Session, client_id: str, value, *, context=None
         MediaReadDecision.SAFE_EXTERNAL, MediaReadDecision.SAFE_LOCAL_OWNED}
 
 
+@observed("MEDIA_VALIDATION")
 def readable_payload_ids(db: Session, model_name: str, fields, *, exact_id: str | None = None) -> list[str]:
     """Complete opaque-field media allowlist, applied in SQL before pagination.
 

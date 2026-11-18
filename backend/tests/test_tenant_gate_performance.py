@@ -37,6 +37,7 @@ from app.services import tenant_mutations as mutations
 from app.services.auth_rate_limit import AuthRateLimiter, AuthRateLimitMiddleware
 from app.services.media_storage import MediaPathError, resolve_stored_media_path
 from app.services.tenant_ownership import RowRef, TenantGraph, context_for_actor, freeze
+from player_event_fixture import install_legacy_player_settlement
 
 
 R4_GATE_OBSERVATIONS = []
@@ -45,6 +46,9 @@ R4_GATE_OBSERVATIONS = []
 class GateFixture(unittest.TestCase):
     """No server startup; every test owns a fresh DB/schema and media directory."""
     password = "R4-Synthetic-Only!42"
+    # Legacy data/security assertions inspect materialized state. New durable
+    # acceptance and latency tests explicitly opt out of post-response settling.
+    legacy_playback_settlement = True
 
     @classmethod
     def setUpClass(cls):
@@ -117,6 +121,7 @@ class GateFixture(unittest.TestCase):
                 yield db
         app.dependency_overrides[get_db] = database
         self.http = self.enterContext(TestClient(app, raise_server_exceptions=False))
+        install_legacy_player_settlement(self, self.http, self.engine)
 
     @contextmanager
     def locked_phase(self, db=None, paths=None):

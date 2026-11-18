@@ -6,6 +6,7 @@ metadata describes effects; it is never used as a reflective mutation executor.
 from dataclasses import dataclass
 from hashlib import sha256
 from types import MappingProxyType
+from app.core.player_diagnostics import observed
 
 from app.services.tenant_relations import (
     OPERATIONS, RELATION_SPECS, conflict, model_class, model_spec,
@@ -346,7 +347,7 @@ def _semantics(graph, ref, context, adapters):
     row = graph.snapshot(ref)
     # Scalar credentials/labels are not ownership-bearing media references.
     exempt = {"password_hash", "player_token_hash", "source_filename", "sample_value", "fallback_value"}
-    present = (ref.model in {"VideowallPublication", "VideowallPublicationAsset", "VideowallPlaybackGroup", "VideowallPlaybackGroupMember"}
+    present = (ref.model in {"VideowallPublication", "VideowallPublicationAsset", "VideowallPlaybackGroup", "VideowallPlaybackGroupMember", "PlayerPlaybackInbox"}
                or any(row.get(k) for k in model_spec(ref.model).opaque_fields if k not in exempt))
     if present:
         adapter = next((a for a in adapters if a.model == ref.model), None)
@@ -474,6 +475,14 @@ def _build_proposal(graph, ref, patch, context, operation, *, create=False, adap
     ref = graph.reference(ref)
     if ref.model not in _write_models(graph, operation):
         raise conflict()
+    if ref.model == "PlayerPlaybackInbox" and (
+            not create or not isinstance(graph, _WriteGraph)
+            or type(context) is not _PlayerWriteScope or context is not graph.player_scope
+            or operation.function != "create_player_playback_event"):
+        # Receipts enter only through authenticated Player activity. Their
+        # immutable payload/scope is not an administrative mutation surface;
+        # locked worker bookkeeping has its separate private implementation.
+        raise conflict()
     current = graph.snapshot(ref)
     if create:
         if current is not None or (operation.method != "POST" and not isinstance(graph, _WriteGraph)):
@@ -503,6 +512,7 @@ def validate_proposed_state(graph, ref, patch, context, operation, *, create=Fal
     return proposal
 
 
+@observed("OWNERSHIP")
 def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=()):
     from sqlalchemy import select
     if not isinstance(gate, MutationGate) or not gate.active:
@@ -684,10 +694,11 @@ class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
             dialect = self.session.get_bind().dialect.name
             locked = self.locking and dialect == "postgresql"
             if locked:
+                nowait = getattr(self, "_nonblocking_parent_locks", False)
                 if self._row_lock_mode(ref) == "share":
-                    statement = statement.with_for_update(read=True)
+                    statement = statement.with_for_update(read=True, nowait=nowait)
                 else:
-                    statement = statement.with_for_update()
+                    statement = statement.with_for_update(nowait=nowait)
             with self.session.no_autoflush:
                 value = self.session.execute(statement).mappings().one_or_none()
             self.snapshots[ref] = freeze(dict(value)) if value is not None else None
@@ -858,10 +869,14 @@ def _player_telemetry_shape(channel, device, operation, intents):
     from datetime import datetime
     if device is None or type(intents) is not tuple:
         return False
+    playback_creates = tuple(i.reference.model for i in intents
+                             if isinstance(i, MutationIntent) and i.action == "CREATE")
+    playback_history = ("PlayerPlaybackInbox" if playback_creates == ("PlayerPlaybackInbox",)
+                        else "PlayerPlaybackEvent")
     expected = {
         "create_player_heartbeat": ("PlayerHeartbeat", {"status", "last_ping_at", "current_playback"},
                                     {"last_seen_at", "app_version"}),
-        "create_player_playback_event": ("PlayerPlaybackEvent", None, set()),
+        "create_player_playback_event": (playback_history, None, set()),
         "get_runtime_config": (None, None, {"last_seen_at"}),
     }.get(operation)
     if expected is None or any(not isinstance(i, MutationIntent) for i in intents):
@@ -886,6 +901,17 @@ def _player_telemetry_shape(channel, device, operation, intents):
         elif intent.action == "CREATE" and intent.reference.model == history:
             if not set(values) <= (set(model_spec(history).columns) - {"id", "created_at", "updated_at"}):
                 return False
+            if history == "PlayerPlaybackInbox":
+                from collections.abc import Mapping
+                required = {"player_device_id", "channel_id", "client_id", "branch_id", "payload_json",
+                            "payload_bytes", "accepted_at", "status", "attempts", "available_at", "last_error_code"}
+                if (set(values) != required or not isinstance(values["payload_json"], Mapping)
+                        or type(values["payload_bytes"]) is not int or values["payload_bytes"] <= 0
+                        or values["status"] != "PENDING" or type(values["attempts"]) is not int
+                        or values["attempts"] != 0 or values["last_error_code"] is not None
+                        or not isinstance(values["accepted_at"], datetime)
+                        or not isinstance(values["available_at"], datetime)):
+                    return False
             if any(values.get(key) != value for key, value in (
                     ("player_device_id", device.id), ("channel_id", channel.id),
                     ("client_id", channel.client_id), ("branch_id", channel.branch_id))):
@@ -919,7 +945,7 @@ def _monotonic_player_activity(graph, intents):
 
 
 @contextmanager
-def player_write_guard(db, *, channel, player_device, operation, intents):
+def player_write_guard(db, *, channel, player_device, operation, intents, receipt_processing=False):
     """Relationship proof for the already authenticated Player/code entrypoints.
 
     Never constructs a User or accepts actor/tenant identity from HTTP payloads.
@@ -938,7 +964,7 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
     models = {
         "activate_player": {"Channel", "PlayerDevice"},
         "create_player_heartbeat": {"Channel", "PlayerDevice", "PlayerHeartbeat"},
-        "create_player_playback_event": {"PlayerDevice", "PlayerPlaybackEvent"},
+        "create_player_playback_event": {"PlayerDevice", "PlayerPlaybackEvent", "PlayerPlaybackInbox"},
         "get_runtime_config": {"PlayerDevice"},
     }
     if operation not in models or any(i.reference.model not in models[operation] for i in intents):
@@ -953,12 +979,26 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
                 or player_device.branch_id != channel.branch_id or not player_device.is_active):
             raise conflict()
     telemetry = _player_telemetry_shape(channel, player_device, operation, intents)
+    if operation == "create_player_playback_event" and not telemetry:
+        # This private operation accepts one event OR one durable receipt, never
+        # a mixed batch or an incidental structural/device update.
+        raise conflict()
+    if type(receipt_processing) is not bool or (receipt_processing and operation != "create_player_playback_event"):
+        raise conflict()
     exclusive = {RowRef("PlayerDevice", player_device.id)} if telemetry else set()
     if telemetry and operation == "create_player_heartbeat":
         exclusive.add(RowRef("Channel", channel.id))
     graph = _PlayerTelemetryGraph(db, exclusive) if telemetry else _WriteGraph(db)
     context = _PlayerWriteScope(channel.client_id, channel.branch_id)
     graph.player_scope = context
+    if telemetry and operation == "create_player_playback_event":
+        creates_receipt = any(i.action == "CREATE" and i.reference.model == "PlayerPlaybackInbox" for i in intents)
+        graph._receipt_scope = (player_device.id, channel.id, context.client_id, context.branch_id) if creates_receipt else None
+        # BLUE has no tenant barrier and may lock Device->Channel while GREEN
+        # locks Channel->Device. Never wait while holding the other half of that
+        # cycle. Receipt ingress retries only this narrow pre-COMMIT conflict;
+        # the consumer uses its existing bounded retry policy.
+        graph._nonblocking_parent_locks = creates_receipt or receipt_processing
     spec = next(o for o in OPERATIONS if o.function == operation)
     prepared = _prepared_row_versions(db, intents)
     if telemetry:
@@ -1031,9 +1071,87 @@ def player_write_guard(db, *, channel, player_device, operation, intents):
             raise
         db.rollback()
         if telemetry and getattr(exc.orig, "sqlstate", None) == "55P03":
+            if getattr(graph, "_nonblocking_parent_locks", False):
+                raise PlayerPlaybackReceiptBusy() from exc
             from fastapi import HTTPException
             raise HTTPException(status_code=503, detail="Player operation temporarily unavailable") from exc
         raise conflict() from exc
+
+
+class PlayerPlaybackReceiptUnavailable(RuntimeError):
+    """Another transaction consumed/locked the receipt; never a validation failure."""
+
+
+class PlayerPlaybackReceiptBusy(RuntimeError):
+    """A live scope row was locked; retry only before receipt acceptance COMMIT."""
+
+
+@dataclass
+class _PlayerPlaybackReceiptScope:
+    session: object
+    transaction: object
+    plan: object
+    receipt: object
+    snapshot: object
+    active: bool = True
+
+
+@contextmanager
+def locked_player_playback_receipt(db, *, plan, receipt_id, channel, player_device):
+    """Authorize exactly one internal receipt consumption in the event commit.
+
+    The event guard acquires Device/parent locks first. No worker may claim an
+    inbox row before entering that guard: reversing this order can deadlock an
+    enqueue which is discovering the same bounded inbox dependencies.
+    """
+    from sqlalchemy import inspect, select
+    from app.models.entities import PlayerPlaybackInbox
+
+    key = "player_playback_receipt_consumption"
+    gate = plan._gate if type(plan) is MutationPlan else None
+    if (gate is None or type(gate) is not _PlayerTelemetryGate or gate.graph.session is not db
+            or plan.operation.function != "create_player_playback_event"
+            or type(plan.context) is not _PlayerWriteScope or db.info.get(key) is not None):
+        raise conflict()
+    plan.assert_usable(gate, plan.context)
+    creates = tuple(i for i in plan.intents if i.action == "CREATE")
+    updates = tuple(i for i in plan.intents if i.action == "UPDATE")
+    if (type(receipt_id) is not str or len(creates) != 1 or len(updates) != 1
+            or creates[0].reference != RowRef("PlayerPlaybackEvent", receipt_id)
+            or updates[0].reference != RowRef("PlayerDevice", player_device.id) or updates[0].patch):
+        raise conflict()
+    expected = (player_device.id, channel.id, plan.context.client_id, plan.context.branch_id)
+    proposed = dict(creates[0].patch)
+    if tuple(proposed.get(field) for field in ("player_device_id", "channel_id", "client_id", "branch_id")) != expected:
+        raise conflict()
+    with db.no_autoflush:
+        receipt = db.scalar(select(PlayerPlaybackInbox).where(PlayerPlaybackInbox.id == receipt_id)
+                            .with_for_update(skip_locked=True).execution_options(populate_existing=True))
+    if receipt is None:
+        raise PlayerPlaybackReceiptUnavailable()
+    actual = tuple(getattr(receipt, field) for field in ("player_device_id", "channel_id", "client_id", "branch_id"))
+    if actual != expected:
+        raise conflict()
+    if receipt.status != "PENDING":
+        raise PlayerPlaybackReceiptUnavailable()
+    columns = model_spec("PlayerPlaybackInbox").columns
+    snapshot = freeze({field: getattr(receipt, field) for field in columns})
+    scope = _PlayerPlaybackReceiptScope(db, db.get_transaction(), plan, receipt, snapshot)
+    db.info[key] = scope
+    try:
+        yield receipt
+        state = inspect(receipt)
+        if (db.info.get(key) is not scope or not scope.active or scope.session is not db
+                or db.get_transaction() is not scope.transaction or not gate.active
+                or gate.transaction is not scope.transaction or plan._gate_token is not gate.token
+                or state.session is not db or db.new or db.dirty
+                or len(db.deleted) != 1 or receipt not in db.deleted
+                or freeze({field: getattr(receipt, field) for field in columns}) != snapshot):
+            raise conflict()
+    finally:
+        scope.active = False
+        if db.info.get(key) is scope:
+            db.info.pop(key, None)
 
 
 class _WriteGraph(_DeleteGraph):
@@ -1116,8 +1234,23 @@ def _write_semantics(graph, ref, context, row):
     # These models' scalar/telemetry values never carry media ownership. Their
     # owner/context checks remain in the complete preflight outside this helper;
     # resolving an owner here used to compute an unused result before True.
+    if ref.model == "PlayerPlaybackInbox":
+        base = graph._persisted if isinstance(graph, _ProposedGraph) else graph
+        expected = getattr(base, "_receipt_scope", None)
+        # Historical strings cannot grant ownership. Only this live authenticated
+        # activity guard may capture them, after all four parents were locked and
+        # freshly validated. Both proposal passes check the exact same binding.
+        if (type(base) is not _PlayerTelemetryGraph or context is not base.player_scope
+                or expected is None
+                or tuple(row.get(k) for k in ("player_device_id", "channel_id", "client_id", "branch_id")) != expected):
+            return False
+        device = graph.snapshot(RowRef("PlayerDevice", expected[0]))
+        channel = graph.snapshot(RowRef("Channel", expected[1]))
+        return (device is not None and channel is not None
+                and tuple(device.get(k) for k in ("id", "channel_id", "client_id", "branch_id")) == expected
+                and tuple(channel.get(k) for k in ("id", "client_id", "branch_id")) == expected[1:])
     if ref.model in {"Channel", "DataSource", "DatasetColumn", "DatasetRow",
-                     "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "User"}:
+                     "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "PlayerPlaybackInbox", "User"}:
         return True
     from collections.abc import Mapping
     from sqlalchemy import select
@@ -1236,7 +1369,7 @@ def _write_semantics(graph, ref, context, row):
     # These values are settings, telemetry, scalar credentials or tabular data;
     # none is interpreted as a resource owner or an executable relationship.
     return ref.model in {"Channel", "DataSource", "DatasetColumn", "DatasetRow",
-                         "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "User"}
+                         "PlayerDevice", "PlayerHeartbeat", "PlayerPlaybackEvent", "PlayerPlaybackInbox", "User"}
 
 
 _TELEMETRY_WRITE_SEMANTICS = _write_semantics
@@ -1245,7 +1378,7 @@ _TELEMETRY_WRITE_SEMANTICS = _write_semantics
 def _write_adapters():
     from app.services.tenant_relations import MODEL_SPECS
     return tuple(SemanticAdapter(spec.name, _write_semantics) for spec in MODEL_SPECS
-                 if spec.opaque_fields or spec.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"})
+                 if spec.opaque_fields or spec.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember", "PlayerPlaybackInbox"})
 
 
 class _GlobalWriteGate(MutationGate):
@@ -1278,6 +1411,10 @@ def _delete_semantics(graph, ref, context, row):
     and are separately ownership checked by the post-commit media protocol.
     A legacy screen action is the one non-FK relational target used by handlers.
     """
+    if ref.model == "PlayerPlaybackInbox":
+        # An acknowledged PENDING/FAILED receipt must survive generic parent
+        # deletion. Only the typed internal consumption above may remove it.
+        return False
     if ref.model == "KioskButton" and row.get("action_type") == "switch_screen":
         value = row.get("action_value")
         if value:
@@ -1297,7 +1434,7 @@ _TELEMETRY_DELETE_SEMANTICS = _delete_semantics
 def _delete_adapters():
     from app.services.tenant_relations import MODEL_SPECS
     return tuple(SemanticAdapter(s.name, _delete_semantics) for s in MODEL_SPECS
-                 if s.opaque_fields or s.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember"})
+                 if s.opaque_fields or s.name in {"VideowallPlaybackGroup", "VideowallPlaybackGroupMember", "PlayerPlaybackInbox"})
 
 
 def _effect_roots(graph, roots, operation):

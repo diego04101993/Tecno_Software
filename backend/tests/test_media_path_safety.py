@@ -24,6 +24,7 @@ from app.models.base import Base
 from app.models.entities import Branch, Campaign, Channel, Client, ContentFolder, ContentItem, ContentType, DataSource, DataSourceType, Dataset, DatasetImport, User, UserRole
 from app.services.content_cleanup import cleanup_files, delete_content_items
 from app.services.player_runtime import serialize_content
+from player_event_fixture import install_legacy_player_settlement
 
 
 class MediaPathSafetyTests(TestCase):
@@ -83,8 +84,8 @@ class MediaPathSafetyTests(TestCase):
             return db.get(User, fixture_user_ids[self.user.client_id])
 
         app.dependency_overrides[get_current_user] = fixture_user
-        self.http = TestClient(app)
-        self.addCleanup(self.http.close)
+        self.http = self.enterContext(TestClient(app))
+        install_legacy_player_settlement(self, self.http, self.engine)
 
     def upload(self, filename="clip.mp4", data=b"complete media bytes"):
         return self.http.post("/api/contents/upload", data={"name": "Visible name"},

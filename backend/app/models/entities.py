@@ -2,7 +2,7 @@ from datetime import date, datetime, time
 from enum import Enum
 import secrets
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, Enum as SqlEnum, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
@@ -1096,6 +1096,36 @@ class PlayerPlaybackEvent(UUIDMixin, TimestampMixin, Base):
     campaign: Mapped[Campaign | None] = relationship()
     layout: Mapped[Layout | None] = relationship()
 
+
+class PlayerPlaybackInbox(UUIDMixin, Base):
+    """Private durable evidence, independent of the lifetime of business rows.
+
+    These immutable IDs are captured from freshly locked authenticated scope at
+    acceptance. They are historical values, not live FK/ORM ownership evidence.
+    """
+    __tablename__ = "player_playback_inbox"
+    __table_args__ = (
+        CheckConstraint("status IN ('PENDING', 'FAILED')", name="ck_player_playback_inbox_status"),
+        CheckConstraint("payload_bytes > 0", name="ck_player_playback_inbox_payload_bytes"),
+        CheckConstraint("attempts >= 0", name="ck_player_playback_inbox_attempts"),
+        Index("ix_player_playback_inbox_available", "status", "available_at", "accepted_at", "id"),
+        Index("ix_player_playback_inbox_player_device_id", "player_device_id"),
+        Index("ix_player_playback_inbox_channel_id", "channel_id"),
+        Index("ix_player_playback_inbox_client_id", "client_id"),
+        Index("ix_player_playback_inbox_branch_id", "branch_id"),
+    )
+
+    player_device_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    branch_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    payload_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    status: Mapped[str] = mapped_column(String(8), nullable=False, default="PENDING", server_default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
 
 class TouchLocation(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "touch_locations"

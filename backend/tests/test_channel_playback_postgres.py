@@ -106,8 +106,8 @@ class ChannelPlaybackPostgresTests(TenantFixture):
     def test_large_full_http_route_is_readonly_constant_and_returns_every_connection(self):
         rows = int(os.environ['CHANNEL_PLAYBACK_QA_ROWS'])
         self.assertLessEqual(rows, 4_000_000)
-        self.assertEqual(len(Base.metadata.tables), 40)
-        self.assertEqual(sum(len(table.columns) for table in Base.metadata.tables.values()), 505)
+        self.assertEqual(len(Base.metadata.tables), 41)
+        self.assertEqual(sum(len(table.columns) for table in Base.metadata.tables.values()), 517)
         side = self.res['A']
         channels = [side['channel']]
         players = [side['player']]
@@ -183,7 +183,7 @@ class ChannelPlaybackPostgresTests(TenantFixture):
         self.assertEqual(readonly, ['on'] * 3)
         self.assertEqual(writes, [])
         self.assertLess(max(samples), 3.0, 'Full route budget; SQL timeout remains 3000ms')
-        report = {'rows': rows, 'visible_channels': 19, 'tables': 40, 'columns': 505,
+        report = {'rows': rows, 'visible_channels': 19, 'tables': 41, 'columns': 517,
                   'sql_statement_timeout_ms': 3000, 'route_seconds': samples,
                   'median_seconds': median(samples), 'worst_seconds': max(samples),
                   'heartbeat_queries_per_request': 1, 'transaction_read_only': readonly,

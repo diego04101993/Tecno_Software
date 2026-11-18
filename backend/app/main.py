@@ -6,7 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import media
 from app.api.router import api_router
 from app.core.config import get_settings, validate_rate_limit_process_configuration
-from app.core.database import SessionLocal, init_db
+from app.core.database import SessionLocal, engine, init_db
+from app.core.player_diagnostics import install as install_player_diagnostics
+from app.core.player_admission import admissions, playback_worker_activity, PlaybackRecoveryMiddleware
+from app.services.playback_inbox import ensure_worker, stop_worker
+from app.api.routes.player import _record_player_playback_event
 from app.core.security_logging import install_security_log_redaction
 from app.services.seed import seed_initial_data
 from app.services.auth_rate_limit import AuthRateLimiter, AuthRateLimitMiddleware
@@ -26,7 +30,10 @@ async def lifespan(_: FastAPI):
             seed_initial_data(db)
         finally:
             db.close()
-    yield
+    try:
+        yield
+    finally:
+        await stop_worker(app, engine)
 
 
 app = FastAPI(
@@ -49,6 +56,9 @@ app.add_middleware(
 
 app.include_router(media.router)
 app.include_router(api_router, prefix=settings.API_PREFIX)
+app.add_middleware(PlaybackRecoveryMiddleware, start=lambda: ensure_worker(
+    app, engine, _record_player_playback_event, activity=lambda: playback_worker_activity(app)))
+install_player_diagnostics(app, engine, admission_snapshot=lambda: admissions(app).snapshot())
 
 
 @app.get("/")

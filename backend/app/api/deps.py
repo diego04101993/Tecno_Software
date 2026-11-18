@@ -5,6 +5,7 @@ from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
+from app.core.player_diagnostics import observed
 from app.core.security import decode_access_token
 from app.models.entities import Channel, PlayerDevice, User, UserRole
 from app.services.tenancy import require_active_channel_tenant, validate_authenticated_tenant_state
@@ -48,6 +49,7 @@ def get_tenant_operation_context(
     return tenant_operation_context(db, current_user)
 
 
+@observed("AUTH")
 def get_current_player_device(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
