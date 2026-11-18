@@ -104,6 +104,16 @@ def comparison_host_config(raw):
     return result
 
 
+def effective_comparison_host_config(raw):
+    """Compare OOM-killer defaults without changing historical identity hashes."""
+    require(type(raw) is dict, "INVALID_HOSTCONFIG")
+    result = comparison_host_config(raw)
+    value = raw.get("OomKillDisable")
+    require(value is None or type(value) is bool, "INVALID_OOM_KILL_DISABLE")
+    result["OomKillDisable"] = False if value is None else value
+    return result
+
+
 def live_identity(item, image, network, peers, binding, role, slot, argv, ticks,
                   frontend_config_hash=None, raw_argv=None, network_namespace=None, *, legacy_compose=None,
                   allow_restarted=False, legacy_frontend_proof=None, legacy_frontend_policy=R3_POLICY):
