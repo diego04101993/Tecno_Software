@@ -99,6 +99,20 @@ def _sanitize_telemetry(payload, db: Session, client_id: str, prefix: str = ""):
     return payload.model_copy(update=updates)
 
 
+def _sanitize_heartbeat_telemetry(payload, db: Session, client_id: str):
+    if db.get_bind().dialect.name != "postgresql":
+        return _sanitize_telemetry(payload, db, client_id, "current_")
+    from app.services.db_snapshots import readonly_snapshot_session
+    from app.services.runtime_read import runtime_read_scope
+
+    # Share only these optional read projections in one consistent snapshot.
+    # Close it before the write guard obtains fresh, locked ownership proofs;
+    # no read eligibility or media authority can escape onto the writer Session.
+    with readonly_snapshot_session(db) as snapshot:
+        with runtime_read_scope(snapshot):
+            return _sanitize_telemetry(payload, snapshot, client_id, "current_")
+
+
 def _resolve_playback_label(
     db: Session,
     *,
@@ -234,7 +248,20 @@ def create_player_heartbeat(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
 
     current_time = datetime.now(UTC)
-    payload = _sanitize_telemetry(payload, db, channel.client_id, "current_")
+    postgres = db.get_bind().dialect.name == "postgresql"
+    if postgres:
+        # The read snapshot releases the source transaction and expires ORM facts.
+        # Preserve the identity actually authenticated, never rebase a revoked
+        # token or moved channel/device onto identities loaded after that read.
+        device_identity_fields = ("id", "client_id", "branch_id", "channel_id", "player_token_hash", "is_active")
+        channel_identity_fields = ("id", "client_id", "branch_id", "channel_code")
+        authenticated_device = tuple(getattr(player_device, key) for key in device_identity_fields)
+        authenticated_channel = tuple(getattr(channel, key) for key in channel_identity_fields)
+    payload = _sanitize_heartbeat_telemetry(payload, db, channel.client_id)
+    if postgres and (
+            tuple(getattr(player_device, key) for key in device_identity_fields) != authenticated_device
+            or tuple(getattr(channel, key) for key in channel_identity_fields) != authenticated_channel):
+        raise conflict()
     normalized_status = payload.status.lower()
     try:
         channel_status = ChannelConnectionStatus(normalized_status)
@@ -294,8 +321,14 @@ def create_player_heartbeat(
         heartbeat = PlayerHeartbeat(id=ref.identity, **values)
         db.add_all([channel, player_device, heartbeat])
         db.commit()
-        db.refresh(heartbeat)
+        if not postgres:
+            db.refresh(heartbeat)
 
+    if postgres:
+        # Both ACK scalars were explicitly persisted above. Avoid reopening a
+        # transaction to refresh the row after the durable COMMIT. SQLite keeps
+        # its original DB timestamp representation and read path unchanged.
+        return PlayerHeartbeatAck(ok=True, received_at=current_time, channel_id=values["channel_id"])
     return PlayerHeartbeatAck(ok=True, received_at=heartbeat.received_at, channel_id=channel.id)
 
 
