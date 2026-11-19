@@ -1,5 +1,8 @@
 """Bounded/fair waiting with no connection or thread-token acquisition."""
 import asyncio
+import json
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -411,6 +414,370 @@ class PlayerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         async with gate.admit("heartbeat"):
             self.assertEqual(gate.snapshot()["active"], 1)
         self.assertEqual(gate.snapshot()["active"], 0)
+
+
+class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
+    async def _hold(self, gate, release, entered):
+        async with gate.admit("runtime"):
+            entered.set()
+            await release.wait()
+
+    async def _fill(self, gate):
+        release, tasks = asyncio.Event(), []
+        for _ in range(gate.capacity):
+            entered = asyncio.Event()
+            tasks.append(asyncio.create_task(self._hold(gate, release, entered)))
+            await entered.wait()
+        return release, tasks
+
+    async def _capture(self, gate, deadline):
+        try:
+            async with gate.admit("heartbeat", deadline_ns=deadline):
+                self.fail("This synthetic expired/full request must never enter work")
+        except HTTPException as error:
+            return error
+
+    def _assert_admission_error(self, error, reason):
+        self.assertEqual(error.status_code, 503)
+        self.assertEqual(error.detail, "Player operation temporarily unavailable")
+        self.assertEqual(error.headers, {"Retry-After": "1"})
+        self.assertEqual(error._player_503_reason, reason)
+
+    def _request(self, controls, path="heartbeat"):
+        async def disconnected():
+            return False
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(player_admission=controls)),
+            method="GET" if path == "runtime-config" else "POST",
+            scope={"route": SimpleNamespace(path="/api/player/" + path)},
+            is_disconnected=disconnected,
+        )
+
+    async def test_six_real_admission_rejection_branches_preserve_http_and_permits(self):
+        from app.core import player_admission as admission
+
+        self.assertEqual(admission.EXPENSIVE_CAPACITY, 4)
+        self.assertEqual(admission.HEARTBEAT_ADMISSION_CAPACITY, 2)
+        self.assertEqual(admission.HEARTBEAT_MAX_WAITERS, 16)
+        self.assertEqual(admission.HEARTBEAT_REQUEST_BUDGET_NS, 5_000_000_000)
+        gate = PlayerAdmission().expensive
+        error = await self._capture(gate, time.monotonic_ns() - 1)
+        self._assert_admission_error(error, "ADMISSION_DEADLINE_AT_ENTRY")
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+
+        gate = PlayerAdmission().expensive
+        release, holders = await self._fill(gate)
+        pending = [asyncio.create_task(self._capture(
+            gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)) for _ in range(16)]
+        await asyncio.sleep(0)
+        try:
+            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 16)
+            error = await self._capture(gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)
+            self._assert_admission_error(error, "ADMISSION_QUEUE_FULL")
+        finally:
+            for task in pending:
+                task.cancel()
+            release.set()
+            await asyncio.gather(*holders, *pending, return_exceptions=True)
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+        gate = PlayerAdmission().expensive
+        release, holders = await self._fill(gate)
+        try:
+            error = await self._capture(gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)
+            self._assert_admission_error(error, "ADMISSION_WAIT_DEADLINE")
+            self.assertEqual(gate.snapshot()["active"], 4)
+        finally:
+            release.set()
+            await asyncio.gather(*holders)
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+        for reason, ticks_factory in (
+            ("ADMISSION_EXPIRED_HEAD", lambda deadline: [deadline + 1]),
+            ("ADMISSION_EXPIRED_AT_GRANT", lambda deadline: [deadline - 1, deadline + 1]),
+        ):
+            with self.subTest(reason=reason):
+                gate = PlayerAdmission().expensive
+                release, holders = await self._fill(gate)
+                deadline = time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS
+                waiting = asyncio.create_task(self._capture(gate, deadline))
+                await asyncio.sleep(0)
+                ticks = ticks_factory(deadline)
+                final_tick = ticks[-1]
+                clock = SimpleNamespace(monotonic_ns=lambda: ticks.pop(0) if ticks else final_tick)
+                try:
+                    with patch.object(admission, "time", clock):
+                        release.set()
+                        await asyncio.gather(*holders)
+                        error = await waiting
+                    self._assert_admission_error(error, reason)
+                finally:
+                    release.set()
+                    if not waiting.done():
+                        waiting.cancel()
+                    await asyncio.gather(*holders, waiting, return_exceptions=True)
+                self.assertEqual(gate.snapshot()["active"], 0)
+                self.assertEqual(gate.snapshot()["waiters"], 0)
+
+        gate = PlayerAdmission().expensive
+        deadline = time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS
+        now = {"value": deadline - 1_000_000}
+        clock = SimpleNamespace(monotonic_ns=lambda: now["value"])
+        with patch.object(admission, "time", clock), patch.object(
+            admission, "admission_grant_recorder", return_value=lambda _: now.update(value=deadline + 1)
+        ):
+            error = await self._capture(gate, deadline)
+        self._assert_admission_error(error, "ADMISSION_EXPIRED_AFTER_GRANT")
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+    async def test_each_known_heartbeat_reason_logs_once_after_cleanup_without_inputs(self):
+        from app.core import player_admission as admission
+
+        for reason, phase in admission._HEARTBEAT_503_PHASES.items():
+            with self.subTest(reason=reason):
+                controls = PlayerAdmission()
+                error = HTTPException(503, {"synthetic": "do-not-log-this-body"}, headers={"X-QA": "preserved"})
+                error._player_503_reason = reason
+                with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+                    with self.assertRaises(HTTPException) as raised:
+                        async with player_activity(self._request(controls)):
+                            raise error
+                self.assertIs(raised.exception, error)
+                self.assertEqual(error.headers, {"X-QA": "preserved"})
+                self.assertEqual(len(captured.records), 1)
+                row = json.loads(captured.records[0].getMessage())
+                self.assertEqual(set(row), {"event", "request_id", "heartbeat_503_reason", "status_code", "retry_after_present", "timestamp", "phase", "gate_state_after_cleanup"})
+                self.assertEqual(row["event"], "heartbeat_http_503")
+                self.assertEqual(row["heartbeat_503_reason"], reason)
+                self.assertEqual(row["phase"], phase)
+                self._assert_metadata(row, retry_after_present=False)
+                self.assertEqual(row["gate_state_after_cleanup"]["active"], 0)
+                self.assertEqual(row["gate_state_after_cleanup"]["waiters"]["heartbeat"], 0)
+                self.assertNotIn("do-not-log-this-body", captured.records[0].getMessage())
+
+    async def test_unknown_or_untrusted_reason_is_sanitized_without_exception_body(self):
+        from app.core import player_admission as admission
+
+        for untrusted in ("unknown synthetic credential-like text", object(), None):
+            with self.subTest(reason_type=type(untrusted).__name__):
+                error = HTTPException(503, "synthetic-sensitive-detail")
+                error._player_503_reason = untrusted
+                controls = PlayerAdmission()
+                with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+                    with self.assertRaises(HTTPException) as raised:
+                        async with player_activity(self._request(controls)):
+                            raise error
+                self.assertIs(raised.exception, error)
+                self.assertEqual(len(captured.records), 1)
+                row = json.loads(captured.records[0].getMessage())
+                self.assertEqual(row["heartbeat_503_reason"], "UNCLASSIFIED_HTTP_503")
+                self.assertEqual(row["phase"], "unclassified")
+                self._assert_metadata(row, retry_after_present=False)
+                self.assertNotIn("synthetic-sensitive-detail", captured.records[0].getMessage())
+                self.assertNotIn("unknown synthetic credential-like text", captured.records[0].getMessage())
+
+    async def test_non_heartbeat_503_does_not_emit_heartbeat_reason_log(self):
+        from app.core import player_admission as admission
+
+        for path in ("runtime-config", "playback-events"):
+            controls = PlayerAdmission()
+            error = admission.overloaded("ADMISSION_QUEUE_FULL")
+            with patch.object(admission.logging, "getLogger") as logger:
+                with self.assertRaises(HTTPException) as raised:
+                    async with player_activity(self._request(controls, path)):
+                        raise error
+            self.assertIs(raised.exception, error)
+            logger.assert_not_called()
+            self.assertEqual(controls.expensive.snapshot()["active"], 0)
+            self.assertEqual(controls.ingress.snapshot()["active"], 0)
+
+    async def test_logging_failure_preserves_original_503_instead_of_500(self):
+        from app.core import player_admission as admission
+
+        controls = PlayerAdmission()
+        error = admission.overloaded("ADMISSION_QUEUE_FULL")
+        with patch.object(admission.logging, "getLogger") as logger:
+            logger.return_value.warning.side_effect = RuntimeError("synthetic unavailable log sink")
+            with self.assertRaises(HTTPException) as raised:
+                async with player_activity(self._request(controls)):
+                    raise error
+        self.assertIs(raised.exception, error)
+        self._assert_admission_error(raised.exception, "ADMISSION_QUEUE_FULL")
+        self.assertEqual(controls.expensive.snapshot()["active"], 0)
+        self.assertEqual(controls.expensive.snapshot()["waiters"], 0)
+
+    async def test_real_router_queue_503_logs_once_without_opt_in_diagnostics_or_database(self):
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+        from app.api.deps import get_current_player_device, get_db
+        from app.api.routes.player import router
+        from app.core import player_diagnostics
+
+        app = FastAPI()
+        controls = app.state.player_admission = PlayerAdmission()
+        app.include_router(router, prefix="/qa-custom/player")
+        calls = []
+        request_uuid = str(uuid4())
+
+        def forbidden_dependency():
+            calls.append(True)
+            raise AssertionError("Full admission must reject before auth or a database dependency")
+
+        app.dependency_overrides[get_current_player_device] = forbidden_dependency
+        app.dependency_overrides[get_db] = forbidden_dependency
+        gate = controls.expensive
+        release, holders = await self._fill(gate)
+        pending = [asyncio.create_task(self._capture(gate, time.monotonic_ns() + 5_000_000_000)) for _ in range(16)]
+        await asyncio.sleep(0)
+        try:
+            with patch.object(player_diagnostics, "ENABLED", False):
+                with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+                    async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False),
+                                           base_url="http://testserver") as client:
+                        response = await client.post("/qa-custom/player/heartbeat", json={"status": "online"},
+                                                     headers={"X-Request-ID": request_uuid})
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json(), {"detail": "Player operation temporarily unavailable"})
+            self.assertEqual(response.headers["Retry-After"], "1")
+            self.assertEqual(calls, [])
+            self.assertEqual(len(captured.records), 1)
+            row = json.loads(captured.records[0].getMessage())
+            self.assertEqual(row["heartbeat_503_reason"], "ADMISSION_QUEUE_FULL")
+            self.assertEqual(row["phase"], "before_admission")
+            self._assert_metadata(row, retry_after_present=True)
+            self.assertEqual(row["request_id"], request_uuid)
+            self.assertNotIn("x-request-id", response.headers)
+            self.assertEqual(row["gate_state_after_cleanup"]["active"], 4)
+            self.assertEqual(row["gate_state_after_cleanup"]["waiters"]["heartbeat"], 16)
+        finally:
+            for task in pending:
+                task.cancel()
+            release.set()
+            await asyncio.gather(*holders, *pending, return_exceptions=True)
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+
+
+
+    async def test_legacy_overloaded_call_without_reason_preserves_original_503(self):
+        from app.core import player_admission as admission
+
+        error = admission.overloaded()
+        self._assert_admission_error(error, "UNCLASSIFIED_HTTP_503")
+
+    async def test_cancellation_after_grant_returns_the_owned_permit(self):
+        from app.core import player_admission as admission
+
+        gate = PlayerAdmission().expensive
+        release, holders = await self._fill(gate)
+        waiting = None
+        try:
+            with patch.object(admission, "admission_grant_recorder", return_value=lambda _: waiting.cancel()):
+                waiting = asyncio.create_task(self._capture(
+                    gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS))
+                await asyncio.sleep(0)
+                self.assertEqual(gate.snapshot()["waiters"], 1)
+                release.set()
+                await asyncio.gather(*holders)
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting
+        finally:
+            release.set()
+            if waiting is not None and not waiting.done():
+                waiting.cancel()
+            await asyncio.gather(*holders, *((waiting,) if waiting is not None else ()), return_exceptions=True)
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+
+
+    def _assert_metadata(self, row, *, retry_after_present):
+        self.assertIs(type(row["status_code"]), int)
+        self.assertEqual(row["status_code"], 503)
+        self.assertIs(type(row["retry_after_present"]), bool)
+        self.assertIs(row["retry_after_present"], retry_after_present)
+        self.assertIs(type(row["request_id"]), str)
+        self.assertEqual(str(UUID(row["request_id"])), row["request_id"])
+        self.assertRegex(row["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+        stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+        self.assertEqual(stamp.utcoffset().total_seconds(), 0)
+        self.assertLess(abs((datetime.now(UTC) - stamp).total_seconds()), 10)
+
+    async def test_single_valid_request_uuid_is_normalized_without_logging_other_headers(self):
+        controls = PlayerAdmission()
+        request = self._request(controls)
+        supplied = str(uuid4())
+        request.scope["headers"] = [
+            (b"X-Request-ID", supplied.upper().encode("ascii")),
+            (b"authorization", b"Bearer qa-synthetic-sensitive-header-never-log"),
+        ]
+        error = HTTPException(503, "synthetic-sensitive-body", headers={"rEtRy-AfTeR": "synthetic-sensitive-header-value"})
+        with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+            with self.assertRaises(HTTPException) as raised:
+                async with player_activity(request):
+                    raise error
+        self.assertIs(raised.exception, error)
+        self.assertEqual(len(captured.records), 1)
+        row = json.loads(captured.records[0].getMessage())
+        self._assert_metadata(row, retry_after_present=True)
+        self.assertEqual(row["request_id"], supplied)
+        for secret in ("qa-synthetic-sensitive-header-never-log", "synthetic-sensitive-header-value", "synthetic-sensitive-body"):
+            self.assertNotIn(secret, captured.records[0].getMessage())
+
+    async def test_missing_invalid_duplicate_and_nonascii_request_ids_generate_safe_uuid(self):
+        supplied = str(uuid4())
+        cases = (
+            [],
+            [(b"x-request-id", b"synthetic-not-a-uuid-never-log")],
+            [(b"x-request-id", b"\xff" * 36)],
+            [(b"x-request-id", supplied.encode("ascii")), (b"X-Request-ID", supplied.encode("ascii"))],
+            [(b"x-request-id", (supplied + " ").encode("ascii"))],
+        )
+        generated = []
+        for headers in cases:
+            with self.subTest(header_count=len(headers)):
+                request = self._request(PlayerAdmission())
+                request.scope["headers"] = headers
+                with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+                    with self.assertRaises(HTTPException):
+                        async with player_activity(request):
+                            raise HTTPException(503, "synthetic-do-not-log")
+                self.assertEqual(len(captured.records), 1)
+                row = json.loads(captured.records[0].getMessage())
+                self._assert_metadata(row, retry_after_present=False)
+                self.assertEqual(UUID(row["request_id"]).version, 4)
+                self.assertNotEqual(row["request_id"], supplied)
+                self.assertNotIn("synthetic-not-a-uuid-never-log", captured.records[0].getMessage())
+                self.assertNotIn("synthetic-do-not-log", captured.records[0].getMessage())
+                generated.append(row["request_id"])
+        self.assertEqual(len(set(generated)), len(cases))
+
+    async def test_existing_diagnostic_trace_uuid_is_reused_for_heartbeat_reason(self):
+        from app.core import player_admission as admission
+
+        trace_id, supplied = str(uuid4()), str(uuid4())
+        request = self._request(PlayerAdmission())
+        request.scope["headers"] = [(b"x-request-id", supplied.encode("ascii"))]
+        token = admission._current_trace.set(SimpleNamespace(request_id=trace_id))
+        try:
+            with self.assertLogs("app.core.player_admission", level="WARNING") as captured:
+                with self.assertRaises(HTTPException):
+                    async with player_activity(request):
+                        raise HTTPException(503, "synthetic")
+        finally:
+            admission._current_trace.reset(token)
+        self.assertEqual(len(captured.records), 1)
+        row = json.loads(captured.records[0].getMessage())
+        self._assert_metadata(row, retry_after_present=False)
+        self.assertEqual(row["request_id"], trace_id)
+
+
 
 
 if __name__ == "__main__":

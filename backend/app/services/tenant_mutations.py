@@ -1252,7 +1252,10 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
             if getattr(graph, "_nonblocking_parent_locks", False):
                 raise PlayerPlaybackReceiptBusy() from exc
             from fastapi import HTTPException
-            raise HTTPException(status_code=503, detail="Player operation temporarily unavailable") from exc
+            error = HTTPException(status_code=503, detail="Player operation temporarily unavailable")
+            if spec.function == "create_player_heartbeat":
+                error._player_503_reason = "TENANT_GUARD_LOCK_UNAVAILABLE"
+            raise error from exc
         raise conflict() from exc
 
 

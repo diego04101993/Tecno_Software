@@ -8,10 +8,11 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+import json
 import os
 import threading
 import unittest
-from uuid import uuid4
+from uuid import UUID, uuid4
 from unittest.mock import patch
 
 if os.environ.get("DATABASE_URL") != "sqlite://" or os.environ.get("AUTO_SEED") != "false":
@@ -380,10 +381,25 @@ class _PlayerCases:
             sqlstate = "55P03"
 
         error = OperationalError("synthetic controlled lock timeout", {}, LockTimeout())
-        with patch.object(mutations._PlayerTelemetryGate, "__enter__", side_effect=error):
+        with self.assertLogs("app.core.player_admission", level="WARNING") as recorded, \
+                patch.object(mutations._PlayerTelemetryGate, "__enter__", side_effect=error):
             response = self.request()
         self.assertEqual(response.status_code, 503, response.text)
         self.assertEqual(response.json(), {"detail": "Player operation temporarily unavailable"})
+        self.assertNotIn("retry-after", response.headers)
+        self.assertEqual(len(recorded.records), 1)
+        failure = json.loads(recorded.records[0].getMessage())
+        self.assertEqual(failure["heartbeat_503_reason"], "TENANT_GUARD_LOCK_UNAVAILABLE")
+        self.assertEqual(failure["phase"], "handler_after_admission")
+        self.assertIs(type(failure["status_code"]), int)
+        self.assertEqual(failure["status_code"], 503)
+        self.assertIs(failure["retry_after_present"], False)
+        self.assertEqual(str(UUID(failure["request_id"])), failure["request_id"])
+        self.assertRegex(failure["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+        self.assertEqual(datetime.fromisoformat(failure["timestamp"].replace("Z", "+00:00")).utcoffset().total_seconds(), 0)
+        self.assertNotIn("x-request-id", response.headers)
+        self.assertNotIn(self.rows["A"]["token"], recorded.records[0].getMessage())
+        self.assertEqual(failure["gate_state_after_cleanup"]["active"], 0)
         self.assertEqual(self.db.scalar(select(func.count()).select_from(PlayerHeartbeat)), 0)
         self.assertEqual(self.db.get(PlayerDevice, self.ids["A"]["device"]).player_token_hash,
                          sha256(self.rows["A"]["token"].encode()).hexdigest())

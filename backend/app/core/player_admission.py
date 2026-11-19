@@ -10,14 +10,16 @@ import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from threading import RLock
 import time
 import logging
+import json
 from typing import Callable
 
 from fastapi import HTTPException
 
-from app.core.player_diagnostics import admission_grant_recorder
+from app.core.player_diagnostics import admission_grant_recorder, _current_trace, _request_uuid
 
 
 EXPENSIVE_CAPACITY = 4
@@ -34,10 +36,55 @@ _KINDS = {
 }
 
 
-def overloaded():
+def overloaded(reason="UNCLASSIFIED_HTTP_503"):
     # A failure before persistence is never an acceptance/201. Legacy Players
     # need their own durable retry to cover these unaccepted attempts.
-    return HTTPException(503, "Player operation temporarily unavailable", headers={"Retry-After": "1"})
+    error = HTTPException(503, "Player operation temporarily unavailable", headers={"Retry-After": "1"})
+    error._player_503_reason = reason
+    return error
+
+
+_HEARTBEAT_503_PHASES = {
+    "ADMISSION_DEADLINE_AT_ENTRY": "before_admission",
+    "ADMISSION_QUEUE_FULL": "before_admission",
+    "ADMISSION_WAIT_DEADLINE": "waiting_before_grant",
+    "ADMISSION_EXPIRED_HEAD": "waiting_before_grant",
+    "ADMISSION_EXPIRED_AT_GRANT": "selected_before_grant",
+    "ADMISSION_EXPIRED_AFTER_GRANT": "granted_before_handler",
+    "TENANT_GUARD_LOCK_UNAVAILABLE": "handler_after_admission",
+}
+
+
+def _record_heartbeat_503(error, gate, request):
+    """Always-on reason only; no request data or exception text enters the log."""
+    try:
+        reason = getattr(error, "_player_503_reason", None)
+        if type(reason) is not str or reason not in _HEARTBEAT_503_PHASES:
+            reason = "UNCLASSIFIED_HTTP_503"
+        trace = _current_trace.get()
+        request_id = trace.request_id if trace is not None else _request_uuid(request.scope.get("headers", []))
+        state = gate.snapshot()
+        logging.getLogger(__name__).warning(json.dumps({
+            "event": "heartbeat_http_503",
+            "request_id": request_id,
+            "heartbeat_503_reason": reason,
+            "status_code": error.status_code,
+            "retry_after_present": any(name.lower() == "retry-after" for name in (error.headers or {})),
+            "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "phase": _HEARTBEAT_503_PHASES.get(reason, "unclassified"),
+            # Admission's original finally has already run. This is explicitly
+            # the remaining gate state, not a claimed snapshot at rejection.
+            "gate_state_after_cleanup": {
+                "active": state["active"],
+                "active_by_class": state["active_by_class"],
+                "waiters": state["by_class"],
+                "rejected": state["rejected"],
+                "expired_before_handler": state["expired_before_handler"],
+            },
+        }, separators=(",", ":"), allow_nan=False))
+    except Exception:
+        # A diagnostic sink must never replace the original Player response.
+        pass
 
 
 @dataclass(eq=False)
@@ -84,7 +131,7 @@ class _FairGate:
                     elif head.deadline_ns is not None and now_ns >= head.deadline_ns:
                         queue.popleft()
                         self.expired += 1
-                        head.future.set_exception(overloaded())
+                        head.future.set_exception(overloaded("ADMISSION_EXPIRED_HEAD"))
                     else:
                         break
             selected = None
@@ -105,7 +152,7 @@ class _FairGate:
             granted_ns = time.monotonic_ns()
             if selected.deadline_ns is not None and granted_ns >= selected.deadline_ns:
                 self.expired += 1
-                selected.future.set_exception(overloaded())
+                selected.future.set_exception(overloaded("ADMISSION_EXPIRED_AT_GRANT"))
                 continue
             selected.granted = True
             selected.granted_ns = granted_ns
@@ -140,13 +187,13 @@ class _FairGate:
                 raise RuntimeError("Unknown Player work class")
             if deadline_ns is not None and item.started_ns >= deadline_ns:
                 self.expired += 1
-                raise overloaded()
+                raise overloaded("ADMISSION_DEADLINE_AT_ENTRY")
             queued = sum(not waiter.future.done() for waiter in self.queues[kind])
             # Idle capacity can serve a request immediately; the finite bound
             # concerns callers that would actually have to wait.
             if self.active >= self.capacity and queued >= self.limits[kind]:
                 self.rejected += 1
-                raise overloaded()
+                raise overloaded("ADMISSION_QUEUE_FULL")
             self.queues[kind].append(item)
             self._dispatch()
             pending = sum(sum(not waiter.future.done() for waiter in queue) for queue in self.queues.values())
@@ -164,7 +211,7 @@ class _FairGate:
                     except TimeoutError:
                         with self.lock:
                             self.expired += 1
-                        raise overloaded() from None
+                        raise overloaded("ADMISSION_WAIT_DEADLINE") from None
             else:
                 while not item.future.done():
                     if await request.is_disconnected():
@@ -180,7 +227,7 @@ class _FairGate:
             if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
                 with self.lock:
                     self.expired += 1
-                raise overloaded()
+                raise overloaded("ADMISSION_EXPIRED_AFTER_GRANT")
             yield
         finally:
             with self.lock:
@@ -230,8 +277,13 @@ async def player_activity(request):
         # client-supplied header or the opt-in diagnostic trace.
         started_ns = request.scope.get("_player_admission_started_ns", time.monotonic_ns())
         deadline_ns = started_ns + HEARTBEAT_REQUEST_BUDGET_NS
-    async with gate.admit(kind, observer, deadline_ns=deadline_ns):
-        yield
+    try:
+        async with gate.admit(kind, observer, deadline_ns=deadline_ns):
+            yield
+    except HTTPException as error:
+        if kind == "heartbeat" and error.status_code == 503:
+            _record_heartbeat_503(error, gate, request)
+        raise
 
 
 def playback_worker_activity(app):
