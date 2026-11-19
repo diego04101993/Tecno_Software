@@ -1,7 +1,7 @@
 from collections.abc import Generator
 import hashlib
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
@@ -53,13 +53,29 @@ def get_tenant_operation_context(
 def get_current_player_device(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
+    request: Request = None,
 ) -> PlayerDevice:
+    heartbeat = False
+    if request is not None and db.get_bind().dialect.name == "postgresql":
+        from app.api.routes.player import create_player_heartbeat
+        # Endpoint identity is supplied by the router, never by a header/path
+        # supplied as authorization evidence. Existing dependency overrides and
+        # arbitrary API prefixes keep their original authentication boundary.
+        heartbeat = request.scope.get("endpoint") is create_player_heartbeat
+    return _authenticate_player_device(authorization, db, heartbeat=heartbeat)
+
+
+def _authenticate_player_device(authorization, db, *, heartbeat):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing player bearer token")
 
     token = authorization.split(" ", 1)[1].strip()
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    player_device = db.query(PlayerDevice).filter(PlayerDevice.player_token_hash == token_hash).one_or_none()
+    if heartbeat:
+        from app.services.heartbeat_queries import load_heartbeat_auth_rows
+        player_device = load_heartbeat_auth_rows(db, token_hash)
+    else:
+        player_device = db.query(PlayerDevice).filter(PlayerDevice.player_token_hash == token_hash).one_or_none()
 
     if not player_device or not player_device.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid player token")

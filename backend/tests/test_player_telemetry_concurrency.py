@@ -201,6 +201,7 @@ class _PlayerCases:
         self.seed_legacy_history()
         history_tables = {"player_heartbeats", "player_playback_events"}
         real_preflight, real_snapshot = mutations.preflight_relationship_graph, mutations._WriteGraph.snapshot
+        real_guard, real_preload = mutations.player_write_guard, mutations._heartbeat_preload_snapshots
         active = {"ids": frozenset(), "inside": False}
         scans, persisted, probes, phases, certificates = [], [], [], [], []
 
@@ -208,18 +209,42 @@ class _PlayerCases:
             statement = execution.compiled.statement if execution.compiled is not None else None
             if not active["inside"] or statement is None or not getattr(statement, "is_select", False):
                 return
-            tables = {getattr(node, "name", None) for node in visitors.iterate(statement)} & history_tables
-            if not tables:
-                return
-            where = statement._where_criteria
-            predicate = where[0] if len(where) == 1 else None
-            # Preserve the mandatory existence probe for the exact newly
-            # server-created UUID; it can never authorize an old history row.
-            exact_new_pk = (len(statement.get_final_froms()) == 1 and isinstance(predicate, BinaryExpression)
-                and predicate.operator is operators.eq and getattr(predicate.left, "name", None) == "id"
-                and getattr(getattr(predicate.left, "table", None), "name", None) in history_tables
-                and isinstance(predicate.right, BindParameter) and predicate.right.value in active["ids"])
-            (probes if exact_new_pk else scans).append(tuple(sorted(tables)))
+            from sqlalchemy.sql.selectable import Join, Select
+
+            def direct_history(source):
+                if isinstance(source, Join):
+                    return direct_history(source.left) | direct_history(source.right)
+                element = getattr(source, "element", None)
+                if element is not None:
+                    # The inner Select is visited separately: do not count its
+                    # CTE/subquery wrapper as a second historical table scan.
+                    return set() if isinstance(element, Select) else direct_history(element)
+                return {getattr(source, "name", None)} & history_tables
+
+            seen = set()
+            for query in visitors.iterate(statement):
+                if not isinstance(query, Select) or id(query) in seen:
+                    continue
+                seen.add(id(query))
+                sources = query.get_final_froms()
+                tables = set().union(*(direct_history(source) for source in sources))
+                if not tables:
+                    continue
+                where = query._where_criteria
+                predicate = where[0] if len(where) == 1 else None
+                binding = predicate.right if isinstance(predicate, BinaryExpression) else None
+                name = execution.compiled.bind_names.get(binding) if isinstance(binding, BindParameter) else None
+                batches = execution.compiled_parameters
+                # Required cached-template binds have no value default. Inspect
+                # the actual compiled execution parameters for every probe.
+                exact_new_pk = (len(sources) == 1 and not isinstance(sources[0], Join)
+                    and isinstance(predicate, BinaryExpression) and predicate.operator is operators.eq
+                    and getattr(predicate.left, "name", None) == "id"
+                    and getattr(predicate.left, "primary_key", False)
+                    and getattr(getattr(predicate.left, "table", None), "name", None) in history_tables
+                    and name is not None and batches
+                    and all(name in values and values[name] in active["ids"] for values in batches))
+                (probes if exact_new_pk else scans).append(tuple(sorted(tables)))
 
         def capture_snapshot(graph, ref):
             value = real_snapshot(graph, ref)
@@ -228,25 +253,40 @@ class _PlayerCases:
                 persisted.append(reference)
             return value
 
-        def capture_preflight(gate, intents, operation, **kwargs):
-            active["ids"] = frozenset(i.reference.identity for i in intents if i.action == "CREATE")
+        def capture_preload(graph, *args, **kwargs):
+            loaded = real_preload(graph, *args, **kwargs)
+            if active["inside"]:
+                persisted.extend(ref for ref, value in graph.snapshots.items()
+                    if value is not None and ref.model in {"PlayerHeartbeat", "PlayerPlaybackEvent"})
+            return loaded
+
+        @contextmanager
+        def capture_guard(*args, **kwargs):
+            previous = dict(active)
+            active["ids"] = frozenset(i.reference.identity for i in kwargs["intents"] if i.action == "CREATE")
             active["inside"] = True
             try:
-                plan = real_preflight(gate, intents, operation, **kwargs)
-                phases.append(gate.graph.media_validation_locked)
-                certificates.append(plan.telemetry)
-                if operation.function != "get_runtime_config":
-                    self.assertTrue({RowRef(model, self.ids["A"][key]) for model, key in
-                                     (("ContentItem", "content"), ("Campaign", "campaign"), ("Layout", "layout"))}
-                                    <= set(plan.checked))
-                return plan
+                with real_guard(*args, **kwargs) as plan:
+                    yield plan
             finally:
-                active["inside"] = False
+                active.update(previous)
+
+        def capture_preflight(gate, intents, operation, **kwargs):
+            plan = real_preflight(gate, intents, operation, **kwargs)
+            phases.append(gate.graph.media_validation_locked)
+            certificates.append(plan.telemetry)
+            if operation.function != "get_runtime_config":
+                self.assertTrue({RowRef(model, self.ids["A"][key]) for model, key in
+                                 (("ContentItem", "content"), ("Campaign", "campaign"), ("Layout", "layout"))}
+                                <= set(plan.checked))
+            return plan
 
         event.listen(self.engine, "before_cursor_execute", capture_sql)
         try:
             with patch.object(mutations, "preflight_relationship_graph", capture_preflight), \
-                    patch.object(mutations._WriteGraph, "snapshot", capture_snapshot):
+                    patch.object(mutations._WriteGraph, "snapshot", capture_snapshot), \
+                    patch.object(mutations, "player_write_guard", capture_guard), \
+                    patch.object(mutations, "_heartbeat_preload_snapshots", capture_preload):
                 for kind in ("heartbeat", "event", "runtime"):
                     try:
                         with self.player_scope(self.db, kind):

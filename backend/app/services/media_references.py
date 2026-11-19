@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from threading import RLock
 
-from sqlalchemy import JSON, create_engine, event, select, text, tuple_
+from sqlalchemy import JSON, String, create_engine, event, literal, select, text, tuple_, union_all
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -375,14 +375,39 @@ def _local_url(value: str) -> str | None:
     return None
 
 
+def _heartbeat_media_reference_rows(db: Session):
+    """Fetch the same three typed authority row sets in one heartbeat read."""
+    statement = union_all(
+        select(literal("client").label("kind"), Client.id.label("client_id"),
+               literal(None, type_=String).label("stored")),
+        select(literal("content"), ContentItem.client_id, ContentItem.file_path),
+        select(literal("import"), Dataset.client_id, DatasetImport.storage_path)
+        .select_from(DatasetImport).outerjoin(Dataset, Dataset.id == DatasetImport.dataset_id),
+    )
+    clients, contents, imports = set(), [], []
+    for kind, client_id, stored in db.execute(statement):
+        if kind == "client":
+            clients.add(client_id)
+        elif kind == "content":
+            contents.append((client_id, stored))
+        elif kind == "import":
+            imports.append((stored, client_id))
+    return clients, contents, imports
+
+
 @observed("MEDIA_VALIDATION")
 def media_reference_owners(db: Session, root: Path, *, strict: bool = False) -> dict[Path, set[str | None]]:
     """Only persisted typed references establish ownership; free JSON never does."""
+    from app.services.heartbeat_queries import heartbeat_query_batch_active
     references = defaultdict(set)
-    clients = set(db.scalars(select(Client.id)))
-    rows = list(db.execute(select(ContentItem.client_id, ContentItem.file_path)))
-    for stored, client_id in db.execute(select(DatasetImport.storage_path, Dataset.client_id)
-                                       .outerjoin(Dataset, Dataset.id == DatasetImport.dataset_id)):
+    if heartbeat_query_batch_active(db):
+        clients, rows, imports = _heartbeat_media_reference_rows(db)
+    else:
+        clients = set(db.scalars(select(Client.id)))
+        rows = list(db.execute(select(ContentItem.client_id, ContentItem.file_path)))
+        imports = db.execute(select(DatasetImport.storage_path, Dataset.client_id)
+                             .outerjoin(Dataset, Dataset.id == DatasetImport.dataset_id))
+    for stored, client_id in imports:
         if stored:
             rows.append((client_id, stored if stored.startswith(("/media/", "media/")) else "/media/" + stored))
     for client_id, stored in rows:

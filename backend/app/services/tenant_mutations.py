@@ -4,6 +4,7 @@ No add/delete/setattr/flush/commit or filesystem operation occurs here. Registry
 metadata describes effects; it is never used as a reflective mutation executor.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from types import MappingProxyType
 from app.core.player_diagnostics import observed
@@ -538,6 +539,117 @@ def _heartbeat_incoming_ids(graph, reference):
     return identities
 
 
+def _heartbeat_snapshot_shape(model, lock_mode, nowait):
+    """Backend SQL metadata only: never identities, sessions or approved facts."""
+    if lock_mode not in {"share", "update"} or type(nowait) is not bool:
+        raise conflict()
+    cls, names = model_class(model), tuple(model_spec(model).columns)
+    columns = []
+    for name in names:
+        attribute = getattr(cls, name)
+        native = attribute.__clause_element__()
+        columns.append((id(attribute), id(native), id(native.type),
+                        native.name, native.key, id(native.table)))
+    return model, names, id(cls), id(cls.__table__), tuple(columns), lock_mode, nowait
+
+
+@lru_cache(maxsize=32)
+def _heartbeat_snapshot_template(shape):
+    """Immutable SQL structure, with required PK values supplied per execution.
+
+    The structural witness changes with model/column binding or lock policy.
+    No row value, RowRef, session, authority or validation result enters this LRU.
+    Execution still runs the complete phase AST guard and fresh database reads.
+    """
+    from sqlalchemy import bindparam, literal, select, true
+
+    anchor = select(literal(1).label("value")).subquery("heartbeat_anchor")
+    source, projection, fields = anchor, [anchor.c.value], []
+    for index, entry in enumerate(shape):
+        model, names, _class, _table, _columns, lock_mode, nowait = entry
+        if entry != _heartbeat_snapshot_shape(model, lock_mode, nowait):
+            raise conflict()
+        cls = model_class(model)
+        identity = bindparam("heartbeat_id_" + str(index), type_=cls.id.type, required=True)
+        statement = select(*(getattr(cls, name) for name in names)).where(cls.id == identity)
+        locked = statement.with_for_update(read=lock_mode == "share", nowait=nowait).cte(
+            "heartbeat_locked_" + str(index))
+        source = source.outerjoin(locked, true())
+        labels = tuple((name, "heartbeat_" + str(index) + "_" + name) for name in names)
+        projection.extend(locked.c[name].label(label) for name, label in labels)
+        fields.append(labels)
+    return select(*projection).select_from(source), tuple(fields)
+
+
+def _heartbeat_preload_snapshots(graph, gate, operation, references):
+    """Fresh typed, physically locked rows for one heartbeat proof phase.
+
+    Each CTE selects one exact primary key with its original lock mode. LEFT
+    JOINs preserve missing rows without JSON conversion or a tenant predicate.
+    Only outgoing registered references are prefetched; every original graph,
+    incoming-discovery and opaque/media validation still executes afterward.
+    """
+    if (type(graph) is not _PlayerTelemetryGraph
+            or operation not in OPERATIONS or operation.function != "create_player_heartbeat"
+            or graph.session.get_bind().dialect.name != "postgresql"):
+        return ()
+    memo = graph._validation_memo
+    if (not gate.active or gate.graph is not graph or not graph.locking
+            or gate.context is not graph.player_scope
+            or graph.session.get_transaction() is not gate.transaction
+            or type(memo) is not _GraphValidationMemo or memo.graph is not graph or memo.gate is not gate):
+        raise conflict()
+    memo.check()
+    pending, seen, loaded = set(references), set(), set()
+    while pending:
+        if any(not isinstance(ref, RowRef) for ref in pending):
+            raise conflict()
+        current = tuple(sorted(pending - seen, key=lambda ref: (ref.model, ref.identity)))
+        if not current:
+            break
+        missing = [ref for ref in current if ref not in graph.snapshots]
+        # PostgreSQL has a finite target-list limit. Bound the projection, never
+        # the relationship closure: additional chunks/parents are all consumed.
+        while missing:
+            chunk, columns = [], 1
+            while missing and (not chunk or columns + len(model_spec(missing[0].model).columns) <= 1000):
+                ref = missing.pop(0)
+                chunk.append(ref)
+                columns += len(model_spec(ref.model).columns)
+            shape = tuple(_heartbeat_snapshot_shape(ref.model, graph._row_lock_mode(ref),
+                            getattr(graph, "_nonblocking_parent_locks", False)) for ref in chunk)
+            statement, fields = _heartbeat_snapshot_template(shape)
+            parameters = {"heartbeat_id_" + str(index): ref.identity for index, ref in enumerate(chunk)}
+            with graph.session.no_autoflush:
+                memo.check()
+                row = graph.session.execute(statement, parameters).mappings().one()
+            if graph.session.get_transaction() is not gate.transaction or not gate.active:
+                raise conflict()
+            for ref, labels in zip(chunk, fields, strict=True):
+                values = {name: row[label] for name, label in labels}
+                snapshot = freeze(values) if values["id"] is not None else None
+                if snapshot is not None and snapshot["id"] != ref.identity:
+                    raise conflict()
+                graph.snapshots[ref] = snapshot
+                if snapshot is not None:
+                    graph._snapshot_lock_proofs[ref] = (snapshot, gate.transaction)
+                loaded.add(ref)
+        pending = set()
+        for ref in current:
+            seen.add(ref)
+            row = graph.snapshots[ref]
+            if row is None:
+                continue
+            for edge in RELATION_SPECS:
+                if edge.model == ref.model and edge.operations & {"WRITE", "DELETE"}:
+                    identity = row.get(edge.field)
+                    if type(identity) is str and identity:
+                        target = RowRef(edge.target, identity)
+                        if target not in seen:
+                            pending.add(target)
+    return tuple(sorted(loaded, key=lambda ref: (ref.model, ref.identity)))
+
+
 @observed("OWNERSHIP")
 def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=()):
     from sqlalchemy import select
@@ -643,6 +755,10 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
                         if heartbeat_batch:
                             if incoming_ids is None:
                                 incoming_ids = _heartbeat_incoming_ids(graph, ref)
+                                _heartbeat_preload_snapshots(graph, gate, operation, (
+                                    RowRef(candidate.model, identity)
+                                    for candidate in RELATION_SPECS if candidate.key in incoming_ids
+                                    for identity in incoming_ids[candidate.key]))
                             ids = set(incoming_ids[edge.key])
                         else:
                             cls = model_class(edge.model)
@@ -1045,6 +1161,8 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                     for ref, row in prepared.items()}
     channel_values = (channel.client_id, channel.branch_id, channel.channel_code)
     device_hash = player_device.player_token_hash if player_device else None
+    heartbeat_bulk = (telemetry and operation == "create_player_heartbeat"
+                      and db.get_bind().dialect.name == "postgresql")
     if db.get_bind().dialect.name == "postgresql":
         conn = db.connection()
         if conn.get_isolation_level() != "READ COMMITTED":
@@ -1055,31 +1173,50 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
         with gate_type(graph, context) as gate:
             graph.snapshots.clear()
             graph.locking = True
-            current = graph.snapshot(RowRef("Channel", channel.id))
-            if current is None or tuple(current[key] for key in ("client_id", "branch_id", "channel_code")) != channel_values:
-                raise conflict()
-            # ORM identities may have been loaded before a concurrent suspension.
-            # Recheck active scope from the locked database snapshots as well.
-            client_row = graph.snapshot(RowRef("Client", current["client_id"]))
-            branch_row = graph.snapshot(RowRef("Branch", current["branch_id"]))
-            if (client_row is None or client_row["status"] != "active" or branch_row is None
-                    or not branch_row["is_active"] or branch_row["client_id"] != current["client_id"]):
-                from fastapi import HTTPException
-                raise HTTPException(status_code=403, detail="Player operation unavailable")
-            if player_device is not None:
-                current_device = graph.snapshot(RowRef("PlayerDevice", player_device.id))
-                if (current_device is None or not current_device["is_active"]
-                        or current_device["player_token_hash"] != device_hash):
+            with ExitStack() as first_phase:
+                if heartbeat_bulk:
+                    from app.services.heartbeat_queries import heartbeat_query_scope
+                    first_phase.enter_context(heartbeat_query_scope(db))
+                    first_phase.enter_context(_graph_validation_phase(graph, gate))
+                # Keep Channel's exclusive anchor first, before any device lock.
+                current = graph.snapshot(RowRef("Channel", channel.id))
+                if current is None or tuple(current[key] for key in ("client_id", "branch_id", "channel_code")) != channel_values:
                     raise conflict()
-            for ref, previous in prepared.items():
-                current = graph.snapshot(ref)
-                if current is None or any(not _same_prepared_value(value, current.get(key)) for key, value in previous.items()):
-                    raise conflict()
-            if telemetry:
-                intents = _monotonic_player_activity(graph, intents)
-                graph._bind_activity_history(gate, context, spec, intents)
-            with _graph_validation_phase(graph, gate):
-                plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
+                if heartbeat_bulk:
+                    references = {RowRef("Client", current["client_id"]), RowRef("Branch", current["branch_id"])}
+                    references.update(intent.reference for intent in intents)
+                    for intent in intents:
+                        values = dict(intent.patch)
+                        for edge in RELATION_SPECS:
+                            identity = values.get(edge.field) if edge.model == intent.reference.model else None
+                            if type(identity) is str and identity:
+                                references.add(RowRef(edge.target, identity))
+                    _heartbeat_preload_snapshots(graph, gate, spec, references)
+                # ORM identities may have been loaded before a concurrent suspension.
+                # Recheck active scope from the locked database snapshots as well.
+                client_row = graph.snapshot(RowRef("Client", current["client_id"]))
+                branch_row = graph.snapshot(RowRef("Branch", current["branch_id"]))
+                if (client_row is None or client_row["status"] != "active" or branch_row is None
+                        or not branch_row["is_active"] or branch_row["client_id"] != current["client_id"]):
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=403, detail="Player operation unavailable")
+                if player_device is not None:
+                    current_device = graph.snapshot(RowRef("PlayerDevice", player_device.id))
+                    if (current_device is None or not current_device["is_active"]
+                            or current_device["player_token_hash"] != device_hash):
+                        raise conflict()
+                for ref, previous in prepared.items():
+                    current = graph.snapshot(ref)
+                    if current is None or any(not _same_prepared_value(value, current.get(key)) for key, value in previous.items()):
+                        raise conflict()
+                if telemetry:
+                    intents = _monotonic_player_activity(graph, intents)
+                    graph._bind_activity_history(gate, context, spec, intents)
+                if heartbeat_bulk:
+                    plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
+                else:
+                    with _graph_validation_phase(graph, gate):
+                        plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
             with ExitStack() as media_locks:
                 paths = frozenset(graph.media_paths)
                 if paths:
@@ -1089,11 +1226,17 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                         lock_media_paths(db, list(paths), shared=True)
                     else:
                         lock_media_paths(db, list(paths))
+                prior_references = tuple(graph.snapshots) if heartbeat_bulk else ()
                 graph.snapshots.clear()
                 graph.media_paths.clear()
                 graph.media_validation_locked = True
-                with _graph_validation_phase(graph, gate):
-                    confirmed = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
+                with ExitStack() as confirmation_phase:
+                    if heartbeat_bulk:
+                        confirmation_phase.enter_context(heartbeat_query_scope(db))
+                    with _graph_validation_phase(graph, gate):
+                        if heartbeat_bulk:
+                            _heartbeat_preload_snapshots(graph, gate, spec, prior_references)
+                        confirmed = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
                 if (plan.proposed != confirmed.proposed or plan.checked != confirmed.checked
                         or plan.telemetry != confirmed.telemetry
                         or plan.dependencies != confirmed.dependencies or paths != frozenset(graph.media_paths)):

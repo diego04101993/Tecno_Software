@@ -108,9 +108,10 @@ def _sanitize_heartbeat_telemetry(payload, db: Session, client_id: str):
     # Share only these optional read projections in one consistent snapshot.
     # Close it before the write guard obtains fresh, locked ownership proofs;
     # no read eligibility or media authority can escape onto the writer Session.
+    from app.services.heartbeat_queries import heartbeat_query_scope, sanitize_heartbeat_references
     with readonly_snapshot_session(db) as snapshot:
-        with runtime_read_scope(snapshot):
-            return _sanitize_telemetry(payload, snapshot, client_id, "current_")
+        with runtime_read_scope(snapshot), heartbeat_query_scope(snapshot):
+            return sanitize_heartbeat_references(payload, snapshot, client_id)
 
 
 def _resolve_playback_label(
@@ -243,7 +244,10 @@ def create_player_heartbeat(
     player_device: PlayerDevice = Depends(get_current_player_device),
     db: Session = Depends(get_db),
 ) -> PlayerHeartbeatAck:
-    channel = db.get(Channel, player_device.channel_id)
+    from app.services.heartbeat_queries import (
+        refresh_heartbeat_roots, retain_heartbeat_write_keys, take_heartbeat_channel,
+    )
+    channel = take_heartbeat_channel(db, player_device)
     if not channel:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
 
@@ -258,6 +262,8 @@ def create_player_heartbeat(
         authenticated_device = tuple(getattr(player_device, key) for key in device_identity_fields)
         authenticated_channel = tuple(getattr(channel, key) for key in channel_identity_fields)
     payload = _sanitize_heartbeat_telemetry(payload, db, channel.client_id)
+    if postgres:
+        refresh_heartbeat_roots(db, player_device, channel)
     if postgres and (
             tuple(getattr(player_device, key) for key in device_identity_fields) != authenticated_device
             or tuple(getattr(channel, key) for key in channel_identity_fields) != authenticated_channel):
@@ -307,6 +313,8 @@ def create_player_heartbeat(
     )
     with player_write_guard(db, channel=channel, player_device=player_device,
                             operation="create_player_heartbeat", intents=intents) as plan:
+        if postgres:
+            retain_heartbeat_write_keys(db, plan, channel, player_device)
         # Same-device telemetry is serialized at its authoritative rows. Use
         # the approved timestamps so an older request admitted later cannot
         # move last_seen_at/last_ping_at backwards.
