@@ -5,18 +5,25 @@ sanitizer path; PostgreSQL coverage explicitly opts into the existing owned R5
 fixture and its per-test schema. No latency assertion uses a faster fake path.
 """
 from datetime import UTC, datetime, timedelta
+from contextlib import contextmanager
 import os
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy import event, select, update
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.api.routes import player
-from app.models.entities import Branch, Channel, Client, ContentItem, PlayerDevice, PlayerHeartbeat
+from app.models.entities import (
+    Branch, CampaignChannelAssignment, Channel, Client, ContentItem,
+    DeviceOutput, PlayerDevice, PlayerHeartbeat,
+)
 from app.schemas.domain import PlayerHeartbeatCreate
 from app.services import media_references as media
+from app.services import tenant_mutations as mutations
 from app.services.runtime_read import runtime_reads
+from app.services.tenant_ownership import RowRef, TenantGraph
+from app.services.tenant_relations import RELATION_SPECS, model_class
 from test_tenant_gate_performance import GateFixture
 import test_player_telemetry_concurrency as telemetry_tests
 
@@ -152,6 +159,134 @@ class _HeartbeatWorkCases:
         self.assertEqual(row.current_content_id, self.ids["A"]["content"])
         with Session(self.engine) as db:
             self.assertEqual(db.get(type(layout), layout.id).zones, zones, "Sanitizer repaired stored layout")
+
+    def test_incoming_batch_preserves_exact_edge_ids_in_one_roundtrip(self):
+        a, b = self.ids["A"], self.ids["B"]
+        owned = CampaignChannelAssignment(campaign_id=a["campaign"], channel_id=a["channel"])
+        foreign = CampaignChannelAssignment(campaign_id=b["campaign"], channel_id=a["channel"])
+        output = DeviceOutput(root_channel_id=a["channel"], channel_id=a["channel"], name="Both edges")
+        unrelated = DeviceOutput(root_channel_id=b["channel"], channel_id=b["channel"], name="Other tenant")
+        self.db.add_all([owned, foreign, output, unrelated])
+        self.db.commit()
+        edges = tuple(edge for edge in RELATION_SPECS if edge.target == "Channel"
+                      and edge.model not in {"PlayerHeartbeat", "PlayerPlaybackEvent"})
+        expected = {edge.key: set(self.db.scalars(select(model_class(edge.model).id).where(
+            getattr(model_class(edge.model), edge.field) == a["channel"]))) for edge in edges}
+        statements = []
+
+        def sql(_connection, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", sql)
+        try:
+            actual = mutations._heartbeat_incoming_ids(TenantGraph(self.db), RowRef("Channel", a["channel"]))
+        finally:
+            event.remove(self.engine, "before_cursor_execute", sql)
+        self.assertEqual(actual, expected, "Batching changed the authoritative FK-only discovery result")
+        self.assertEqual(actual["CampaignChannelAssignment.channel_id"], {owned.id, foreign.id},
+                         "An owner predicate concealed a foreign incoming dependency")
+        self.assertIn(output.id, actual["DeviceOutput.channel_id"])
+        self.assertIn(output.id, actual["DeviceOutput.root_channel_id"], "UNION lost a repeated ID on another edge")
+        self.assertNotIn(unrelated.id, set().union(*actual.values()))
+        self.assertEqual(len(statements), 1, "Ordinary Channel incoming discovery must use one SQL roundtrip")
+
+    def test_heartbeat_batches_incoming_discovery_in_both_fresh_phases(self):
+        statements = []
+
+        def sql(_connection, _cursor, statement, _params, _context, _many):
+            if "UNION ALL" in statement.upper() and "AS relation_key" in statement:
+                statements.append(statement)
+
+        event.listen(self.engine, "before_cursor_execute", sql)
+        try:
+            response = self.post()
+        finally:
+            event.remove(self.engine, "before_cursor_execute", sql)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(statements), 2, "Each fresh heartbeat proof needs its own batched incoming query")
+        edges = [edge for edge in RELATION_SPECS if edge.target == "Channel"
+                 and edge.model not in {"PlayerHeartbeat", "PlayerPlaybackEvent"}]
+        self.assertTrue(all(statement.upper().count("UNION ALL") == len(edges) - 1
+                            for statement in statements))
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_foreign_incoming_assignment_is_not_hidden_by_batch(self):
+        self.db.add(CampaignChannelAssignment(campaign_id=self.ids["B"]["campaign"],
+                                              channel_id=self.ids["A"]["channel"]))
+        self.db.commit()
+        response = self.post()
+        self.assertEqual(response.status_code, 409, response.text)
+        with Session(self.engine) as db:
+            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_second_phase_rediscovers_new_foreign_incoming_assignment(self):
+        original = mutations._graph_validation_phase
+        phases = []
+
+        @contextmanager
+        def phase(graph, gate=None):
+            phases.append(True)
+            with original(graph, gate):
+                yield
+            if len(phases) == 1:
+                # A controlled inter-phase write in the same transaction tests
+                # freshness without bypassing PostgreSQL's real parent locks.
+                graph.session.execute(insert(CampaignChannelAssignment).values(
+                    campaign_id=self.ids["B"]["campaign"], channel_id=self.ids["A"]["channel"]))
+
+        with patch.object(mutations, "_graph_validation_phase", phase):
+            response = self.post()
+        self.assertEqual(phases, [True, True])
+        self.assertEqual(response.status_code, 409, "A negative incoming result escaped its first proof phase")
+        with Session(self.engine) as db:
+            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_second_phase_rechecks_media_authority(self):
+        original = mutations._graph_validation_phase
+        phases = []
+
+        @contextmanager
+        def phase(graph, gate=None):
+            phases.append(True)
+            with original(graph, gate):
+                yield
+            if len(phases) == 1:
+                graph.session.execute(update(ContentItem).where(
+                    ContentItem.id == self.ids["B"]["content"]).values(
+                        file_path=self.rows["A"]["content"].file_path))
+
+        with patch.object(mutations, "_graph_validation_phase", phase):
+            response = self.post()
+        self.assertEqual(phases, [True, True])
+        self.assertEqual(response.status_code, 409, "Media authority was reused across proof phases")
+        with Session(self.engine) as db:
+            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_current_playback_label_is_committed_with_original_precedence(self):
+        a = self.ids["A"]
+        cases = ((self.payload(), self.rows["A"]["content"].name),
+                 (self.payload(current_content_id=None), self.rows["A"]["campaign"].name),
+                 (self.payload(current_content_id=None, current_campaign_id=None),
+                  "Layout " + self.rows["A"]["layout"].name),
+                 (self.payload(current_content_id=None, current_campaign_id=None, current_layout_id=None),
+                  "Layout " + self.rows["A"]["layout"].name))
+        for payload, label in cases:
+            response = self.post(payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            with Session(self.engine) as db:
+                self.assertEqual(db.get(Channel, a["channel"]).current_playback, label)
+                row = db.scalar(select(PlayerHeartbeat).order_by(PlayerHeartbeat.received_at.desc()))
+                for field in ("current_content_id", "current_campaign_id", "current_layout_id"):
+                    self.assertEqual(getattr(row, field), payload[field])
+                self.assertEqual(utc(row.received_at), utc(datetime.fromisoformat(
+                    response.json()["received_at"].replace("Z", "+00:00"))))
+        self.assertEqual(self.engine.pool.checkedout(), 0)
 
 
 class HeartbeatWorkSQLiteTests(_HeartbeatWorkCases, GateFixture):

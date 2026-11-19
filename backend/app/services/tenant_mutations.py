@@ -512,6 +512,32 @@ def validate_proposed_state(graph, ref, patch, context, operation, *, create=Fal
     return proposal
 
 
+def _heartbeat_incoming_ids(graph, reference):
+    """Batch ordinary incoming Channel edges for one heartbeat preflight.
+
+    The caller proves the exact activity binding before using this result. The
+    two history models keep their existing activity exemption; every other edge
+    retains its original FK-only predicate, including foreign dependencies.
+    Nothing is cached across references or the two fresh validation phases.
+    """
+    from sqlalchemy import literal, select, union_all
+
+    edges = tuple(edge for edge in RELATION_SPECS
+                  if edge.target == reference.model
+                  and edge.model not in {"PlayerHeartbeat", "PlayerPlaybackEvent"})
+    identities = {edge.key: set() for edge in edges}
+    statements = []
+    for edge in edges:
+        cls = model_class(edge.model)
+        statements.append(select(literal(edge.key).label("relation_key"), cls.id.label("identity"))
+                          .where(getattr(cls, edge.field) == reference.identity))
+    if statements:
+        statement = union_all(*statements) if len(statements) > 1 else statements[0]
+        for relation_key, identity in graph.session.execute(statement):
+            identities[relation_key].add(identity)
+    return identities
+
+
 @observed("OWNERSHIP")
 def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=()):
     from sqlalchemy import select
@@ -565,6 +591,10 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
                     _semantics(view, related, context, semantic_adapters)
             _semantics(view, ref, context, semantic_adapters)
             checked.add(ref)
+            heartbeat_batch = (ref.model == "Channel" and type(graph) is _PlayerTelemetryGraph
+                               and operation.function == "create_player_heartbeat"
+                               and graph._skip_prior_telemetry(gate, context, operation, intents))
+            incoming_ids = None
             for edge in RELATION_SPECS:
                 if edge.target != ref.model:
                     continue
@@ -610,10 +640,15 @@ def preflight_relationship_graph(gate, intents, operation, *, semantic_adapters=
                                 _semantics(view, related, context, semantic_adapters)
                         ids = set()
                     else:
-                        cls = model_class(edge.model)
-                        ids = set(graph.session.scalars(
-                            select(cls.id).where(getattr(cls, edge.field) == ref.identity).order_by(cls.id)
-                        ).all())
+                        if heartbeat_batch:
+                            if incoming_ids is None:
+                                incoming_ids = _heartbeat_incoming_ids(graph, ref)
+                            ids = set(incoming_ids[edge.key])
+                        else:
+                            cls = model_class(edge.model)
+                            ids = set(graph.session.scalars(
+                                select(cls.id).where(getattr(cls, edge.field) == ref.identity).order_by(cls.id)
+                            ).all())
                 ids.update(p.reference.identity for p in proposed
                            if p.reference.model == edge.model and p.values.get(edge.field) == ref.identity)
                 for identity in sorted(ids):
