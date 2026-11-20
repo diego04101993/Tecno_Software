@@ -7,12 +7,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+import time
 from types import MappingProxyType
 
 from fastapi import HTTPException
-from sqlalchemy import event, inspect, select, text, true
+from sqlalchemy import event, inspect, select, text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.orm import aliased
 
 from app.models.entities import Branch, Channel, ChannelConnectionStatus, Client, PlayerDevice, PlayerHeartbeatInbox
 from app.services.tenant_relations import conflict
@@ -30,30 +30,92 @@ def _channel_identity(row):
     return tuple(getattr(row, k) for k in ("id", "client_id", "branch_id", "channel_code"))
 
 
+class _HeartbeatRootBusy(Exception):
+    """An exact pre-write lock stage; never log its historical identifiers."""
+    def __init__(self, model, identity, shared):
+        self.model, self.identity, self.shared = model, identity, shared
+
+
 def _locked_roots(db, identity, channel_identity):
-    """One PostgreSQL statement, ordered materialized root locks, no media graph."""
+    """Fresh root locks; a busy stage is explicit, never parsed from SQL text."""
     if db.get_bind().dialect.name != "postgresql":
         channel = db.get(Channel, channel_identity[0], populate_existing=True)
         device = db.get(PlayerDevice, identity[0], populate_existing=True)
         client = db.get(Client, channel_identity[1], populate_existing=True)
         branch = db.get(Branch, channel_identity[2], populate_existing=True)
         return channel, device, client, branch
-    # First concrete anchor may wait for an ordinary administrative reader;
-    # we hold no other row lock yet. Later NOWAIT locks avoid BLUE's reverse
-    # Device->Channel / parent-delete cycles without changing the Player clock.
-    c = select(Channel).where(Channel.id == channel_identity[0]).with_for_update(of=Channel)\
-        .cte("hb_accept_channel").prefix_with("MATERIALIZED")
-    t = select(Client).join(c, true()).where(Client.id == channel_identity[1])\
-        .with_for_update(of=Client, read=True, nowait=True).cte("hb_accept_client").prefix_with("MATERIALIZED")
-    b = select(Branch).join(t, true()).where(Branch.id == channel_identity[2])\
-        .with_for_update(of=Branch, read=True, nowait=True).cte("hb_accept_branch").prefix_with("MATERIALIZED")
-    d = select(PlayerDevice).join(b, true()).where(PlayerDevice.id == identity[0])\
-        .with_for_update(of=PlayerDevice, nowait=True).cte("hb_accept_device").prefix_with("MATERIALIZED")
-    ca, da, ta, ba = (aliased(model, cte) for model, cte in
-                       ((Channel, c), (PlayerDevice, d), (Client, t), (Branch, b)))
-    row = db.execute(select(ca, da, ta, ba).select_from(d).join(c, true()).join(t, true()).join(b, true())
-                     .execution_options(populate_existing=True)).one_or_none()
-    return row if row is not None else (None, None, None, None)
+    values = {}
+    for model, key, shared in ((Channel, channel_identity[0], False),
+                               (Client, channel_identity[1], True),
+                               (Branch, channel_identity[2], True),
+                               (PlayerDevice, identity[0], False)):
+        try:
+            row = db.scalar(select(model).where(model.id == key)
+                            .with_for_update(of=model, read=shared, nowait=True)
+                            .execution_options(populate_existing=True))
+        except DBAPIError as error:
+            if getattr(error.orig, "sqlstate", None) != "55P03":
+                raise
+            raise _HeartbeatRootBusy(model, key, shared) from error
+        if row is None:
+            return None, None, None, None
+        values[model] = row
+    return values[Channel], values[PlayerDevice], values[Client], values[Branch]
+
+
+def _lock_unavailable():
+    error = HTTPException(503, "Player operation temporarily unavailable")
+    error._player_503_reason = "TENANT_GUARD_LOCK_UNAVAILABLE"
+    return error
+
+
+def _set_lock_budget(connection, wait_deadline_ns):
+    # A late grant may still finish an uncontended NOWAIT fast path. It must
+    # never start a new lock wait or inherit the old ten-second DB timeout.
+    milliseconds = max(1, (wait_deadline_ns - time.monotonic_ns()) // 1_000_000)
+    connection.execute(text("SET LOCAL lock_timeout = '" + str(milliseconds) + "ms'"))
+
+
+def _postgres_roots(db, identity, channel_identity, deadline_ns):
+    """Wait for a known conflicting row only after releasing every held lock.
+
+    BLUE may lock Device->Channel while GREEN locks Channel->Device. Waiting
+    for either second row while retaining the first can deadlock. Each busy
+    probe therefore rolls back its entire read-only transaction, waits on only
+    that exact row, releases it, and obtains all four fresh locks again. There
+    is no retry after writes, COMMIT, generic DB error or a failed authority
+    check, no sleep/poll loop, and no extension of the original request clock.
+    """
+    from app.core.player_admission import HEARTBEAT_HANDLER_RESERVE_NS
+    wait_deadline_ns = deadline_ns - HEARTBEAT_HANDLER_RESERVE_NS
+    key = int.from_bytes(sha256(("tecno.tenant.write.v1:" + channel_identity[1]).encode()).digest()[:8],
+                         "big", signed=True)
+    while True:
+        connection = db.connection()
+        if connection.get_isolation_level() != "READ COMMITTED":
+            raise conflict()
+        _set_lock_budget(connection, wait_deadline_ns)
+        # Separate statement: a writer may commit while this barrier waits.
+        # The following root queries must use new READ COMMITTED snapshots.
+        connection.execute(text("SELECT pg_advisory_xact_lock_shared(:key)"), {"key": key})
+        try:
+            roots = _locked_roots(db, identity, channel_identity)
+        except _HeartbeatRootBusy as busy:
+            db.rollback()
+            if time.monotonic_ns() >= wait_deadline_ns:
+                raise _lock_unavailable() from None
+            try:
+                connection = db.connection()
+                _set_lock_budget(connection, wait_deadline_ns)
+                # This transaction owns no tenant, parent or other row lock.
+                # A successful wait is only a wakeup, never an authorization.
+                db.scalar(select(busy.model.id).where(busy.model.id == busy.identity)
+                          .with_for_update(of=busy.model, read=busy.shared))
+            finally:
+                db.rollback()
+            continue
+        _set_lock_budget(connection, wait_deadline_ns)
+        return roots
 
 
 @dataclass(frozen=True)
@@ -66,7 +128,7 @@ class HeartbeatAcceptance:
 
 @contextmanager
 def heartbeat_accept_guard(db, *, device, channel, channel_values, device_values,
-                           receipt_id, receipt_values):
+                           receipt_id, receipt_values, deadline_ns=None):
     """Validate fresh scope and bind precisely three allowlisted ORM writes.
 
     A shared structural barrier precedes fresh READ COMMITTED snapshots. It is
@@ -107,22 +169,27 @@ def heartbeat_accept_guard(db, *, device, channel, channel_values, device_values
         raise conflict()
     from app.services.tenant_ownership import freeze
     receipt_expected = freeze(dict(receipt_values, id=receipt_id))
+    from app.core.player_admission import HEARTBEAT_REQUEST_BUDGET_NS
+    latest_deadline = time.monotonic_ns() + HEARTBEAT_REQUEST_BUDGET_NS
+    if deadline_ns is None:
+        deadline_ns = latest_deadline
+    elif type(deadline_ns) is not int:
+        raise conflict()
+    else:
+        deadline_ns = min(deadline_ns, latest_deadline)
     try:
         connection = db.connection()
         if connection.dialect.name == "postgresql":
-            if connection.get_isolation_level() != "READ COMMITTED":
-                raise conflict()
-            # The existing Player guard uses this same DB lock timeout.
-            connection.execute(text("SET LOCAL lock_timeout = '10s'"))
-            key = int.from_bytes(sha256(("tecno.tenant.write.v1:" + scope[2]).encode()).digest()[:8], "big", signed=True)
-            connection.execute(text("SELECT pg_advisory_xact_lock_shared(:key)"), {"key": key})
+            roots = _postgres_roots(db, original_device, original_channel, deadline_ns)
         elif connection.dialect.name == "sqlite":
             if connection.connection.driver_connection.in_transaction:
                 raise conflict()
             connection.exec_driver_sql("BEGIN IMMEDIATE")
         else:
             raise conflict()
-        current_channel, current_device, client, branch = _locked_roots(db, original_device, original_channel)
+        if connection.dialect.name != "postgresql":
+            roots = _locked_roots(db, original_device, original_channel)
+        current_channel, current_device, client, branch = roots
         if (current_device is None or current_channel is None
                 or _device_identity(current_device) != original_device
                 or _channel_identity(current_channel) != original_channel):
@@ -176,9 +243,7 @@ def heartbeat_accept_guard(db, *, device, channel, channel_values, device_values
             raise
         db.rollback()
         if getattr(error.orig, "sqlstate", None) == "55P03":
-            exc = HTTPException(503, "Player operation temporarily unavailable")
-            exc._player_503_reason = "TENANT_GUARD_LOCK_UNAVAILABLE"
-            raise exc from error
+            raise _lock_unavailable() from error
         raise conflict() from error
 
 

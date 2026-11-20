@@ -100,7 +100,7 @@ def _storage_unavailable():
 
 
 def enqueue(db: Session, device: PlayerDevice, channel: Channel,
-            payload: PlayerHeartbeatCreate) -> PlayerHeartbeatAck:
+            payload: PlayerHeartbeatCreate, *, deadline_ns: int | None = None) -> PlayerHeartbeatAck:
     """One complete private report and required liveness state commit before200."""
     bind = db.get_bind()
     # A Session bound to an externally owned Connection may leave its outer
@@ -143,7 +143,8 @@ def enqueue(db: Session, device: PlayerDevice, channel: Channel,
         # immutable private receipt, never optional references or label writes.
         with heartbeat_accept_guard(db, device=device, channel=channel,
                                     receipt_id=identity, receipt_values=values,
-                                    channel_values=channel_values, device_values=device_values) as plan:
+                                    channel_values=channel_values, device_values=device_values,
+                                    deadline_ns=deadline_ns) as plan:
             if plan.scope != expected or plan.transaction is not db.get_transaction():
                 raise conflict()
             with _capacity_serialization(db):

@@ -19,8 +19,10 @@ import json
 from typing import Callable
 
 from fastapi import HTTPException
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.player_diagnostics import admission_grant_recorder, _current_trace, _request_uuid
+from app.core.playback_failure_diagnostics import exception_observed as observe_playback_503
 
 
 EXPENSIVE_CAPACITY = 2
@@ -293,6 +295,12 @@ async def player_activity(request):
     except HTTPException as error:
         if kind == "heartbeat" and error.status_code == 503:
             _record_heartbeat_503(error, gate, request)
+        if kind == "ingress":
+            observe_playback_503(request, error)
+        raise
+    except StarletteHTTPException as error:
+        if kind == "ingress":
+            observe_playback_503(request, error)
         raise
 
 

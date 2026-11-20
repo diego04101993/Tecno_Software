@@ -5,6 +5,8 @@ SQLite/process-reopen and worker-recreation cases here do not replace that gate.
 No application startup, production URL, Player client or playback modification.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -13,19 +15,20 @@ from types import SimpleNamespace
 import subprocess
 import sys
 import time
+import threading
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from sqlalchemy import create_engine, delete, func, inspect, select, text, update
+from sqlalchemy import create_engine, delete, event, func, inspect, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.api.routes import player
 from app.models.entities import (
-    Branch, CampaignChannelAssignment, Channel, ChannelConnectionStatus, Client,
+    Branch, CampaignChannelAssignment, Channel, ChannelConnectionStatus, Client, ContentItem,
     PlayerDevice, PlayerHeartbeat, PlayerHeartbeatInbox,
 )
 from app.schemas.domain import PlayerHeartbeatCreate
@@ -698,3 +701,221 @@ class HeartbeatInboxPostgresTests(_HeartbeatInboxCases, GateFixture):
                 engine.dispose()
         self.addCleanup(cleanup)
         return engine
+
+
+@unittest.skipUnless(os.environ.get("SECURITY_R5_TEST_DATABASE_URL"), "Owned isolated PostgreSQL QA required")
+class HeartbeatGuardLockPostgresTests(GateFixture):
+    """Real concurrent transactions; no mocked lock success or weakened scope."""
+    make_engine = HeartbeatInboxPostgresTests.make_engine
+    payload = _HeartbeatInboxCases.payload
+    count = _HeartbeatInboxCases.count
+    process = _HeartbeatInboxCases.process
+
+    def attempt(self, *, ready=None, proceed=None, deadline_ns=None):
+        with Session(self.engine, autoflush=False) as db:
+            device = db.get(PlayerDevice, self.ids["A"]["device"])
+            channel = db.get(Channel, self.ids["A"]["channel"])
+            if ready is not None:
+                ready.set()
+                self.assertTrue(proceed.wait(4), "QA authority handoff did not complete")
+            started = time.monotonic()
+            try:
+                ack = inbox.enqueue(db, device, channel, self.payload(), deadline_ns=deadline_ns)
+                return {"status": 200, "ok": ack.ok, "elapsed": time.monotonic() - started}
+            except HTTPException as error:
+                return {"status": error.status_code, "reason": getattr(error, "_player_503_reason", None),
+                        "elapsed": time.monotonic() - started}
+
+    def assert_empty_acceptance(self):
+        self.assertEqual(self.count(PlayerHeartbeatInbox), 0)
+        self.assertEqual(self.count(PlayerHeartbeat), 0)
+
+    def test_short_locks_on_each_exact_root_release_without_503(self):
+        for model, key in ((Channel, "channel"), (Client, "client"),
+                           (Branch, "branch"), (PlayerDevice, "device")):
+            with self.subTest(root=model.__name__):
+                with Session(self.engine) as holder, ThreadPoolExecutor(max_workers=1) as pool:
+                    holder.scalar(select(model.id).where(model.id == self.ids["A"][key]).with_for_update())
+                    future = pool.submit(self.attempt)
+                    time.sleep(.10)
+                    self.assertFalse(future.done(), "A transient root lock must wait rather than reject immediately")
+                    holder.rollback()
+                    result = future.result(timeout=4)
+                self.assertEqual(result["status"], 200, result)
+                self.assertLess(result["elapsed"], 4)
+        self.assertEqual(self.count(PlayerHeartbeatInbox), 4)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_blue_device_then_channel_order_does_not_deadlock_green(self):
+        waiting_on_device = threading.Event()
+        blue_thread = threading.get_ident()
+
+        def observe(_connection, _cursor, statement, _parameters, _context, _many):
+            if (threading.get_ident() != blue_thread
+                    and "FROM player_devices" in statement and "FOR UPDATE" in statement
+                    and "NOWAIT" not in statement):
+                waiting_on_device.set()
+
+        event.listen(self.engine, "before_cursor_execute", observe)
+        try:
+            with Session(self.engine) as blue, ThreadPoolExecutor(max_workers=1) as pool:
+                blue.scalar(select(PlayerDevice.id).where(
+                    PlayerDevice.id == self.ids["A"]["device"]).with_for_update())
+                future = pool.submit(self.attempt)
+                self.assertTrue(waiting_on_device.wait(3), "GREEN did not reach the exact conflicting device wait")
+                blue.execute(text("SET LOCAL lock_timeout = '1s'"))
+                # This succeeds only if GREEN released Channel before waiting
+                # for our Device. Retaining half the old cycle fails this test.
+                blue.scalar(select(Channel.id).where(Channel.id == self.ids["A"]["channel"]).with_for_update())
+                blue.commit()
+                result = future.result(timeout=4)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", observe)
+        self.assertEqual(result["status"], 200, result)
+        self.assertLess(result["elapsed"], 4)
+        self.assertEqual(self.count(PlayerHeartbeatInbox), 1)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def mutation_wins(self, statement, *, structural=False):
+        loaded, proceed = threading.Event(), threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.attempt, ready=loaded, proceed=proceed)
+            self.assertTrue(loaded.wait(3))
+            with Session(self.engine) as writer:
+                if structural:
+                    import hashlib
+                    key = int.from_bytes(hashlib.sha256(("tecno.tenant.write.v1:" + self.ids["A"]["client"])
+                                         .encode()).digest()[:8], "big", signed=True)
+                    writer.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+                writer.execute(statement)
+                proceed.set()
+                time.sleep(.10)
+                writer.commit()
+            result = future.result(timeout=4)
+        self.assertIn(result["status"], (403, 409), result)
+        self.assertLess(result["elapsed"], 4)
+        self.assert_empty_acceptance()
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_channel_delete_winner_rejects_stale_auth_without_orphan(self):
+        self.mutation_wins(delete(Channel).where(Channel.id == self.ids["A"]["channel"]))
+
+    def test_branch_delete_winner_rejects_stale_auth_without_orphan(self):
+        self.mutation_wins(delete(Branch).where(Branch.id == self.ids["A"]["branch"]))
+
+    def test_tenant_delete_winner_rejects_stale_auth_without_orphan(self):
+        self.mutation_wins(delete(Client).where(Client.id == self.ids["A"]["client"]))
+
+    def test_device_deactivation_winner_rejects_stale_auth(self):
+        self.mutation_wins(update(PlayerDevice).where(PlayerDevice.id == self.ids["A"]["device"])
+                           .values(is_active=False))
+
+    def test_device_token_revocation_winner_rejects_stale_auth(self):
+        self.mutation_wins(update(PlayerDevice).where(PlayerDevice.id == self.ids["A"]["device"])
+                           .values(player_token_hash="e" * 64))
+
+    def test_device_reassignment_winner_rejects_original_tenant_scope(self):
+        target = Channel(client_id=self.ids["B"]["client"], branch_id=self.ids["B"]["branch"],
+                         name="Unoccupied B race destination")
+        self.db.add(target); self.db.commit()
+        self.mutation_wins(update(PlayerDevice).where(PlayerDevice.id == self.ids["A"]["device"])
+                           .values(channel_id=target.id, client_id=self.ids["B"]["client"],
+                                   branch_id=self.ids["B"]["branch"]))
+
+    def test_branch_deactivation_winner_rejects_stale_auth(self):
+        self.mutation_wins(update(Branch).where(Branch.id == self.ids["A"]["branch"]).values(is_active=False))
+
+    def test_client_suspension_winner_rejects_stale_auth(self):
+        self.mutation_wins(update(Client).where(Client.id == self.ids["A"]["client"]).values(status="inactive"))
+
+    def test_structural_tenant_gate_wait_uses_new_read_committed_snapshot(self):
+        self.mutation_wins(update(Client).where(Client.id == self.ids["A"]["client"]).values(status="inactive"),
+                           structural=True)
+
+    def acceptance_wins_delete(self, model, key):
+        roots_held, allow_commit = threading.Event(), threading.Event()
+        original = inbox._capacity_serialization
+
+        @contextmanager
+        def pause_after_authority(db):
+            with original(db):
+                roots_held.set()
+                self.assertTrue(allow_commit.wait(3))
+                yield
+
+        def remove():
+            with Session(self.engine) as writer:
+                writer.execute(text("SET LOCAL lock_timeout = '3s'"))
+                writer.execute(delete(model).where(model.id == self.ids["A"][key]))
+                writer.commit()
+
+        with patch.object(inbox, "_capacity_serialization", pause_after_authority):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                heartbeat = pool.submit(self.attempt)
+                self.assertTrue(roots_held.wait(3))
+                deletion = pool.submit(remove)
+                time.sleep(.10)
+                self.assertFalse(deletion.done(), "DELETE must not invalidate accepted scope before COMMIT")
+                allow_commit.set()
+                result = heartbeat.result(timeout=4)
+                deletion.result(timeout=4)
+        self.assertEqual(result["status"], 200, result)
+        with Session(self.engine) as db:
+            receipt = db.scalar(select(PlayerHeartbeatInbox))
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt.status, "PENDING")
+            self.assertEqual((receipt.player_device_id, receipt.channel_id, receipt.client_id, receipt.branch_id),
+                             tuple(self.ids["A"][name] for name in ("device", "channel", "client", "branch")))
+            self.assertEqual(receipt.payload_json, self.payload().model_dump(mode="json"))
+            self.assertIsNone(db.get(model, self.ids["A"][key]))
+        self.assertEqual(self.count(PlayerHeartbeat), 0)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_accepted_receipt_survives_concurrent_channel_delete(self):
+        self.acceptance_wins_delete(Channel, "channel")
+
+    def test_accepted_receipt_survives_concurrent_branch_delete(self):
+        self.acceptance_wins_delete(Branch, "branch")
+
+    def test_accepted_receipt_survives_concurrent_tenant_delete(self):
+        self.acceptance_wins_delete(Client, "client")
+
+    def test_related_media_mutation_cannot_make_raw_optional_id_authoritative(self):
+        with Session(self.engine) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+            writer.execute(update(ContentItem).where(ContentItem.id == self.ids["A"]["content"])
+                           .values(client_id=self.ids["B"]["client"]))
+            result = pool.submit(self.attempt).result(timeout=4)
+            self.assertEqual(result["status"], 200, result)
+            writer.commit()
+        self.assertTrue(self.process())
+        with Session(self.engine) as db:
+            history = db.scalar(select(PlayerHeartbeat))
+            receipt = db.scalar(select(PlayerHeartbeatInbox))
+            if history is not None:
+                self.assertNotEqual(history.current_content_id, self.ids["A"]["content"])
+                self.assertEqual(history.client_id, self.ids["A"]["client"])
+                self.assertEqual(history.report_json["payload"], self.payload().model_dump(mode="json"))
+            else:
+                self.assertIsNotNone(receipt)
+                self.assertEqual(receipt.status, "FAILED")
+                self.assertEqual(receipt.payload_json, self.payload().model_dump(mode="json"))
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_held_lock_beyond_remaining_budget_rejects_before_write_and_releases_session(self):
+        with Session(self.engine) as holder, ThreadPoolExecutor(max_workers=1) as pool:
+            holder.scalar(select(PlayerDevice.id).where(
+                PlayerDevice.id == self.ids["A"]["device"]).with_for_update())
+            deadline = time.monotonic_ns() + 1_250_000_000
+            result = pool.submit(self.attempt, deadline_ns=deadline).result(timeout=2)
+            self.assertEqual(result["status"], 503, result)
+            self.assertEqual(result["reason"], "TENANT_GUARD_LOCK_UNAVAILABLE")
+            self.assertLess(result["elapsed"], .8)
+            self.assert_empty_acceptance()
+            holder.rollback()
+        self.assertEqual(self.attempt()["status"], 200)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_late_grant_may_complete_uncontended_nowait_fast_path(self):
+        result = self.attempt(deadline_ns=time.monotonic_ns() + 750_000_000)
+        self.assertEqual(result["status"], 200, result)
+        self.assertEqual(self.engine.pool.checkedout(), 0)

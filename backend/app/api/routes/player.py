@@ -18,6 +18,7 @@ from app.core.player_diagnostics import (
     admission_acquired, admission_released, admission_wait_start, observed,
 )
 from app.core.player_admission import player_activity, playback_worker_activity, heartbeat_worker_activity
+from app.core.playback_failure_diagnostics import handler_entered as playback_handler_entered
 from app.models.entities import (
     Campaign,
     Channel,
@@ -246,13 +247,17 @@ def create_player_heartbeat(
     request: Request = None,
 ) -> PlayerHeartbeatAck:
     from anyio import from_thread
+    import time
+    from app.core.player_admission import HEARTBEAT_REQUEST_BUDGET_NS
     from app.services.heartbeat_queries import take_heartbeat_channel
     from app.services.heartbeat_inbox import enqueue, ensure_worker
 
     channel = take_heartbeat_channel(db, player_device)
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
-    acknowledgment = enqueue(db, player_device, channel, payload)
+    deadline_ns = (request.scope.get("_player_admission_started_ns", time.monotonic_ns())
+                   + HEARTBEAT_REQUEST_BUDGET_NS) if request is not None else None
+    acknowledgment = enqueue(db, player_device, channel, payload, deadline_ns=deadline_ns)
     if request is not None:
         application, engine = request.app, db.get_bind()
         try:
@@ -342,6 +347,7 @@ def create_player_playback_event(
     player_device: PlayerDevice = Depends(get_current_player_device),
     db: Session = Depends(get_db),
 ) -> PlayerPlaybackEventAck:
+    playback_handler_entered(request)
     from anyio import from_thread
     from app.services.playback_inbox import enqueue, ensure_worker
 

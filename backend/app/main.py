@@ -10,6 +10,7 @@ from app.core.database import SessionLocal, engine, init_db
 from app.core.player_diagnostics import install as install_player_diagnostics
 from app.core.player_admission import admissions, playback_worker_activity, PlaybackRecoveryMiddleware
 from app.core.player_admission import heartbeat_worker_activity, HeartbeatRecoveryMiddleware
+from app.core.playback_failure_diagnostics import Playback503DiagnosticsMiddleware
 from app.services.playback_inbox import ensure_worker, stop_worker
 from app.services.heartbeat_inbox import ensure_worker as ensure_heartbeat_worker, stop_worker as stop_heartbeat_worker
 from app.api.routes.player import _record_player_playback_event, _materialize_player_heartbeat
@@ -64,6 +65,7 @@ app.add_middleware(PlaybackRecoveryMiddleware, start=lambda: ensure_worker(
 app.add_middleware(HeartbeatRecoveryMiddleware, start=lambda: ensure_heartbeat_worker(
     app, engine, _materialize_player_heartbeat, activity=lambda: heartbeat_worker_activity(app)))
 install_player_diagnostics(app, engine, admission_snapshot=lambda: admissions(app).snapshot())
+app.add_middleware(Playback503DiagnosticsMiddleware, api_prefix=settings.API_PREFIX)
 
 
 @app.get("/")
