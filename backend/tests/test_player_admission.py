@@ -30,18 +30,46 @@ class PlayerAdmissionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(entered.wait(), 1)
         return release, tasks
 
-    async def test_expensive_capacity_stays_four_and_ingress_is_separate(self):
+    async def test_heartbeat_two_nonheartbeat_two_and_ingress_two_are_independent(self):
         lanes = PlayerAdmission()
-        self.assertEqual(lanes.expensive.capacity, 4)
+        self.assertEqual(lanes.heartbeat.capacity, 2)
+        self.assertEqual(lanes.expensive.capacity, 2)
+        self.assertEqual(lanes.heartbeat.capacity + lanes.expensive.capacity, 4)
         self.assertEqual(lanes.ingress.capacity, 2)
+        self.assertEqual(lanes.heartbeat_materializer.capacity, 1)
+        self.assertEqual(lanes.heartbeat_materializer.limits, {"heartbeat_worker": 0})
+        self.assertEqual(lanes.expensive.reservations, {"runtime": 1, "playback_worker": 1})
         release, holders = await self.fill(lanes.expensive, "runtime")
         try:
-            async with lanes.ingress.admit("ingress"):
+            async with lanes.heartbeat.admit("heartbeat"), lanes.ingress.admit("ingress"):
+                self.assertEqual(lanes.heartbeat.snapshot()["active"], 1)
                 self.assertEqual(lanes.ingress.snapshot()["active"], 1)
-                self.assertEqual(lanes.expensive.snapshot()["active"], 4)
+                self.assertEqual(lanes.expensive.snapshot()["active"], 2)
         finally:
             release.set()
             await asyncio.gather(*holders)
+        self.assertEqual(lanes.heartbeat.snapshot()["active"], 0)
+        self.assertEqual(lanes.expensive.snapshot()["active"], 0)
+
+    async def test_durable_heartbeat_background_lane_is_single_and_cannot_borrow_http_capacity(self):
+        lanes = PlayerAdmission()
+        release, background = await self.fill(lanes.heartbeat_materializer, "heartbeat_worker")
+        try:
+            with self.assertRaises(HTTPException) as rejected:
+                async with lanes.heartbeat_materializer.admit("heartbeat_worker"):
+                    self.fail("A second materializer must not create an unbounded background queue")
+            self.assertEqual(rejected.exception.status_code, 503)
+            self.assertEqual(lanes.heartbeat_materializer.snapshot()["active"], 1)
+            self.assertEqual(lanes.heartbeat_materializer.snapshot()["waiters"], 0)
+            async with lanes.heartbeat.admit("heartbeat"), lanes.expensive.admit("runtime"), lanes.ingress.admit("ingress"):
+                self.assertEqual(lanes.heartbeat.snapshot()["active"], 1)
+                self.assertEqual(lanes.expensive.snapshot()["active"], 1)
+                self.assertEqual(lanes.ingress.snapshot()["active"], 1)
+                self.assertEqual(lanes.heartbeat_materializer.snapshot()["active"], 1)
+        finally:
+            release.set()
+            await asyncio.gather(*background)
+        self.assertTrue(all(lane["active"] == lane["waiters"] == 0 for lane in lanes.snapshot().values()))
 
     async def test_finite_pending_limit_rejects_before_execution(self):
         gate = _FairGate(1, {"heartbeat": 2, "runtime": 2})
@@ -186,130 +214,118 @@ class PlayerAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.player_admission.ingress.snapshot()["active"], 0)
             self.assertEqual(app.state.player_admission.ingress.snapshot()["waiters"], 0)
 
-    async def test_reserved_heartbeat_precedes_another_borrower(self):
-        # Three runtimes borrow otherwise idle capacity. The last admitted HB
-        # leaves ordinary round-robin pointing at runtime; a second HB must
-        # still receive its reserved share when one borrowed slot is released.
-        gate = PlayerAdmission().expensive
-        releases, holders = [], []
-        for kind in ("runtime", "runtime", "runtime", "heartbeat"):
-            release, entered = asyncio.Event(), asyncio.Event()
-            releases.append(release)
-            holders.append(asyncio.create_task(self.hold(gate, kind, release, entered)))
-            await asyncio.wait_for(entered.wait(), 1)
-        pending_release = asyncio.Event()
-        runtime_entered, heartbeat_entered = asyncio.Event(), asyncio.Event()
-        waiting = [
-            asyncio.create_task(self.hold(gate, "runtime", pending_release, runtime_entered)),
-            asyncio.create_task(self.hold(gate, "heartbeat", pending_release, heartbeat_entered)),
-        ]
+    async def test_nonheartbeat_borrowers_cannot_take_or_receive_heartbeat_capacity(self):
+        lanes = PlayerAdmission()
+        other_release, others = await self.fill(lanes.expensive, "runtime")
+        waiting_release, runtime_entered = asyncio.Event(), asyncio.Event()
+        waiting = asyncio.create_task(self.hold(lanes.expensive, "runtime", waiting_release, runtime_entered))
         await asyncio.sleep(0)
+        heartbeat_release, heartbeats = await self.fill(lanes.heartbeat, "heartbeat")
         try:
-            self.assertEqual(gate.snapshot()["active"], 4)
-            self.assertEqual(gate.snapshot()["waiters"], 2)
-            releases[0].set()
-            await asyncio.wait_for(heartbeat_entered.wait(), 1)
-            self.assertFalse(runtime_entered.is_set(), "A borrower must not take HB's reserved share")
-            self.assertEqual(gate.snapshot()["active"], 4)
+            self.assertEqual(lanes.expensive.snapshot()["active"], 2)
+            self.assertEqual(lanes.expensive.snapshot()["waiters"], 1)
+            self.assertEqual(lanes.heartbeat.snapshot()["active"], 2)
+            self.assertFalse(runtime_entered.is_set())
+            heartbeat_release.set()
+            await asyncio.gather(*heartbeats)
+            self.assertFalse(runtime_entered.is_set(), "HB releases cannot lend a permit across lanes")
+            self.assertEqual(lanes.expensive.snapshot()["active"], 2)
         finally:
-            for release in releases:
-                release.set()
-            pending_release.set()
-            await asyncio.wait_for(asyncio.gather(*holders, *waiting), 2)
-        self.assertEqual(gate.snapshot()["active"], 0)
-        self.assertEqual(gate.snapshot()["waiters"], 0)
+            other_release.set()
+            waiting_release.set()
+            heartbeat_release.set()
+            await asyncio.gather(*others, *heartbeats, waiting)
+        self.assertEqual(lanes.expensive.snapshot()["active"], 0)
+        self.assertEqual(lanes.expensive.snapshot()["waiters"], 0)
+        self.assertEqual(lanes.heartbeat.snapshot()["active"], 0)
 
-    async def test_runtime_and_worker_reclaim_reserved_slots_during_heartbeat_burst(self):
-        gate = PlayerAdmission().expensive
-        releases, holders = [], []
-        for _ in range(4):
-            release, entered = asyncio.Event(), asyncio.Event()
-            releases.append(release)
-            holders.append(asyncio.create_task(self.hold(gate, "heartbeat", release, entered)))
-            await asyncio.wait_for(entered.wait(), 1)
+    async def test_full_heartbeat_lane_cannot_block_runtime_and_worker(self):
+        lanes = PlayerAdmission()
+        heartbeat_release, heartbeats = await self.fill(lanes.heartbeat, "heartbeat")
         pending_release = asyncio.Event()
         heartbeat_entered, runtime_entered, worker_entered = (asyncio.Event() for _ in range(3))
         waiting = [
-            asyncio.create_task(self.hold(gate, "heartbeat", pending_release, heartbeat_entered)),
-            asyncio.create_task(self.hold(gate, "runtime", pending_release, runtime_entered)),
-            asyncio.create_task(self.hold(gate, "playback_worker", pending_release, worker_entered)),
+            asyncio.create_task(self.hold(lanes.heartbeat, "heartbeat", pending_release, heartbeat_entered)),
+            asyncio.create_task(self.hold(lanes.expensive, "runtime", pending_release, runtime_entered)),
+            asyncio.create_task(self.hold(lanes.expensive, "playback_worker", pending_release, worker_entered)),
         ]
-        await asyncio.sleep(0)
-        observers = [asyncio.create_task(runtime_entered.wait()), asyncio.create_task(worker_entered.wait())]
         try:
-            releases[0].set()
-            # The reservation policy can choose either deficient class first.
-            completed, _ = await asyncio.wait(
-                observers,
-                timeout=1, return_when=asyncio.FIRST_COMPLETED,
-            )
-            self.assertTrue(completed, "Runtime or consumer must reclaim its share")
-            self.assertFalse(heartbeat_entered.is_set())
-            releases[1].set()
             await asyncio.wait_for(asyncio.gather(runtime_entered.wait(), worker_entered.wait()), 1)
-            self.assertFalse(heartbeat_entered.is_set(), "HB must not starve runtime or durable processing")
-            self.assertEqual(gate.snapshot()["active"], 4)
-        finally:
-            for release in releases:
-                release.set()
+            self.assertFalse(heartbeat_entered.is_set())
+            self.assertEqual(lanes.heartbeat.snapshot()["active"], 2)
+            self.assertEqual(lanes.heartbeat.snapshot()["waiters"], 1)
+            self.assertEqual(lanes.expensive.snapshot()["active_by_class"], {"runtime": 1, "playback_worker": 1})
             pending_release.set()
-            await asyncio.wait_for(asyncio.gather(*holders, *waiting), 2)
-            for observer in observers:
-                if not observer.done():
-                    observer.cancel()
-            await asyncio.gather(*observers, return_exceptions=True)
-        self.assertEqual(gate.snapshot()["active"], 0)
-        self.assertEqual(gate.snapshot()["waiters"], 0)
+            await asyncio.gather(*waiting[1:])
+            self.assertFalse(heartbeat_entered.is_set(), "Non-HB releases cannot lend a permit across lanes")
+        finally:
+            heartbeat_release.set()
+            pending_release.set()
+            await asyncio.gather(*heartbeats, *waiting)
+        self.assertEqual(lanes.expensive.snapshot()["active"], 0)
+        self.assertEqual(lanes.heartbeat.snapshot()["active"], 0)
+        self.assertEqual(lanes.heartbeat.snapshot()["waiters"], 0)
 
-    async def test_reserved_gate_stays_work_conserving_with_global_four(self):
-        gate = PlayerAdmission().expensive
-        for kind in ("heartbeat", "runtime", "playback_worker"):
+    async def test_each_lane_is_work_conserving_with_four_http_expensive_permits(self):
+        lanes = PlayerAdmission()
+        for gate, kind, capacity in ((lanes.heartbeat, "heartbeat", 2),
+                                     (lanes.expensive, "runtime", 2),
+                                     (lanes.expensive, "playback_worker", 2)):
             with self.subTest(kind=kind):
                 release, holders = await self.fill(gate, kind)
                 try:
-                    self.assertEqual(gate.snapshot()["active"], 4,
-                                     "Uncontended work may borrow every idle permit")
+                    self.assertEqual(gate.snapshot()["active"], capacity)
                 finally:
                     release.set()
-                    await asyncio.wait_for(asyncio.gather(*holders), 2)
-        active = peak = 0
+                    await asyncio.gather(*holders)
+        active = {"heartbeat": 0, "nonheartbeat": 0}
+        peaks = dict(active)
+        peak_total = 0
         completed = []
 
         async def visit(kind):
-            nonlocal active, peak
+            nonlocal peak_total
+            lane = "heartbeat" if kind == "heartbeat" else "nonheartbeat"
+            gate = lanes.heartbeat if lane == "heartbeat" else lanes.expensive
             async with gate.admit(kind):
-                active += 1
-                peak = max(peak, active)
-                self.assertLessEqual(active, 4)
+                active[lane] += 1
+                peaks[lane] = max(peaks[lane], active[lane])
+                peak_total = max(peak_total, sum(active.values()))
+                self.assertLessEqual(active["heartbeat"], 2)
+                self.assertLessEqual(active["nonheartbeat"], 2)
+                self.assertLessEqual(sum(active.values()), 4)
                 try:
                     await asyncio.sleep(0)
                     completed.append(kind)
                 finally:
-                    active -= 1
+                    active[lane] -= 1
         kinds = ["heartbeat"] * 12 + ["runtime"] * 6 + ["playback_worker"]
         await asyncio.wait_for(asyncio.gather(*(visit(kind) for kind in kinds)), 2)
-        self.assertEqual(peak, 4)
+        self.assertEqual(peaks, {"heartbeat": 2, "nonheartbeat": 2})
+        self.assertEqual(peak_total, 4)
         self.assertCountEqual(completed, kinds)
-        self.assertEqual(gate.snapshot()["active"], 0)
-        self.assertEqual(gate.snapshot()["waiters"], 0)
+        for gate in (lanes.heartbeat, lanes.expensive):
+            self.assertEqual(gate.snapshot()["active"], 0)
+            self.assertEqual(gate.snapshot()["waiters"], 0)
 
-    async def test_actual_heartbeat_queue_is_bounded_at_sixteen(self):
-        gate = PlayerAdmission().expensive
+    async def test_actual_heartbeat_queue_is_bounded_at_twenty_two(self):
+        gate = PlayerAdmission().heartbeat
         release, holders = await self.fill(gate, "heartbeat")
-        pending = [asyncio.create_task(self.hold(gate, "heartbeat", release)) for _ in range(16)]
+        pending = [asyncio.create_task(self.hold(gate, "heartbeat", release)) for _ in range(22)]
         await asyncio.sleep(0)
         try:
-            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 16)
+            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 22)
             with self.assertRaises(HTTPException) as result:
                 async with gate.admit("heartbeat"):
-                    self.fail("Seventeenth waiting HB must not execute")
+                    self.fail("Twenty-third waiting HB must not execute")
             self.assertEqual(result.exception.status_code, 503)
             self.assertEqual(result.exception.headers["Retry-After"], "1")
-            self.assertEqual(gate.snapshot()["active"], 4)
-            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 16)
+            self.assertEqual(result.exception._player_503_reason, "ADMISSION_QUEUE_FULL")
+            self.assertEqual(gate.snapshot()["active"], 2)
+            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 22)
         finally:
             release.set()
-            await asyncio.wait_for(asyncio.gather(*holders, *pending), 2)
+            await asyncio.gather(*holders, *pending)
         self.assertEqual(gate.snapshot()["active"], 0)
         self.assertEqual(gate.snapshot()["waiters"], 0)
 
@@ -402,9 +418,9 @@ class PlayerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scope["_player_admission_started_ns"], 10_000_000_000)
         self.assertEqual(len(wake_calls), 1)
         self.assertFalse(executed)
-        self.assertEqual(app.state.player_admission.expensive.snapshot()["active"], 0)
-        self.assertEqual(app.state.player_admission.expensive.snapshot()["waiters"], 0)
-        self.assertEqual(app.state.player_admission.expensive.snapshot()["expired_before_handler"], 1)
+        self.assertEqual(app.state.player_admission.heartbeat.snapshot()["active"], 0)
+        self.assertEqual(app.state.player_admission.heartbeat.snapshot()["waiters"], 0)
+        self.assertEqual(app.state.player_admission.heartbeat.snapshot()["expired_before_handler"], 1)
 
     async def test_handler_failure_releases_capacity_and_queue_drains(self):
         gate = _FairGate(1, {"heartbeat": 2})
@@ -416,9 +432,90 @@ class PlayerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gate.snapshot()["active"], 0)
 
 
+    async def test_worker_reclaims_its_nonheartbeat_reserved_share_from_runtime_borrowers(self):
+        gate = PlayerAdmission().expensive
+        releases, holders = [], []
+        for _ in range(2):
+            release, entered = asyncio.Event(), asyncio.Event()
+            releases.append(release)
+            holders.append(asyncio.create_task(self.hold(gate, "runtime", release, entered)))
+            await entered.wait()
+        pending_release, runtime_entered, worker_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        pending = [asyncio.create_task(self.hold(gate, "runtime", pending_release, runtime_entered)),
+                   asyncio.create_task(self.hold(gate, "playback_worker", pending_release, worker_entered))]
+        await asyncio.sleep(0)
+        try:
+            releases[0].set()
+            await asyncio.wait_for(worker_entered.wait(), 1)
+            self.assertFalse(runtime_entered.is_set())
+            self.assertEqual(gate.snapshot()["active_by_class"], {"runtime": 1, "playback_worker": 1})
+        finally:
+            for release in releases:
+                release.set()
+            pending_release.set()
+            await asyncio.gather(*holders, *pending)
+        self.assertEqual(gate.snapshot()["active"], 0)
+        self.assertEqual(gate.snapshot()["waiters"], 0)
+
+    async def test_heartbeat_latest_grant_reserves_one_second_of_unchanged_total_budget(self):
+        from app.core import player_admission as admission
+
+        self.assertEqual(admission.HEARTBEAT_REQUEST_BUDGET_NS, 5_000_000_000)
+        self.assertEqual(admission.HEARTBEAT_HANDLER_RESERVE_NS, 1_000_000_000)
+        origin = 10_000_000_000
+        clock = {"now": origin + 3_999_999_999}
+        controls = PlayerAdmission()
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(player_admission=controls)), method="POST",
+                                  scope={"route": SimpleNamespace(path="/api/player/heartbeat"),
+                                         "_player_admission_started_ns": origin})
+        with patch.object(admission, "time", SimpleNamespace(monotonic_ns=lambda: clock["now"])):
+            async with player_activity(request):
+                self.assertEqual(controls.heartbeat.snapshot()["active"], 1)
+                # The reserve controls entry only. Already admitted writes must
+                # still finish even if the original five-second budget elapses.
+                clock["now"] = origin + 6_000_000_000
+                await asyncio.sleep(0)
+                self.assertEqual(controls.heartbeat.snapshot()["active"], 1)
+        self.assertEqual(controls.heartbeat.snapshot()["active"], 0)
+        clock["now"] = origin + 4_000_000_000
+        with patch.object(admission, "time", SimpleNamespace(monotonic_ns=lambda: clock["now"])):
+            with self.assertLogs("app.core.player_admission", level="WARNING"):
+                with self.assertRaises(HTTPException) as error:
+                    async with player_activity(request):
+                        self.fail("No new handler may start at or after the latest grant boundary")
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual(error.exception._player_503_reason, "ADMISSION_DEADLINE_AT_ENTRY")
+        self.assertEqual(controls.heartbeat.snapshot()["active"], 0)
+        self.assertEqual(controls.heartbeat.snapshot()["waiters"], 0)
+
+    async def test_process_diagnostics_aggregate_both_expensive_lanes_and_keep_full_snapshots(self):
+        from app.core import player_diagnostics as diagnostic
+
+        lanes = PlayerAdmission()
+        hb_release, heartbeats = await self.fill(lanes.heartbeat, "heartbeat")
+        other_release, others = await self.fill(lanes.expensive, "runtime")
+        background_release, background = await self.fill(lanes.heartbeat_materializer, "heartbeat_worker")
+        try:
+            with patch.object(diagnostic._state, "admission_snapshot", lanes.snapshot):
+                row = diagnostic._counter_snapshot()
+            self.assertEqual(row["admission_capacity"], 5)
+            self.assertEqual(row["admission_active"], 5)
+            self.assertEqual(row["admission_waiters"], 0)
+            self.assertEqual(row["player_admission"], lanes.snapshot())
+            self.assertEqual(row["player_admission"]["heartbeat"]["active"], 2)
+            self.assertEqual(row["player_admission"]["expensive"]["active"], 2)
+            self.assertEqual(row["player_admission"]["heartbeat_materializer"]["active"], 1)
+        finally:
+            hb_release.set()
+            other_release.set()
+            background_release.set()
+            await asyncio.gather(*heartbeats, *others, *background)
+
+
+
 class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
     async def _hold(self, gate, release, entered):
-        async with gate.admit("runtime"):
+        async with gate.admit("heartbeat"):
             entered.set()
             await release.wait()
 
@@ -456,24 +553,24 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
     async def test_six_real_admission_rejection_branches_preserve_http_and_permits(self):
         from app.core import player_admission as admission
 
-        self.assertEqual(admission.EXPENSIVE_CAPACITY, 4)
+        self.assertEqual(admission.EXPENSIVE_CAPACITY, 2)
         self.assertEqual(admission.HEARTBEAT_ADMISSION_CAPACITY, 2)
-        self.assertEqual(admission.HEARTBEAT_MAX_WAITERS, 16)
+        self.assertEqual(admission.HEARTBEAT_MAX_WAITERS, 22)
         self.assertEqual(admission.HEARTBEAT_REQUEST_BUDGET_NS, 5_000_000_000)
-        gate = PlayerAdmission().expensive
+        gate = PlayerAdmission().heartbeat
         error = await self._capture(gate, time.monotonic_ns() - 1)
         self._assert_admission_error(error, "ADMISSION_DEADLINE_AT_ENTRY")
         self.assertEqual(gate.snapshot()["active"], 0)
         self.assertEqual(gate.snapshot()["waiters"], 0)
 
 
-        gate = PlayerAdmission().expensive
+        gate = PlayerAdmission().heartbeat
         release, holders = await self._fill(gate)
         pending = [asyncio.create_task(self._capture(
-            gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)) for _ in range(16)]
+            gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)) for _ in range(22)]
         await asyncio.sleep(0)
         try:
-            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 16)
+            self.assertEqual(gate.snapshot()["by_class"]["heartbeat"], 22)
             error = await self._capture(gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)
             self._assert_admission_error(error, "ADMISSION_QUEUE_FULL")
         finally:
@@ -484,12 +581,12 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gate.snapshot()["active"], 0)
         self.assertEqual(gate.snapshot()["waiters"], 0)
 
-        gate = PlayerAdmission().expensive
+        gate = PlayerAdmission().heartbeat
         release, holders = await self._fill(gate)
         try:
             error = await self._capture(gate, time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS)
             self._assert_admission_error(error, "ADMISSION_WAIT_DEADLINE")
-            self.assertEqual(gate.snapshot()["active"], 4)
+            self.assertEqual(gate.snapshot()["active"], 2)
         finally:
             release.set()
             await asyncio.gather(*holders)
@@ -501,7 +598,7 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
             ("ADMISSION_EXPIRED_AT_GRANT", lambda deadline: [deadline - 1, deadline + 1]),
         ):
             with self.subTest(reason=reason):
-                gate = PlayerAdmission().expensive
+                gate = PlayerAdmission().heartbeat
                 release, holders = await self._fill(gate)
                 deadline = time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS
                 waiting = asyncio.create_task(self._capture(gate, deadline))
@@ -523,7 +620,7 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(gate.snapshot()["active"], 0)
                 self.assertEqual(gate.snapshot()["waiters"], 0)
 
-        gate = PlayerAdmission().expensive
+        gate = PlayerAdmission().heartbeat
         deadline = time.monotonic_ns() + admission.HEARTBEAT_REQUEST_BUDGET_NS
         now = {"value": deadline - 1_000_000}
         clock = SimpleNamespace(monotonic_ns=lambda: now["value"])
@@ -594,6 +691,7 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(raised.exception, error)
             logger.assert_not_called()
             self.assertEqual(controls.expensive.snapshot()["active"], 0)
+            self.assertEqual(controls.heartbeat.snapshot()["active"], 0)
             self.assertEqual(controls.ingress.snapshot()["active"], 0)
 
     async def test_logging_failure_preserves_original_503_instead_of_500(self):
@@ -609,6 +707,7 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception, error)
         self._assert_admission_error(raised.exception, "ADMISSION_QUEUE_FULL")
         self.assertEqual(controls.expensive.snapshot()["active"], 0)
+        self.assertEqual(controls.heartbeat.snapshot()["active"], 0)
         self.assertEqual(controls.expensive.snapshot()["waiters"], 0)
 
     async def test_real_router_queue_503_logs_once_without_opt_in_diagnostics_or_database(self):
@@ -630,9 +729,9 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
 
         app.dependency_overrides[get_current_player_device] = forbidden_dependency
         app.dependency_overrides[get_db] = forbidden_dependency
-        gate = controls.expensive
+        gate = controls.heartbeat
         release, holders = await self._fill(gate)
-        pending = [asyncio.create_task(self._capture(gate, time.monotonic_ns() + 5_000_000_000)) for _ in range(16)]
+        pending = [asyncio.create_task(self._capture(gate, time.monotonic_ns() + 5_000_000_000)) for _ in range(22)]
         await asyncio.sleep(0)
         try:
             with patch.object(player_diagnostics, "ENABLED", False):
@@ -652,8 +751,8 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
             self._assert_metadata(row, retry_after_present=True)
             self.assertEqual(row["request_id"], request_uuid)
             self.assertNotIn("x-request-id", response.headers)
-            self.assertEqual(row["gate_state_after_cleanup"]["active"], 4)
-            self.assertEqual(row["gate_state_after_cleanup"]["waiters"]["heartbeat"], 16)
+            self.assertEqual(row["gate_state_after_cleanup"]["active"], 2)
+            self.assertEqual(row["gate_state_after_cleanup"]["waiters"]["heartbeat"], 22)
         finally:
             for task in pending:
                 task.cancel()
@@ -674,7 +773,7 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_after_grant_returns_the_owned_permit(self):
         from app.core import player_admission as admission
 
-        gate = PlayerAdmission().expensive
+        gate = PlayerAdmission().heartbeat
         release, holders = await self._fill(gate)
         waiting = None
         try:

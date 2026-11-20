@@ -17,18 +17,18 @@ from fastapi import FastAPI, HTTPException, Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from test_tenant_gate_performance import GateFixture
 from app.api.deps import get_current_player_device, get_db
 from app.api.routes import player
-from app.models.entities import CampaignChannelAssignment, PlayerHeartbeat, PlayerPlaybackEvent
+from app.models.entities import CampaignChannelAssignment, PlayerHeartbeat, PlayerPlaybackEvent, PlayerHeartbeatInbox
 from app.schemas.domain import PlayerPlaybackEventCreate
 from app.services import media_references
 
 
 class PlayerActivityAdmissionTests(IsolatedAsyncioTestCase):
-    async def test_expensive_four_and_durable_ingress_two_bound_auth_and_keep_time_available(self):
+    async def test_heartbeat_two_nonheartbeat_two_and_ingress_two_bound_auth_and_keep_time_available(self):
         app = FastAPI()
         app.include_router(player.router, prefix="/api/player")
         admitted = []
@@ -44,31 +44,40 @@ class PlayerActivityAdmissionTests(IsolatedAsyncioTestCase):
 
         app.dependency_overrides[get_current_player_device] = pause_authentication
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-            requests = []
-            for _ in range(2):
-                requests.extend([
-                    client.get("/api/player/runtime-config"),
-                    client.post("/api/player/heartbeat", json={"status": "online"}),
-                    client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"}),
-                ])
-            # One extra request in each lane must wait before authentication.
-            requests.extend([
-                client.post("/api/player/heartbeat", json={"status": "online"}),
-                client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"}),
-            ])
+            requests = [client.post("/api/player/heartbeat", json={"status": "online"}) for _ in range(2)]
+            requests += [client.get("/api/player/runtime-config") for _ in range(2)]
+            requests += [client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"})
+                         for _ in range(2)]
+            # One additional request in each of the three finite lanes must
+            # remain before authentication until its own lane frees a permit.
+            requests += [client.post("/api/player/heartbeat", json={"status": "online"}),
+                         client.get("/api/player/runtime-config"),
+                         client.post("/api/player/playback-events", json={"started_at": "2026-01-01T00:00:00Z"})]
             responses = asyncio.gather(*requests)
             try:
                 await asyncio.wait_for(budget_admitted.wait(), timeout=3)
                 time_response = await asyncio.wait_for(client.get("/api/player/time"), timeout=3)
                 self.assertEqual(time_response.status_code, 200)
+                self.assertEqual(admitted.count("/api/player/heartbeat"), 2)
+                self.assertEqual(admitted.count("/api/player/runtime-config"), 2)
                 self.assertEqual(admitted.count("/api/player/playback-events"), 2)
-                self.assertEqual(len(admitted) - admitted.count("/api/player/playback-events"), 4)
-                self.assertEqual(len(admitted), 6, "Both independent budgets must apply before authentication")
+                self.assertEqual(len(admitted), 6, "Every lane must apply before authentication")
+                lanes = app.state.player_admission.snapshot()
+                self.assertEqual(lanes["heartbeat"]["active"], 2)
+                self.assertEqual(lanes["expensive"]["active"], 2)
+                self.assertEqual(lanes["ingress"]["active"], 2)
+                self.assertEqual(lanes["heartbeat_materializer"]["active"], 0)
+                self.assertEqual(lanes["heartbeat_materializer"]["waiters"], 0)
+                for lane in (lanes[key] for key in ("heartbeat", "expensive", "ingress")):
+                    self.assertEqual(lane["waiters"], 1)
             finally:
                 release.set()
                 results = await asyncio.wait_for(responses, timeout=3)
-        self.assertEqual([response.status_code for response in results], [401] * 8)
-        self.assertEqual(len(admitted), 8, "Authentication failure must release capacity for waiting requests")
+        self.assertEqual([response.status_code for response in results], [401] * 9)
+        self.assertEqual(len(admitted), 9, "Authentication failure must release each owned permit")
+        for lane in app.state.player_admission.snapshot().values():
+            self.assertEqual(lane["active"], 0)
+            self.assertEqual(lane["waiters"], 0)
 
 
 @skipUnless(os.environ.get("SECURITY_R5_TEST_DATABASE_URL"), "Owned local PostgreSQL QA required")
@@ -101,6 +110,8 @@ class PlayerConnectionPoolTests(GateFixture):
 
     def setUp(self):
         super().setUp()
+        # ACK observations and derived-processing observations are separate.
+        self.enterContext(patch("app.services.heartbeat_inbox.ensure_worker", return_value=None))
         a = self.ids["A"]
         self.db.add(CampaignChannelAssignment(channel_id=a["channel"], campaign_id=a["campaign"]))
         self.db.commit()
@@ -140,11 +151,23 @@ class PlayerConnectionPoolTests(GateFixture):
             "content_id": a["content"], "campaign_id": a["campaign"], "layout_id": a["layout"],
             "started_at": datetime.now(UTC).isoformat(), "status": "completed"})
 
+    def settle_heartbeats(self):
+        from app.services.heartbeat_inbox import materialize_one
+        count = 0
+        while materialize_one(self.engine, player._materialize_player_heartbeat):
+            count += 1
+            self.assertLessEqual(count, 128)
+        with Session(self.engine) as db:
+            self.assertIsNone(db.scalar(select(PlayerHeartbeatInbox)),
+                              "Accepted reports must materialize, not be hidden as FAILED/backlogged")
+
     def assert_pool_returned(self):
         from app.services.playback_inbox import stop_worker
         # All individual/joined HTTP calls have completed at this boundary.
         # The durable consumer may still own a legitimate short idle poll.
         self.http.portal.call(stop_worker, self.http.app, self.engine)
+        from app.services.heartbeat_inbox import stop_worker as stop_heartbeat_worker
+        self.http.portal.call(stop_heartbeat_worker, self.http.app, self.engine)
         self.assertEqual(self.engine.pool.checkedout(), 0)
         self.assertEqual(self.checked_out, 0)
         self.assertEqual(self.pool_events["checkout"], self.pool_events["checkin"])
@@ -169,6 +192,8 @@ class PlayerConnectionPoolTests(GateFixture):
             for kind, expected in (("runtime", 200), ("heartbeat", 200), ("event", 201)):
                 response = self.call(kind)
                 self.assertEqual(response.status_code, expected, response.text)
+                if kind == "heartbeat":
+                    self.settle_heartbeats()
                 self.assert_pool_returned()
         self.assertLessEqual(self.peak_checked_out, 1)
         self.assertEqual(self.engine.pool.size(), 1)
@@ -186,6 +211,9 @@ class PlayerConnectionPoolTests(GateFixture):
             ) as payload_checks:
                 response = self.call(kind)
                 self.assertEqual(response.status_code, status_code, response.text)
+                if kind == "heartbeat":
+                    self.assertEqual(content_checks.call_count, 0, "Optional media work ran before durable ACK")
+                    self.settle_heartbeats()
                 self.assertEqual([call.args[2].id for call in content_checks.call_args_list], [a["content"].id])
                 layouts = [call.args[2] for call in payload_checks.call_args_list
                            if call.args[2] in (a["layout"].zones, b["layout"].zones)]
@@ -227,6 +255,7 @@ class PlayerConnectionPoolTests(GateFixture):
             results = list(executor.map(self.call, kinds))
         for kind, response in zip(kinds, results):
             self.assertEqual(response.status_code, 201 if kind == "event" else 200, response.text)
+        self.settle_heartbeats()
         self.assert_pool_returned()
 
     def test_auth_and_snapshot_errors_release_connections_and_next_request_recovers(self):

@@ -1,10 +1,11 @@
 """Finite process-local admission; playback persistence has a separate lane.
 
-The expensive lane still has four permits. Reserved shares protect heartbeat,
-runtime and the playback worker; idle shares remain borrowable. No DB
-connection/thread token is acquired while a caller is waiting here. A heartbeat
-past its server-side request budget cannot enter the handler. Admitted writes
-are never cancelled by a deadline.
+Heartbeat acceptance has two dedicated permits and twenty-two bounded waiters. Runtime and
+the playback worker share two separate permits with one reserved share each;
+they cannot borrow heartbeat's permits. Durable ingress remains independent.
+No DB connection/thread token is acquired while waiting here. The five-second
+heartbeat budget reserves its final second for the unchanged handler. Admitted
+writes are never cancelled by a deadline.
 """
 import asyncio
 from collections import deque
@@ -22,12 +23,13 @@ from fastapi import HTTPException
 from app.core.player_diagnostics import admission_grant_recorder, _current_trace, _request_uuid
 
 
-EXPENSIVE_CAPACITY = 4
+EXPENSIVE_CAPACITY = 2
 INGRESS_CAPACITY = 2
 HTTP_PENDING_PER_CLASS = 16
 HEARTBEAT_ADMISSION_CAPACITY = 2
-HEARTBEAT_MAX_WAITERS = 16
+HEARTBEAT_MAX_WAITERS = 22
 HEARTBEAT_REQUEST_BUDGET_NS = 5_000_000_000
+HEARTBEAT_HANDLER_RESERVE_NS = 1_000_000_000
 INGRESS_PENDING = 64
 _KINDS = {
     "heartbeat": "heartbeat",
@@ -246,14 +248,19 @@ class _FairGate:
 
 class PlayerAdmission:
     def __init__(self):
+        self.heartbeat = _FairGate(HEARTBEAT_ADMISSION_CAPACITY, {
+            "heartbeat": HEARTBEAT_MAX_WAITERS,
+        })
         self.expensive = _FairGate(EXPENSIVE_CAPACITY, {
-            "heartbeat": HEARTBEAT_MAX_WAITERS, "runtime": HTTP_PENDING_PER_CLASS,
+            "runtime": HTTP_PENDING_PER_CLASS,
             "playback_worker": 1,
-        }, reservations={"heartbeat": HEARTBEAT_ADMISSION_CAPACITY, "runtime": 1, "playback_worker": 1})
+        }, reservations={"runtime": 1, "playback_worker": 1})
         self.ingress = _FairGate(INGRESS_CAPACITY, {"ingress": INGRESS_PENDING})
+        self.heartbeat_materializer = _FairGate(1, {"heartbeat_worker": 0})
 
     def snapshot(self):
-        return {"expensive": self.expensive.snapshot(), "ingress": self.ingress.snapshot()}
+        return {"heartbeat": self.heartbeat.snapshot(), "expensive": self.expensive.snapshot(),
+                "ingress": self.ingress.snapshot(), "heartbeat_materializer": self.heartbeat_materializer.snapshot()}
 
 
 def admissions(app):
@@ -269,14 +276,17 @@ async def player_activity(request):
     # Use the server-selected route, independent of API_PREFIX or a mount path.
     kind = _KINDS[request.scope["route"].path.rsplit("/", 1)[-1]]
     controls = admissions(request.app)
-    gate = controls.ingress if kind == "ingress" else controls.expensive
+    gate = (controls.heartbeat if kind == "heartbeat" else
+            controls.ingress if kind == "ingress" else controls.expensive)
     observer = request if kind == "runtime" and request.method == "GET" else None
     deadline_ns = None
     if kind == "heartbeat":
         # This origin is captured by the always-on HTTP middleware, not a
         # client-supplied header or the opt-in diagnostic trace.
         started_ns = request.scope.get("_player_admission_started_ns", time.monotonic_ns())
-        deadline_ns = started_ns + HEARTBEAT_REQUEST_BUDGET_NS
+        # Latest grant, not a new client/handler timeout. Retain enough of the
+        # original five seconds for auth, validation and the atomic commit.
+        deadline_ns = started_ns + HEARTBEAT_REQUEST_BUDGET_NS - HEARTBEAT_HANDLER_RESERVE_NS
     try:
         async with gate.admit(kind, observer, deadline_ns=deadline_ns):
             yield
@@ -288,6 +298,25 @@ async def player_activity(request):
 
 def playback_worker_activity(app):
     return admissions(app).expensive.admit("playback_worker")
+
+
+def heartbeat_worker_activity(app):
+    return admissions(app).heartbeat_materializer.admit("heartbeat_worker")
+
+
+class HeartbeatRecoveryMiddleware:
+    """Resume durable heartbeat reports independently of playback recovery."""
+    def __init__(self, app, start):
+        self.app, self.start = app, start
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            scope.setdefault("_player_admission_started_ns", time.monotonic_ns())
+            try:
+                self.start()
+            except RuntimeError:
+                logging.getLogger(__name__).warning("HEARTBEAT_INBOX_START_DEFERRED")
+        await self.app(scope, receive, send)
 
 
 class PlaybackRecoveryMiddleware:

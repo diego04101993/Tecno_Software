@@ -80,7 +80,9 @@ class PlaybackInboxGuardTests(GateFixture):
     def test_additive_catalog_preserves_every_legacy_model_and_fingerprint(self):
         # Frozen from approved e6c3f4 before the additive inbox: no weakening or
         # replacement of any of the original 40 models / 105 edge policies.
-        legacy_models = sorted(spec.name for spec in MODEL_SPECS if spec.name != "PlayerPlaybackInbox")
+        # Both private operational inboxes are additions outside that baseline.
+        legacy_models = sorted(spec.name for spec in MODEL_SPECS
+                               if spec.name not in {"PlayerPlaybackInbox", "PlayerHeartbeatInbox"})
         legacy_edges = {key: value for key, value in APPROVED_RELATION_FINGERPRINTS.items()
                         if not key.startswith("PlayerPlaybackInbox.")}
         digest = lambda value: sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),

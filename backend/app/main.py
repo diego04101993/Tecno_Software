@@ -9,8 +9,10 @@ from app.core.config import get_settings, validate_rate_limit_process_configurat
 from app.core.database import SessionLocal, engine, init_db
 from app.core.player_diagnostics import install as install_player_diagnostics
 from app.core.player_admission import admissions, playback_worker_activity, PlaybackRecoveryMiddleware
+from app.core.player_admission import heartbeat_worker_activity, HeartbeatRecoveryMiddleware
 from app.services.playback_inbox import ensure_worker, stop_worker
-from app.api.routes.player import _record_player_playback_event
+from app.services.heartbeat_inbox import ensure_worker as ensure_heartbeat_worker, stop_worker as stop_heartbeat_worker
+from app.api.routes.player import _record_player_playback_event, _materialize_player_heartbeat
 from app.core.security_logging import install_security_log_redaction
 from app.services.seed import seed_initial_data
 from app.services.auth_rate_limit import AuthRateLimiter, AuthRateLimitMiddleware
@@ -33,6 +35,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await stop_heartbeat_worker(app, engine)
         await stop_worker(app, engine)
 
 
@@ -58,6 +61,8 @@ app.include_router(media.router)
 app.include_router(api_router, prefix=settings.API_PREFIX)
 app.add_middleware(PlaybackRecoveryMiddleware, start=lambda: ensure_worker(
     app, engine, _record_player_playback_event, activity=lambda: playback_worker_activity(app)))
+app.add_middleware(HeartbeatRecoveryMiddleware, start=lambda: ensure_heartbeat_worker(
+    app, engine, _materialize_player_heartbeat, activity=lambda: heartbeat_worker_activity(app)))
 install_player_diagnostics(app, engine, admission_snapshot=lambda: admissions(app).snapshot())
 
 

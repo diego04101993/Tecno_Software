@@ -1062,6 +1062,9 @@ class PlayerHeartbeat(UUIDMixin, TimestampMixin, Base):
     local_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     playback_position: Mapped[dict] = mapped_column(JSON, default=dict)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    # Private full-fidelity report; nullable for legacy BLUE writers/history.
+    # Optional IDs here never establish media ownership or public references.
+    report_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     player_device: Mapped[PlayerDevice] = relationship(back_populates="heartbeats")
     channel: Mapped[Channel] = relationship(back_populates="player_heartbeats")
@@ -1126,6 +1129,32 @@ class PlayerPlaybackInbox(UUIDMixin, Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_error_code: Mapped[str | None] = mapped_column(String(80))
+
+class PlayerHeartbeatInbox(UUIDMixin, Base):
+    """Durable private heartbeat evidence, independent of business-row deletes."""
+    __tablename__ = "player_heartbeat_inbox"
+    __table_args__ = (
+        CheckConstraint("status IN ('PENDING', 'FAILED')", name="ck_player_heartbeat_inbox_status"),
+        CheckConstraint("payload_bytes > 0", name="ck_player_heartbeat_inbox_payload_bytes"),
+        CheckConstraint("attempts >= 0", name="ck_player_heartbeat_inbox_attempts"),
+        Index("ix_player_heartbeat_inbox_available", "status", "available_at", "accepted_at", "id"),
+        Index("ix_player_heartbeat_inbox_device_order", "player_device_id", "accepted_at", "id"),
+    )
+
+    # Historical backend-captured identifiers, deliberately no FK/relationship:
+    # BLUE/admin DELETE must neither block nor erase unmaterialized reports.
+    player_device_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    branch_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    payload_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    status: Mapped[str] = mapped_column(String(8), nullable=False, default="PENDING", server_default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+
 
 class TouchLocation(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "touch_locations"

@@ -17,7 +17,7 @@ from app.core.public_urls import build_public_base_url
 from app.core.player_diagnostics import (
     admission_acquired, admission_released, admission_wait_start, observed,
 )
-from app.core.player_admission import player_activity, playback_worker_activity
+from app.core.player_admission import player_activity, playback_worker_activity, heartbeat_worker_activity
 from app.models.entities import (
     Campaign,
     Channel,
@@ -243,101 +243,94 @@ def create_player_heartbeat(
     payload: PlayerHeartbeatCreate,
     player_device: PlayerDevice = Depends(get_current_player_device),
     db: Session = Depends(get_db),
+    request: Request = None,
 ) -> PlayerHeartbeatAck:
-    from app.services.heartbeat_queries import (
-        refresh_heartbeat_roots, retain_heartbeat_write_keys, take_heartbeat_channel,
-    )
+    from anyio import from_thread
+    from app.services.heartbeat_queries import take_heartbeat_channel
+    from app.services.heartbeat_inbox import enqueue, ensure_worker
+
     channel = take_heartbeat_channel(db, player_device)
-    if not channel:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    acknowledgment = enqueue(db, player_device, channel, payload)
+    if request is not None:
+        application, engine = request.app, db.get_bind()
+        try:
+            from_thread.run_sync(lambda: ensure_worker(
+                application, engine, _materialize_player_heartbeat,
+                activity=lambda: heartbeat_worker_activity(application)))
+        except RuntimeError:
+            # COMMIT, not this best-effort wake, is the acceptance boundary.
+            logging.getLogger(__name__).warning("HEARTBEAT_INBOX_WAKE_DEFERRED")
+    return acknowledgment
 
-    current_time = datetime.now(UTC)
-    postgres = db.get_bind().dialect.name == "postgresql"
-    if postgres:
-        # The read snapshot releases the source transaction and expires ORM facts.
-        # Preserve the identity actually authenticated, never rebase a revoked
-        # token or moved channel/device onto identities loaded after that read.
-        device_identity_fields = ("id", "client_id", "branch_id", "channel_id", "player_token_hash", "is_active")
-        channel_identity_fields = ("id", "client_id", "branch_id", "channel_code")
-        authenticated_device = tuple(getattr(player_device, key) for key in device_identity_fields)
-        authenticated_channel = tuple(getattr(channel, key) for key in channel_identity_fields)
-    payload = _sanitize_heartbeat_telemetry(payload, db, channel.client_id)
-    if postgres:
-        refresh_heartbeat_roots(db, player_device, channel)
-    if postgres and (
-            tuple(getattr(player_device, key) for key in device_identity_fields) != authenticated_device
-            or tuple(getattr(channel, key) for key in channel_identity_fields) != authenticated_channel):
-        raise conflict()
-    normalized_status = payload.status.lower()
-    try:
-        channel_status = ChannelConnectionStatus(normalized_status)
-    except ValueError:
-        channel_status = ChannelConnectionStatus.UNKNOWN
-    channel_values = dict(status=channel_status, last_ping_at=current_time)
-    playback_label = _resolve_playback_label(
-        db,
-        content_id=payload.current_content_id,
-        campaign_id=payload.current_campaign_id,
-        layout_id=payload.current_layout_id,
+
+def _newer_materialized_heartbeat_label(db, device_id, accepted_at, event_id):
+    """Locked Channel serializes this fence with both GREEN and legacy writers."""
+    from sqlalchemy import and_, case, literal, or_
+    legacy_label = case(
+        (ContentItem.id.is_not(None), ContentItem.name),
+        (Campaign.id.is_not(None), Campaign.name),
+        (Layout.id.is_not(None), literal("Layout ") + Layout.name),
+        else_=None,
     )
-    if playback_label:
-        channel_values["current_playback"] = playback_label
+    # New reports record the label actually derived then; legacy BLUE rows have
+    # no envelope and retain their original reference/name interpretation.
+    recorded_label = PlayerHeartbeat.report_json["derived"]["playback_label"].as_string()
+    is_new_report = PlayerHeartbeat.report_json["payload"]["status"].as_string().is_not(None)
+    label = case((is_new_report, recorded_label), else_=legacy_label)
+    return db.scalar(select(PlayerHeartbeat.id)
+        .outerjoin(ContentItem, ContentItem.id == PlayerHeartbeat.current_content_id)
+        .outerjoin(Campaign, Campaign.id == PlayerHeartbeat.current_campaign_id)
+        .outerjoin(Layout, Layout.id == PlayerHeartbeat.current_layout_id)
+        .where(PlayerHeartbeat.player_device_id == device_id,
+               or_(PlayerHeartbeat.received_at > accepted_at,
+                   and_(PlayerHeartbeat.received_at == accepted_at, PlayerHeartbeat.id > event_id)),
+               label.is_not(None), label != "")
+        .limit(1)) is not None
 
-    device_values = dict(last_seen_at=current_time)
-    if payload.app_version:
-        device_values["app_version"] = payload.app_version
 
-    values = dict(
-        player_device_id=player_device.id,
-        channel_id=channel.id,
-        client_id=channel.client_id,
-        branch_id=channel.branch_id,
-        status=normalized_status,
-        current_content_id=payload.current_content_id,
-        current_campaign_id=payload.current_campaign_id,
-        current_layout_id=payload.current_layout_id,
-        resolution_json=payload.resolution,
-        mode=payload.mode,
-        app_version=payload.app_version,
-        cache_status_json=payload.cache_status,
-        errors_json=payload.errors,
-        local_time=payload.local_time,
-        playback_position=payload.playback_position,
-        received_at=current_time,
-    )
-    ref = RowRef("PlayerHeartbeat", str(uuid4()))
+def _materialize_player_heartbeat(payload, player_device, db, *, event_id, received_at,
+                                  raw_report, before_commit):
+    """Derived history/media only; never replay accepted liveness or version."""
+    from app.services.heartbeat_queries import retain_heartbeat_write_keys
+    channel = db.get(Channel, player_device.channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    # Keep the consumer's transaction/advisory claim intact. The full write
+    # guard still repeats fresh media/ownership proof before canonical writes.
+    payload = _sanitize_telemetry(payload, db, channel.client_id, "current_")
+    playback_label = _resolve_playback_label(db, content_id=payload.current_content_id,
+        campaign_id=payload.current_campaign_id, layout_id=payload.current_layout_id)
+    channel_values = {"current_playback": playback_label} if playback_label else {}
+    values = dict(player_device_id=player_device.id, channel_id=channel.id,
+        client_id=channel.client_id, branch_id=channel.branch_id,
+        status=payload.status.lower(), current_content_id=payload.current_content_id,
+        current_campaign_id=payload.current_campaign_id, current_layout_id=payload.current_layout_id,
+        resolution_json=payload.resolution, mode=payload.mode, app_version=payload.app_version,
+        cache_status_json=payload.cache_status, errors_json=payload.errors,
+        local_time=payload.local_time, playback_position=payload.playback_position,
+        received_at=received_at,
+        report_json={"payload": raw_report, "derived": {"playback_label": playback_label}})
+    ref = RowRef("PlayerHeartbeat", event_id)
     intents = (
         MutationIntent("UPDATE", RowRef("Channel", channel.id), tuple(channel_values.items())),
-        MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), tuple(device_values.items())),
+        MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), ()),
         MutationIntent("CREATE", ref, tuple(values.items())),
     )
     with player_write_guard(db, channel=channel, player_device=player_device,
                             operation="create_player_heartbeat", intents=intents) as plan:
-        if postgres:
+        if db.get_bind().dialect.name == "postgresql":
             retain_heartbeat_write_keys(db, plan, channel, player_device)
-        # Same-device telemetry is serialized at its authoritative rows. Use
-        # the approved timestamps so an older request admitted later cannot
-        # move last_seen_at/last_ping_at backwards.
-        channel_values["last_ping_at"] = next(p.values["last_ping_at"] for p in plan.proposed
-                                               if p.reference == intents[0].reference)
-        device_values["last_seen_at"] = next(p.values["last_seen_at"] for p in plan.proposed
-                                             if p.reference == intents[1].reference)
-        for key, value in channel_values.items():
-            setattr(channel, key, value)
-        for key, value in device_values.items():
-            setattr(player_device, key, value)
-        heartbeat = PlayerHeartbeat(id=ref.identity, **values)
-        db.add_all([channel, player_device, heartbeat])
+        before_commit(plan)
+        if playback_label and not _newer_materialized_heartbeat_label(
+                db, values["player_device_id"], received_at, event_id):
+            channel.current_playback = playback_label
+        heartbeat = PlayerHeartbeat(id=event_id, **values)
+        heartbeat.created_at = received_at
+        db.add(heartbeat)
         db.commit()
-        if not postgres:
-            db.refresh(heartbeat)
-
-    if postgres:
-        # Both ACK scalars were explicitly persisted above. Avoid reopening a
-        # transaction to refresh the row after the durable COMMIT. SQLite keeps
-        # its original DB timestamp representation and read path unchanged.
-        return PlayerHeartbeatAck(ok=True, received_at=current_time, channel_id=values["channel_id"])
-    return PlayerHeartbeatAck(ok=True, received_at=heartbeat.received_at, channel_id=channel.id)
+    return PlayerHeartbeatAck(ok=True, received_at=received_at, channel_id=values["channel_id"])
 
 
 @router.post("/playback-events", response_model=PlayerPlaybackEventAck, status_code=status.HTTP_201_CREATED,

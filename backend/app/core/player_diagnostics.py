@@ -542,15 +542,16 @@ def _counter_snapshot(engine: Any = None) -> dict[str, Any]:
         try:
             lanes = provider()
             # Keep HTTP ticket accounting separately from the actual resource
-            # gate. Durable materialization also occupies that four-slot gate;
-            # fast ingress has its own small persistence lane.
+            # gates. Heartbeat is isolated from runtime/materialization; fast
+            # ingress has its own small persistence lane and is not expensive.
             result["http_admission"] = {key: result[key] for key in (
                 "admission_active", "admission_waiters", "admission_started",
                 "admission_acquired", "admission_released", "admission_cancelled")}
             result["player_admission"] = lanes
-            result["admission_capacity"] = lanes["expensive"]["capacity"]
-            result["admission_active"] = lanes["expensive"]["active"]
-            result["admission_waiters"] = lanes["expensive"]["waiters"]
+            expensive = tuple(lanes[key] for key in ("expensive", "heartbeat", "heartbeat_materializer") if key in lanes)
+            result["admission_capacity"] = sum(lane["capacity"] for lane in expensive)
+            result["admission_active"] = sum(lane["active"] for lane in expensive)
+            result["admission_waiters"] = sum(lane["waiters"] for lane in expensive)
         except Exception:
             # Observability must never change the HTTP or worker outcome.
             pass

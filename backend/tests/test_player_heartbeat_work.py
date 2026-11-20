@@ -24,11 +24,13 @@ from app.api.routes import player
 from app.models.entities import (
     Branch, CampaignChannelAssignment, Channel, ChannelConnectionStatus, Client, ContentItem,
     DataSource, DataSourceType, Dataset, DatasetImport, DeviceOutput, PlayerDevice, PlayerHeartbeat,
-    PlayerPlaybackEvent,
+    PlayerPlaybackEvent, PlayerHeartbeatInbox,
 )
 from app.schemas.domain import PlayerHeartbeatCreate
 from app.services import media_references as media
 from app.services import tenant_mutations as mutations
+from app.services import heartbeat_inbox as inbox
+from app.services import heartbeat_acceptance as acceptance
 from app.services.runtime_read import runtime_reads
 from app.services.tenant_ownership import RowRef, TenantGraph, freeze
 from app.services.tenant_relations import RELATION_SPECS, model_class, model_spec
@@ -106,6 +108,43 @@ class HeartbeatStatementTemplateTests(unittest.TestCase):
 
 
 class _HeartbeatWorkCases:
+    def setUp(self):
+        super().setUp()
+        # Final-state assertions explicitly advance the real processor below.
+        # A successful HTTP response itself observes only committed acceptance.
+        self.enterContext(patch.object(inbox, "ensure_worker", return_value=None))
+
+    def assert_accepted_pending(self, response, *, count=1):
+        self.assertEqual(response.status_code, 200, response.text)
+        with Session(self.engine) as db:
+            receipts = list(db.scalars(select(PlayerHeartbeatInbox)))
+            self.assertEqual(len(receipts), count)
+            self.assertTrue(all(row.status == "PENDING" for row in receipts))
+            self.assertIsNone(db.scalar(select(PlayerHeartbeat)), "PREACK must not secretly materialize history")
+            self.assertIsNotNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        return receipts
+
+    def drain(self):
+        # No retry/backoff rewriting, no bypassed guard, and no implicit drain
+        # inside post()/latest(). FAILED receipts remain available for assertions.
+        progressed = 0
+        while inbox.materialize_one(self.engine, player._materialize_player_heartbeat):
+            progressed += 1
+            self.assertLessEqual(progressed, 128, "Derived processing did not reach its bounded idle boundary")
+        return progressed
+
+    def assert_failed_report_without_history(self):
+        with Session(self.engine) as db:
+            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+            receipts = list(db.scalars(select(PlayerHeartbeatInbox)))
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0].status, "FAILED")
+            self.assertTrue(receipts[0].last_error_code)
+            self.assertEqual(receipts[0].payload_json["current_content_id"], self.ids["A"]["content"])
+            channel = db.get(Channel, self.ids["A"]["channel"])
+            self.assertIsNotNone(channel.last_ping_at, "A valid durable acceptance must retain its liveness")
+            self.assertEqual(channel.current_playback, self.rows["A"]["channel"].current_playback)
+
     def payload(self, **overrides):
         a = self.ids["A"]
         values = dict(status="online", current_content_id=a["content"],
@@ -128,38 +167,35 @@ class _HeartbeatWorkCases:
     def test_ack_matches_committed_history_and_preserves_sqlite_serialization(self):
         after_commit, post_commit_sql = [], []
         original = Session.commit
-
         def commit(db):
-            heartbeat_write = any(isinstance(row, PlayerHeartbeat) for row in db.new)
+            receipt_write = any(isinstance(row, PlayerHeartbeatInbox) for row in db.new)
             result = original(db)
-            if heartbeat_write:
+            if receipt_write:
                 after_commit.append(True)
             return result
-
         def sql(_connection, _cursor, statement, _params, _context, _many):
             if after_commit:
                 post_commit_sql.append(statement.split(None, 1)[0])
-
         event.listen(self.engine, "before_cursor_execute", sql)
         try:
             with patch.object(Session, "commit", commit):
                 response = self.post()
         finally:
             event.remove(self.engine, "before_cursor_execute", sql)
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(after_commit, [True])
-        expected_reads = [] if self.engine.dialect.name == "postgresql" else ["SELECT", "SELECT", "SELECT"]
-        self.assertEqual(post_commit_sql, expected_reads,
-                         "PostgreSQL ACK must avoid redundant reads; SQLite retains its legacy read path")
+        self.assertEqual(after_commit, [True], "The ACK must follow the real durable receipt commit")
+        self.assertEqual(post_commit_sql, [], "Neither dialect should reread rows merely to serialize the ACK")
         self.assertEqual(self.engine.pool.checkedout(), 0)
-        row = self.latest()
+        receipt = self.assert_accepted_pending(response)[0]
         self.assertEqual(set(response.json()), {"ok", "received_at", "channel_id"})
         self.assertIs(response.json()["ok"], True)
-        self.assertEqual(response.json()["channel_id"], row.channel_id)
+        self.assertEqual(response.json()["channel_id"], receipt.channel_id)
         received = datetime.fromisoformat(response.json()["received_at"].replace("Z", "+00:00"))
+        self.assertEqual(utc(received), utc(receipt.accepted_at))
+        self.assertEqual(self.drain(), 1)
+        row = self.latest()
+        self.assertEqual(row.id, receipt.id)
         self.assertEqual(utc(received), utc(row.received_at))
-        self.assertEqual(received.tzinfo is None, self.engine.dialect.name == "sqlite",
-                         "SQLite's existing naive timestamp representation changed")
+        self.assertEqual(row.report_json["payload"], receipt.payload_json)
 
     def test_all_heartbeat_diagnostics_remain_individual_history(self):
         for number in range(4):
@@ -169,6 +205,8 @@ class _HeartbeatWorkCases:
                 cache_status={"sequence": number}, errors=[{"sequence": number}],
                 local_time="2026-01-02T03:04:05Z", playback_position={"position": number}))
             self.assertEqual(response.status_code, 200, response.text)
+        self.assert_accepted_pending(response, count=4)
+        self.assertEqual(self.drain(), 4)
         with Session(self.engine) as db:
             rows = list(db.scalars(select(PlayerHeartbeat).order_by(PlayerHeartbeat.received_at)))
             self.assertEqual(len(rows), 4, "Heartbeat work reduction discarded required history")
@@ -192,6 +230,7 @@ class _HeartbeatWorkCases:
             with self.subTest(bad=bad):
                 response = self.post(self.payload(**{"current_" + bad + "_id": self.ids["B"][bad]}))
                 self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.drain(), 1)
                 row = self.latest()
                 for key in ("content", "campaign", "layout"):
                     self.assertEqual(getattr(row, "current_" + key + "_id"),
@@ -214,6 +253,7 @@ class _HeartbeatWorkCases:
                 self.db.commit()
                 response = self.post(self.payload(current_campaign_id=None))
                 self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.drain(), 1)
                 row = self.latest()
                 self.assertIsNone(row.current_content_id, "Foreign opaque media survived heartbeat sanitization")
                 self.assertEqual(row.current_layout_id, self.ids["A"]["layout"])
@@ -227,6 +267,7 @@ class _HeartbeatWorkCases:
         self.db.commit()
         response = self.post(self.payload(current_campaign_id=None))
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.drain(), 1)
         row = self.latest()
         self.assertIsNone(row.current_layout_id)
         self.assertEqual(row.current_content_id, self.ids["A"]["content"])
@@ -273,6 +314,9 @@ class _HeartbeatWorkCases:
         event.listen(self.engine, "before_cursor_execute", sql)
         try:
             response = self.post()
+            self.assert_accepted_pending(response)
+            self.assertEqual(statements, [], "Optional graph discovery belongs after durable acceptance")
+            self.assertEqual(self.drain(), 1)
         finally:
             event.remove(self.engine, "before_cursor_execute", sql)
         self.assertEqual(response.status_code, 200, response.text)
@@ -288,10 +332,9 @@ class _HeartbeatWorkCases:
                                               channel_id=self.ids["A"]["channel"]))
         self.db.commit()
         response = self.post()
-        self.assertEqual(response.status_code, 409, response.text)
-        with Session(self.engine) as db:
-            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
-            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assert_accepted_pending(response)
+        self.assertEqual(self.drain(), 1)
+        self.assert_failed_report_without_history()
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_second_phase_rediscovers_new_foreign_incoming_assignment(self):
@@ -309,13 +352,12 @@ class _HeartbeatWorkCases:
                 graph.session.execute(insert(CampaignChannelAssignment).values(
                     campaign_id=self.ids["B"]["campaign"], channel_id=self.ids["A"]["channel"]))
 
+        response = self.post()
+        self.assert_accepted_pending(response)
         with patch.object(mutations, "_graph_validation_phase", phase):
-            response = self.post()
+            self.assertEqual(self.drain(), 1)
         self.assertEqual(phases, [True, True])
-        self.assertEqual(response.status_code, 409, "A negative incoming result escaped its first proof phase")
-        with Session(self.engine) as db:
-            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
-            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assert_failed_report_without_history()
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_second_phase_rechecks_media_authority(self):
@@ -332,13 +374,12 @@ class _HeartbeatWorkCases:
                     ContentItem.id == self.ids["B"]["content"]).values(
                         file_path=self.rows["A"]["content"].file_path))
 
+        response = self.post()
+        self.assert_accepted_pending(response)
         with patch.object(mutations, "_graph_validation_phase", phase):
-            response = self.post()
+            self.assertEqual(self.drain(), 1)
         self.assertEqual(phases, [True, True])
-        self.assertEqual(response.status_code, 409, "Media authority was reused across proof phases")
-        with Session(self.engine) as db:
-            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
-            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assert_failed_report_without_history()
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_current_playback_label_is_committed_with_original_precedence(self):
@@ -352,6 +393,7 @@ class _HeartbeatWorkCases:
         for payload, label in cases:
             response = self.post(payload)
             self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.drain(), 1)
             with Session(self.engine) as db:
                 self.assertEqual(db.get(Channel, a["channel"]).current_playback, label)
                 row = db.scalar(select(PlayerHeartbeat).order_by(PlayerHeartbeat.received_at.desc()))
@@ -384,6 +426,7 @@ class _HeartbeatWorkCases:
                     self.assertEqual(response.status_code, expected, response.text)
                     with Session(self.engine) as db:
                         self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+                        self.assertIsNone(db.scalar(select(PlayerHeartbeatInbox)))
                         self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
                         self.assertIsNone(db.get(PlayerDevice, self.ids["A"]["device"]).last_seen_at)
                 finally:
@@ -398,6 +441,7 @@ class _HeartbeatWorkCases:
                                    ("custom-status", ChannelConnectionStatus.UNKNOWN)):
             response = self.post(self.payload(status=reported, app_version=""))
             self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.drain(), 1)
             with Session(self.engine) as db:
                 channel = db.get(Channel, self.ids["A"]["channel"])
                 device = db.get(PlayerDevice, self.ids["A"]["device"])
@@ -415,8 +459,11 @@ class HeartbeatWorkSQLiteTests(_HeartbeatWorkCases, GateFixture):
     def test_sqlite_keeps_original_unshared_sanitizer(self):
         with patch.object(media, "media_reference_owners", wraps=media.media_reference_owners) as builds:
             response = self.post()
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(builds.call_count, 3, "SQLite cannot assume a PostgreSQL read-only MVCC snapshot")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(builds.call_count, 0, "No optional media work belongs in durable liveness acceptance")
+            self.assertEqual(self.drain(), 1)
+            self.assertEqual(builds.call_count, 3, "SQLite cannot assume a PostgreSQL read-only MVCC snapshot")
+        self.assertEqual(self.latest().current_content_id, self.ids["A"]["content"])
 
 
 @unittest.skipUnless(os.environ.get("SECURITY_R5_TEST_DATABASE_URL"),
@@ -438,6 +485,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
         try:
             first = self.post()
             self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(self.drain(), 1)
             turn[0] = "B"
             b = self.ids["B"]
             second = self.http.post("/api/player/heartbeat",
@@ -445,11 +493,13 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
                 json={"status": "online", "current_content_id": b["content"],
                       "current_campaign_id": b["campaign"], "current_layout_id": b["layout"]})
             self.assertEqual(second.status_code, 200, second.text)
+            self.assertEqual(self.drain(), 1)
             self.rows["A"]["content"].name = "A fresh after template warmup"
             self.db.commit()
             turn[0] = "A2"
             third = self.post()
             self.assertEqual(third.status_code, 200, third.text)
+            self.assertEqual(self.drain(), 1)
         finally:
             event.remove(Session, "do_orm_execute", execute)
         common = set(statements["A1"]) & set(statements["B"]) & set(statements["A2"])
@@ -476,6 +526,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
     def test_cached_template_executes_ast_guard_again_and_denies_writable_cte(self):
         response = self.post()
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.drain(), 1)
         original_check = media._OwnershipValidationPhase.before_cursor
         original_template = mutations._heartbeat_snapshot_template
         executed, checked = [], []
@@ -494,6 +545,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
         try:
             with patch.object(media._OwnershipValidationPhase, "before_cursor", check):
                 response = self.post()
+                self.assertEqual(self.drain(), 1)
             self.assertEqual(response.status_code, 200, response.text)
         finally:
             event.remove(Session, "do_orm_execute", execute)
@@ -511,7 +563,12 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
         with patch.object(mutations, "_heartbeat_snapshot_template", poisoned), patch.object(
                 media._OwnershipValidationPhase, "before_cursor", check):
             response = self.post()
-        self.assertEqual(response.status_code, 409, "The cached-statement path bypassed the DML AST guard")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.drain(), 1)
+        with Session(self.engine) as db:
+            rejected = db.scalar(select(PlayerHeartbeatInbox))
+            self.assertIsNotNone(rejected)
+            self.assertEqual(rejected.status, "FAILED", "The cached-statement path bypassed the DML AST guard")
         self.assertGreater(len(checked), before_checks)
         with Session(self.engine) as db:
             self.assertIsNone(db.scalar(select(ContentItem.id).where(
@@ -564,6 +621,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
         try:
             with patch.object(mutations, "_heartbeat_preload_snapshots", preload):
                 response = self.post()
+                self.assertEqual(self.drain(), 1)
         finally:
             event.remove(self.engine, "before_cursor_execute", sql)
         self.assertEqual(response.status_code, 200, response.text)
@@ -600,6 +658,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
 
         with patch.object(mutations, "_heartbeat_preload_snapshots", preload):
             response = self.post()
+            self.assertEqual(self.drain(), 1)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(tested_phases, {False, True})
         with Session(self.engine) as db:
@@ -674,6 +733,8 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
                 wraps=heartbeat_queries.load_heartbeat_auth_rows) as joined_auth:
             response = self.post()
             self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(observed.get("heartbeat", []), [], "Media validation ran before durable ACK")
+            self.assertEqual(self.drain(), 1)
             heartbeat_auth_calls = joined_auth.call_count
             current[0] = "runtime"
             headers = {"Authorization": "Bearer " + self.rows["A"]["token"]}
@@ -690,7 +751,8 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
             self.assertEqual(joined_auth.call_count, heartbeat_auth_calls,
                              "Non-heartbeat authentication opted into the heartbeat-only join")
         self.assertTrue(observed["heartbeat"])
-        self.assertTrue(all(observed["heartbeat"]))
+        self.assertEqual(observed["heartbeat"], [False, False, True],
+                         "Derived sanitization must be fresh before the guarded batched owner proof")
         self.assertFalse(any(observed.get("runtime", ())))
         self.assertFalse(any(observed.get("playback", ())))
         # This case starts the real durable-playback consumer to prove it does
@@ -704,18 +766,17 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def mutate_after_read(self, action, *, payload=None):
-        original = player._sanitize_heartbeat_telemetry
+        original = acceptance._locked_roots
         calls = []
 
-        def changed_after_read(value, db, client_id):
-            result = original(value, db, client_id)
+        def changed_after_read(db, device_identity, channel_identity):
             with Session(self.engine) as other:
                 action(other)
                 other.commit()
             calls.append(True)
-            return result
+            return original(db, device_identity, channel_identity)
 
-        with patch.object(player, "_sanitize_heartbeat_telemetry", changed_after_read):
+        with patch.object(acceptance, "_locked_roots", changed_after_read):
             response = self.post(payload)
         self.assertEqual(calls, [True])
         self.assertEqual(self.engine.pool.checkedout(), 0)
@@ -724,6 +785,9 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
     def assert_no_history(self):
         with Session(self.engine) as db:
             self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
+            self.assertIsNone(db.scalar(select(PlayerHeartbeatInbox)))
+            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+            self.assertIsNone(db.get(PlayerDevice, self.ids["A"]["device"]).last_seen_at)
 
     def test_authenticated_token_rotation_after_read_is_not_rebased(self):
         def rotate(db):
@@ -819,6 +883,7 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
 
         response = self.mutate_after_read(touch)
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.drain(), 1)
         self.assertEqual(self.latest().channel_id, a["channel"])
 
     def test_concurrent_activity_does_not_rebase_scope_or_move_times_backwards(self):
@@ -841,51 +906,44 @@ class HeartbeatWorkPostgresTests(_HeartbeatWorkCases, GateFixture):
 
     def test_optional_read_map_is_shared_only_inside_fresh_read_only_snapshot(self):
         original, builds = media.media_reference_owners, []
-
         def owners(db, root, **kwargs):
-            scope = runtime_reads(db)
-            phase = db.info.get(media._OWNERSHIP_VALIDATION_PHASE)
-            builds.append((db, scope, phase))
-            if scope is not None:
-                self.assertEqual(db.connection().get_isolation_level(), "REPEATABLE READ")
-                self.assertEqual(db.connection().exec_driver_sql("SHOW transaction_read_only").scalar_one(), "on")
+            builds.append((db, runtime_reads(db), db.info.get(media._OWNERSHIP_VALIDATION_PHASE)))
             return original(db, root, **kwargs)
-
         with patch.object(media, "media_reference_owners", owners):
-            for _ in range(2):
+            for number in range(2):
                 response = self.post()
                 self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(len(builds), 4, "Expected one read map and one fresh guarded map per heartbeat")
-        for start in (0, 2):
-            self.assertIsNotNone(builds[start][1])
-            self.assertIsNone(builds[start][2])
-            self.assertIsNone(builds[start + 1][1])
-            self.assertIsNotNone(builds[start + 1][2])
-            self.assertIsNot(builds[start][0], builds[start + 1][0])
-        self.assertIsNot(builds[0][1], builds[2][1], "Read authority escaped into the next heartbeat")
+                self.assertEqual(len(builds), number * 3, "Optional ownership must not run before ACK")
+                self.assertEqual(self.drain(), 1)
+        self.assertEqual(len(builds), 6, "Each report requires two original sanitizer maps and one fresh guarded map")
+        for start in (0, 3):
+            for entry in builds[start:start + 2]:
+                self.assertIsNone(entry[1], "A preexisting read proof escaped into the consumer transaction")
+                self.assertIsNone(entry[2])
+            self.assertIsNone(builds[start + 2][1])
+            self.assertIsNotNone(builds[start + 2][2])
+            self.assertTrue(all(item[0] is builds[start][0] for item in builds[start:start + 3]),
+                            "Materialization must preserve its claim and ownership transaction")
+        self.assertIsNot(builds[0][0], builds[3][0], "Authority cache/session escaped into the next report")
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_fresh_guard_rejects_authority_change_after_optional_read(self):
-        original = getattr(player, "_sanitize_heartbeat_telemetry",
-                           lambda payload, db, client_id: player._sanitize_telemetry(payload, db, client_id, "current_"))
+        original = player._sanitize_telemetry
         called = []
-
-        def changed_after_read(payload, db, client_id):
-            result = original(payload, db, client_id)
+        def changed_after_read(payload, db, client_id, prefix=""):
+            result = original(payload, db, client_id, prefix)
             with Session(self.engine) as other:
                 other.execute(update(ContentItem).where(ContentItem.id == self.ids["B"]["content"]).values(
                     file_path=self.rows["A"]["content"].file_path))
                 other.commit()
             called.append(True)
             return result
-
-        with patch.object(player, "_sanitize_heartbeat_telemetry", changed_after_read, create=True):
-            response = self.post()
+        response = self.post()
+        self.assert_accepted_pending(response)
+        with patch.object(player, "_sanitize_telemetry", changed_after_read):
+            self.assertEqual(self.drain(), 1)
         self.assertEqual(called, [True])
-        self.assertEqual(response.status_code, 409, response.text)
-        with Session(self.engine) as db:
-            self.assertIsNone(db.scalar(select(PlayerHeartbeat)))
-            self.assertIsNone(db.get(Channel, self.ids["A"]["channel"]).last_ping_at)
+        self.assert_failed_report_without_history()
         self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_optional_snapshot_failure_releases_its_connection_and_proof(self):
