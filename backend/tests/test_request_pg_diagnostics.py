@@ -2,7 +2,9 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import io
 import json
+import logging
 import os
 import threading
 from types import SimpleNamespace
@@ -40,8 +42,46 @@ def trace(endpoint="runtime-config", request_id=None):
 class RequestPGCoreTests(unittest.TestCase):
     def setUp(self):
         self.records = []
-        self.enterContext(patch.object(diagnostic, "_emit", self.records.append))
+        if self._testMethodName != "test_real_emit_through_security_factory_is_json_and_preserves_correlation":
+            self.enterContext(patch.object(diagnostic, "_emit", self.records.append))
         diagnostic.install(FastAPI())
+
+    def test_real_emit_through_security_factory_is_json_and_preserves_correlation(self):
+        from app.core.security_logging import install_security_log_redaction
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger(diagnostic.__name__)
+        previous = (list(logger.handlers), logger.level, logger.propagate, logger.disabled,
+                    logging.getLogRecordFactory())
+        identifier, transaction = str(uuid4()), str(uuid4())
+        secret = "tpw_SYNTHETIC_EMITTER_REGRESSION_ONLY"
+        try:
+            logger.handlers, logger.propagate, logger.disabled = [handler], False, False
+            logger.setLevel(logging.WARNING)
+            install_security_log_redaction()
+            self.assertTrue(getattr(logging.getLogRecordFactory(), "_tecno_security_redaction", False))
+            self.assertIs(diagnostic._emit, _REAL_EMIT)
+            diagnostic._emit({"event": "request_pg_sql_error", "request_id": identifier,
+                              "endpoint": "heartbeat", "stage": "INITIAL_LOCK",
+                              "pg_backend_pid": 4242, "db_transaction_id": transaction,
+                              "sqlstate": "55P03", "timestamp": "2026-11-20T00:00:00.000Z",
+                              "note": secret})
+            handler.flush()
+        finally:
+            logger.handlers, logger.level, logger.propagate, logger.disabled = previous[:4]
+            logging.setLogRecordFactory(previous[4])
+            handler.close()
+        lines = stream.getvalue().splitlines()
+        self.real_emitted_line_count = len(lines)
+        self.assertEqual(len(lines), 1, "The real diagnostic emitter must produce one actual JSON log line")
+        row = json.loads(lines[0])
+        self.assertEqual((row["request_id"], row["pg_backend_pid"], row["db_transaction_id"]),
+                         (identifier, 4242, transaction))
+        self.assertEqual((row["event"], row["endpoint"], row["stage"], row["sqlstate"]),
+                         ("request_pg_sql_error", "heartbeat", "INITIAL_LOCK", "55P03"))
+        self.assertEqual(row["note"], "[REDACTED]")
+        self.assertNotIn(secret, stream.getvalue())
 
     def test_runtime_request_uuid_and_http_bytes_are_unchanged(self):
         def application(observe):
