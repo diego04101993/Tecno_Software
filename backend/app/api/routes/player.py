@@ -231,16 +231,13 @@ def get_runtime_config(
         if channel.client_id != player_device.client_id or channel.branch_id != player_device.branch_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
 
-        intent = MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), (("last_seen_at", datetime.now(UTC)),))
+        from app.services.runtime_activity import record_runtime_activity
         with diagnostic_stage("runtime_tenant_guard", db=db):
-            with player_write_guard(db, channel=channel, player_device=player_device,
-                                    operation="get_runtime_config", intents=(intent,)) as plan:
-                player_device.last_seen_at = next(p.values["last_seen_at"] for p in plan.proposed
-                                                  if p.reference == intent.reference)
-                db.add(player_device)
-                db.commit()
+            channel, expected_player = record_runtime_activity(db, player_device, channel,
+                request_started_ns=getattr(request, "scope", {}).get("_player_admission_started_ns"))
     with diagnostic_stage("runtime_builder", db=db):
-        return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
+        return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request),
+                                                  expected_player_identity=expected_player)
 
 
 @router.post("/heartbeat", response_model=PlayerHeartbeatAck, dependencies=[Depends(_admit_player_activity)])

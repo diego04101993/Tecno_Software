@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 import contextvars
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.models.entities import Channel, PlayerDevice, PlayerPlaybackInbox
 from app.core.playback_failure_diagnostics import storage_503, tagged_503
-from app.core.request_pg_diagnostics import worker_scope
+from app.core.request_pg_diagnostics import playback_receipt_scope, playback_worker_event, worker_scope
 from app.schemas.domain import PlayerPlaybackEventAck, PlayerPlaybackEventCreate
 from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_mutations import (
@@ -231,6 +231,7 @@ def _retain_failure(engine, receipt: _Receipt, code: str, terminal: bool) -> boo
     # The failed processing transaction was rolled back first. This transaction
     # changes only private operational retry fields, never historical IDs/payload.
     try:
+        playback_worker_event("PLAYBACK_RETAIN_FAILURE", reason=code)
         with Session(engine, autoflush=False) as db:
             row = db.scalar(select(PlayerPlaybackInbox).where(PlayerPlaybackInbox.id == receipt.identity)
                             .with_for_update(skip_locked=True).execution_options(populate_existing=True))
@@ -253,6 +254,7 @@ def _retain_failure(engine, receipt: _Receipt, code: str, terminal: bool) -> boo
             else:
                 row.available_at = datetime.now(UTC) + timedelta(seconds=_RETRY_SECONDS[row.attempts - 1])
                 metric = "scheduled_retries"
+            playback_worker_event("PLAYBACK_RETAIN_FAILURE", db=db, reason=code, receipt_status=row.status)
             db.commit()
             _increment(engine, metric)
             return True
@@ -286,6 +288,7 @@ def materialize_one(engine, processor: Callable) -> bool:
 
 def _materialize_one_locked(engine, processor) -> bool:
     receipt = None
+    observation = ExitStack()
     try:
         with Session(engine, autoflush=False) as db:
             if engine.dialect.name == "postgresql" and not db.scalar(text(
@@ -298,7 +301,10 @@ def _materialize_one_locked(engine, processor) -> bool:
             if row is None:
                 return False
             receipt = _Receipt.capture(row)
+            observation.enter_context(playback_receipt_scope(receipt.identity, row.attempts + 1, db=db))
+            playback_worker_event("PLAYBACK_RECEIPT_SELECTED", db=db, receipt_status=row.status)
             payload = PlayerPlaybackEventCreate.model_validate(json.loads(receipt.canonical_payload))
+            playback_worker_event("PLAYBACK_VALIDATE_SCOPE", db=db)
             device = db.get(PlayerDevice, receipt.scope[0])
             channel = db.get(Channel, receipt.scope[1])
             if device is None or channel is None:
@@ -312,6 +318,7 @@ def _materialize_one_locked(engine, processor) -> bool:
 
             def before_commit(plan):
                 nonlocal claimed
+                playback_worker_event("PLAYBACK_CLAIM_RECEIPT", db=db)
                 with locked_player_playback_receipt(db, plan=plan, receipt_id=receipt.identity,
                                                     channel=channel, player_device=device) as current:
                     if current is None or current.status != "PENDING":
@@ -323,10 +330,12 @@ def _materialize_one_locked(engine, processor) -> bool:
                     db.delete(current)
                     claimed = True
 
+            playback_worker_event("PLAYBACK_MATERIALIZE", db=db)
             processor(payload, device, db, event_id=receipt.identity,
                       recorded_at=receipt.accepted_at, before_commit=before_commit)
             if not claimed:
                 raise RuntimeError("Playback processor did not claim its durable receipt")
+            playback_worker_event("PLAYBACK_COMMITTED", receipt_status="MATERIALIZED")
             _increment(engine, "materialized_commits")
             return True
     except (_NoLongerAvailable, PlayerPlaybackReceiptUnavailable):
@@ -339,7 +348,10 @@ def _materialize_one_locked(engine, processor) -> bool:
             _increment(engine, "candidate_read_errors")
             return False
         code, terminal = _failure_code(exc)
+        playback_worker_event("PLAYBACK_MATERIALIZE", error=exc, reason=code)
         return _retain_failure(engine, receipt, code, terminal)
+    finally:
+        observation.close()
 
 
 def snapshot(db: Session) -> dict[str, int | float | None]:

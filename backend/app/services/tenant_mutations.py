@@ -20,6 +20,15 @@ def _clean(session):
         raise conflict()
 
 
+def _runtime_lock_budget(session, deadline_ns):
+    """Shrink only the opt-in runtime's DB lock waits as its budget elapses."""
+    if deadline_ns is not None:
+        import time
+        from sqlalchemy import text
+        milliseconds = max(1, (deadline_ns - time.monotonic_ns()) // 1_000_000)
+        session.connection().execute(text("SET LOCAL lock_timeout = '" + str(milliseconds) + "ms'"))
+
+
 @dataclass(frozen=True)
 class ProposedState:
     reference: RowRef
@@ -845,13 +854,25 @@ class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
             dialect = self.session.get_bind().dialect.name
             locked = self.locking and dialect == "postgresql"
             if locked:
-                nowait = getattr(self, "_nonblocking_parent_locks", False)
+                nowait = (getattr(self, "_nonblocking_parent_locks", False)
+                          or ref in getattr(self, "_runtime_wait_roots", ()))
                 if self._row_lock_mode(ref) == "share":
                     statement = statement.with_for_update(read=True, nowait=nowait)
                 else:
                     statement = statement.with_for_update(nowait=nowait)
             with self.session.no_autoflush:
-                value = self.session.execute(statement).mappings().one_or_none()
+                try:
+                    value = self.session.execute(statement).mappings().one_or_none()
+                except Exception as error:
+                    # Runtime opts in only for its four authenticated roots.
+                    # An exact NOWAIT conflict is a pre-write wakeup request,
+                    # never permission to retry arbitrary graph/DB failures.
+                    from sqlalchemy.exc import DBAPIError
+                    if (isinstance(error, DBAPIError)
+                            and ref in getattr(self, "_runtime_wait_roots", ())
+                            and getattr(error.orig, "sqlstate", None) == "55P03"):
+                        raise PlayerRuntimeRootBusy(ref, self._row_lock_mode(ref)) from error
+                    raise
             self.snapshots[ref] = freeze(dict(value)) if value is not None else None
             # Eligibility records the actual locked load, not merely a mutable
             # ``locking`` flag or a caller-prepopulated immutable dictionary.
@@ -1096,7 +1117,8 @@ def _monotonic_player_activity(graph, intents):
 
 
 @contextmanager
-def player_write_guard(db, *, channel, player_device, operation, intents, receipt_processing=False):
+def player_write_guard(db, *, channel, player_device, operation, intents, receipt_processing=False,
+                       runtime_wait_deadline_ns=None):
     """Relationship proof for the already authenticated Player/code entrypoints.
 
     Never constructs a User or accepts actor/tenant identity from HTTP payloads.
@@ -1140,6 +1162,15 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
     if telemetry and operation == "create_player_heartbeat":
         exclusive.add(RowRef("Channel", channel.id))
     graph = _PlayerTelemetryGraph(db, exclusive) if telemetry else _WriteGraph(db)
+    if runtime_wait_deadline_ns is not None:
+        import time
+        if (type(runtime_wait_deadline_ns) is not int or not telemetry
+                or operation != "get_runtime_config" or receipt_processing
+                or runtime_wait_deadline_ns > time.monotonic_ns() + 4_000_000_000):
+            raise conflict()
+        graph._runtime_wait_roots = frozenset((RowRef("Channel", channel.id),
+            RowRef("Client", channel.client_id), RowRef("Branch", channel.branch_id),
+            RowRef("PlayerDevice", player_device.id)))
     context = _PlayerWriteScope(channel.client_id, channel.branch_id)
     graph.player_scope = context
     if telemetry and operation == "create_player_playback_event":
@@ -1167,7 +1198,10 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
         conn = db.connection()
         if conn.get_isolation_level() != "READ COMMITTED":
             raise conflict()
-        conn.execute(text("SET LOCAL lock_timeout = '10s'"))
+        if runtime_wait_deadline_ns is None:
+            conn.execute(text("SET LOCAL lock_timeout = '10s'"))
+        else:
+            _runtime_lock_budget(db, runtime_wait_deadline_ns)
     try:
         gate_type = _PlayerTelemetryGate if telemetry else MutationGate
         with gate_type(graph, context) as gate:
@@ -1215,11 +1249,13 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                 if heartbeat_bulk:
                     plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
                 else:
+                    _runtime_lock_budget(db, runtime_wait_deadline_ns)
                     with _graph_validation_phase(graph, gate):
                         plan = preflight_relationship_graph(gate, intents, spec, semantic_adapters=_write_adapters())
             with ExitStack() as media_locks:
                 paths = frozenset(graph.media_paths)
                 if paths:
+                    _runtime_lock_budget(db, runtime_wait_deadline_ns)
                     from app.services.media_references import media_reference_operation, lock_media_paths
                     media_locks.enter_context(media_reference_operation(db))
                     if telemetry:
@@ -1230,6 +1266,7 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                 graph.snapshots.clear()
                 graph.media_paths.clear()
                 graph.media_validation_locked = True
+                _runtime_lock_budget(db, runtime_wait_deadline_ns)
                 with ExitStack() as confirmation_phase:
                     if heartbeat_bulk:
                         confirmation_phase.enter_context(heartbeat_query_scope(db))
@@ -1265,6 +1302,12 @@ class PlayerPlaybackReceiptUnavailable(RuntimeError):
 
 class PlayerPlaybackReceiptBusy(RuntimeError):
     """A live scope row was locked; retry only before receipt acceptance COMMIT."""
+
+
+class PlayerRuntimeRootBusy(RuntimeError):
+    """Exact authenticated runtime root was busy before the guard could yield."""
+    def __init__(self, reference, lock_mode):
+        self.reference, self.lock_mode = reference, lock_mode
 
 
 @dataclass

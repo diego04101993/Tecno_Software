@@ -35,13 +35,20 @@ _ENTITIES = frozenset({"Channel", "Client", "Branch", "PlayerDevice", "tenant_ba
                        "heartbeat_capacity", "heartbeat_inbox", "playback_inbox"})
 _STAGES = frozenset({"DEPENDENCY", "REQUEST", "RUNTIME_ADMISSION", "RUNTIME_DB", "RUNTIME_TENANT_GUARD", "RUNTIME_BUILDER",
                      "RUNTIME_SERIALIZATION", "RESPONSE_READY", "INITIAL_LOCK", "RELEASE_FOR_WAIT",
-                     "WAIT_BEGIN", "WAIT_END", "REVALIDATE_BEGIN", "REVALIDATE_END", "COMMIT", "ROLLBACK", "WORKER"})
+                     "WAIT_BEGIN", "WAIT_END", "REVALIDATE_BEGIN", "REVALIDATE_END", "COMMIT", "ROLLBACK", "WORKER",
+                     "PLAYBACK_RECEIPT_SELECTED", "PLAYBACK_VALIDATE_SCOPE", "PLAYBACK_MATERIALIZE",
+                     "PLAYBACK_CLAIM_RECEIPT", "PLAYBACK_RETAIN_FAILURE", "PLAYBACK_COMMITTED"})
 _TABLES = frozenset({"channels", "clients", "branches", "player_devices", "player_heartbeats",
                      "player_heartbeat_inbox", "player_playback_events", "player_playback_inbox",
                      "campaigns", "contents", "layouts", "device_outputs", "schedules",
                      "campaign_channel_assignments", "campaign_playlist_items", "videowalls", "videowall_nodes",
                      "videowall_publications", "videowall_publication_assets", "videowall_playback_groups",
                      "videowall_playback_group_members"})
+_WORKER_TABLES = _TABLES | frozenset({"users", "content_folders", "data_sources", "datasets",
+                                     "dataset_imports", "dataset_columns", "dataset_rows", "layout_data_bindings",
+                                     "layout_binding_fields", "layout_revisions", "audio_playlists", "audio_playlist_items",
+                                     "audio_assignments", "audio_playback_events", "campaign_sequence_items", "kiosk_screens",
+                                     "kiosk_buttons", "touch_experiences", "touch_experience_assignments", "touch_locations", "touch_maps"})
 _RUNTIME_REASONS = frozenset({"RUNTIME_TENANT_GUARD_LOCK_UNAVAILABLE", "RUNTIME_CHANNEL_LOCK_UNAVAILABLE",
                              "RUNTIME_DB_ERROR", "RUNTIME_ADMISSION_REJECT", "RUNTIME_TIMEOUT_OR_CANCEL",
                              "RUNTIME_DEPENDENCY_UNAVAILABLE", "RUNTIME_OTHER"})
@@ -53,6 +60,8 @@ class _Trace:
     method: str
     request_id: str | None = None
     worker_id: str | None = None
+    receipt_id: str | None = None
+    attempt_number: int | None = None
     scope: dict | None = None
     stage: str = "DEPENDENCY"
     entity: str | None = None
@@ -104,11 +113,15 @@ def _emit(value):
 
 
 def _common(trace, *, stage=None):
-    return {"request_id": trace.request_id, "worker_id": trace.worker_id,
+    value = {"request_id": trace.request_id, "worker_id": trace.worker_id,
             "scope": "worker" if trace.worker_id else "request", "endpoint": trace.endpoint,
             "method": trace.method, "stage": stage if stage in _STAGES else trace.stage,
             "request_finished": trace.request_finished,
             "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+    if trace.receipt_id is not None:
+        value.update(receipt_id=trace.receipt_id, history_id=trace.receipt_id,
+                     attempt_number=trace.attempt_number, playback_worker_stage=value["stage"])
+    return value
 
 
 def _pid(connection):
@@ -199,7 +212,7 @@ def _exception_class(error):
     return "OTHER"
 
 
-def _shape(statement):
+def _shape(statement, *, worker_receipt=False):
     # Shape only: remove literal values before hashing; raw SQL/parameters never
     # enter a log. Technical identifiers are restricted to a fixed table set.
     sql = statement[:65536] if type(statement) is str else ""
@@ -214,15 +227,40 @@ def _shape(statement):
     elif "PG_ADVISORY_XACT_LOCK" in upper or "PG_TRY_ADVISORY_XACT_LOCK" in upper:
         lock_mode = "ADVISORY_EXCLUSIVE"
     targets = set(re.findall(r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\s+OF\s+([A-Z_][A-Z_0-9]*)", upper))
-    tables = sorted(name for name in _TABLES if re.search(r"\b" + re.escape(name) + r"\b", normalized, re.I))
+    known_tables = _WORKER_TABLES if worker_receipt else _TABLES
+    tables = sorted(name for name in known_tables if re.search(r"\b" + re.escape(name) + r"\b", normalized, re.I))
     operation = upper.split(" ", 1)[0] if upper else "OTHER"
     if operation not in {"SELECT", "UPDATE", "INSERT", "DELETE", "WITH", "SET", "SHOW"}:
         operation = "OTHER"
     return {"sql_fingerprint": hmac.new(_target_key, b"sql:" + normalized.encode(), hashlib.sha256).hexdigest(),
             "sql_fingerprint_scope": "process", "sql_operation": operation,
             "sql_tables": tables, "lock_mode": lock_mode, "lock_nowait": "NOWAIT" in upper,
-            "lock_targets": sorted(target.lower() for target in targets if target.lower() in _TABLES),
+            "lock_targets": sorted(target.lower() for target in targets if target.lower() in known_tables),
             "fingerprint_truncated": len(statement) > 65536 if type(statement) is str else False}
+
+
+def _worker_lock_context():
+    """Allowlisted code identity on errors only; never log frames or locals."""
+    frame = None
+    try:
+        frame = inspect.currentframe()
+        for _ in range(48):
+            if frame is None:
+                break
+            identity = (frame.f_globals.get("__name__"), frame.f_code.co_qualname)
+            context = {
+                ("app.services.tenant_mutations", "_PlayerTelemetryGate.__enter__"): "TENANT_BARRIER",
+                ("app.services.media_references", "lock_media_paths"): "MEDIA_PATH",
+                ("app.services.tenant_mutations", "_DeleteGraph.snapshot"): "AUTHORITY_ROW",
+            }.get(identity)
+            if context is not None:
+                return context
+            frame = frame.f_back
+    except BaseException:
+        pass
+    finally:
+        del frame
+    return "UNKNOWN"
 
 
 def _error_metadata(error, connection=None):
@@ -234,6 +272,8 @@ def _error_metadata(error, connection=None):
                 "sqlstate": _sqlstate(error), "exception_class": _exception_class(error)}
     if state and state["last"]:
         metadata.update(state["last"])
+    if trace is not None and trace.receipt_id is not None:
+        metadata["lock_context"] = _worker_lock_context()
     if trace is not None and trace.entity in _ENTITIES:
         entity_table = {"Channel": "channels", "Client": "clients", "Branch": "branches", "PlayerDevice": "player_devices"}.get(trace.entity)
         if entity_table is None or metadata.get("sql_tables") == [entity_table]:
@@ -432,6 +472,60 @@ def worker_scope(name):
     return decorate
 
 
+@contextmanager
+def playback_receipt_scope(receipt_id, attempt_number, *, db):
+    """Observe one owned synchronous consumer call, never its originating HTTP.
+
+    The consumer deliberately enters its thread with a blank Context. Attach to
+    its already-open transaction using driver metadata, without diagnostic SQL,
+    and leave every receipt/transaction decision to the existing processor.
+    """
+    trace = token = None
+    try:
+        if _valid_uuid(receipt_id) and type(attempt_number) is int and attempt_number > 0:
+            trace = _Trace(endpoint="playback-worker", method="WORKER", worker_id=str(uuid.uuid4()),
+                           receipt_id=receipt_id, attempt_number=attempt_number,
+                           stage="PLAYBACK_RECEIPT_SELECTED")
+            token = _current.set(trace)
+            _state(db.connection(), create=True)
+    except BaseException:
+        pass
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                trace.active = False
+                _current.reset(token)
+            except BaseException:
+                pass
+
+
+def playback_worker_event(stage, *, db=None, error=None, reason=None, receipt_status=None):
+    """Fixed technical fields only; recovered lock errors remain worker retries."""
+    try:
+        trace = _active()
+        if trace is None or trace.receipt_id is None or stage not in _STAGES or not stage.startswith("PLAYBACK_"):
+            return
+        trace.stage = stage
+        metadata = failure_metadata(error) if error is not None else _database_metadata(db)
+        error_stage = metadata.pop("stage", None)
+        value = {"event": "playback_worker_stage", **_common(trace), **metadata}
+        if error_stage in _STAGES:
+            value["error_stage"] = error_stage
+        tables = metadata.get("sql_tables", [])
+        value["relation"] = tables[0] if len(tables) == 1 else None
+        if reason in {"TARGET_DELETED", "TARGET_TEMPORARILY_LOCKED", "AUTHORITY_OR_RECEIPT_INVALID",
+                      "AUTHORITY_OR_VALIDATION_REJECTED", "PROCESSOR_TEMPORARILY_UNAVAILABLE",
+                      "DATABASE_TEMPORARILY_UNAVAILABLE", "PROCESSOR_ERROR", "IMMUTABLE_RECEIPT_CHANGED"}:
+            value["error_reason"] = reason
+        if receipt_status in {"PENDING", "FAILED", "MATERIALIZED"}:
+            value["receipt_status"] = receipt_status
+        _emit(value)
+    except BaseException:
+        pass
+
+
 class RequestPGCorrelationMiddleware:
     def __init__(self, app, *, api_prefix="/api"):
         self.app = app
@@ -503,7 +597,7 @@ def _install_hooks():
             with trace.lock:
                 trace.sql_sequence += 1
                 sequence = trace.sql_sequence
-            metadata = {**_shape(statement), "db_operation_id": sequence}
+            metadata = {**_shape(statement, worker_receipt=trace.receipt_id is not None), "db_operation_id": sequence}
             state["count"] += 1
             state["last"] = metadata
             context._request_pg_operation = metadata

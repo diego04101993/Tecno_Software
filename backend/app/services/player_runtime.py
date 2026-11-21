@@ -965,17 +965,30 @@ def _build_player_runtime_config(channel: Channel, db: Session, base_url: str, *
     }
 
 
-def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: str) -> dict[str, object]:
+def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: str, *,
+                                       expected_player_identity=None) -> dict[str, object]:
     """Read selection and retention under one PostgreSQL MVCC snapshot."""
-    channel_id, expected_client_id, expected_branch_id = channel.id, channel.client_id, channel.branch_id
+    if expected_player_identity is None:
+        channel_id, expected_client_id, expected_branch_id = channel.id, channel.client_id, channel.branch_id
+    else:
+        # COMMIT expires the writer's ORM rows. A concurrent DELETE must be
+        # rejected inside the new snapshot, not trigger an expired-row refresh
+        # outside its exception/security boundary.
+        channel_id, expected_client_id, expected_branch_id = expected_player_identity[1:4]
 
     bind = db.get_bind()
     if bind.dialect.name != "postgresql":
+        if expected_player_identity is not None:
+            from app.services.runtime_activity import validate_runtime_player
+            _, channel = validate_runtime_player(db, expected_player_identity)
         return build_player_runtime_config(channel, db, base_url)
     try:
         from app.services.db_snapshots import readonly_snapshot_session
         with readonly_snapshot_session(db) as snapshot_db:
             snapshot_db.info["a9_snapshot"] = True
+            if expected_player_identity is not None:
+                from app.services.runtime_activity import validate_runtime_player
+                validate_runtime_player(snapshot_db, expected_player_identity)
             snapshot_channel = snapshot_db.get(Channel, channel_id)
             if snapshot_channel is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
