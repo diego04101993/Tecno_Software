@@ -12,6 +12,7 @@ import logging
 from sqlalchemy.exc import SQLAlchemyError, TimeoutError as SQLAlchemyTimeoutError
 
 from app.core.player_diagnostics import _current_trace, _request_uuid
+from app.core.request_pg_diagnostics import capture_failure, failure_metadata, request_uuid as correlated_request_uuid
 
 
 REASONS = frozenset({
@@ -31,22 +32,25 @@ _INTERNAL_CAUSES = _ADMISSION_CAUSES | frozenset({
 })
 _SCOPE_REASON = "_player_playback_503_metadata"
 _SCOPE_HANDLER = "_player_playback_handler_entered"
+_SCOPE_DATABASE = "_player_playback_503_database"
 
 
-def tagged_503(error, reason, internal_cause):
+def tagged_503(error, reason, internal_cause, *, db=None, source_error=None):
     """Return the SAME exception, with no changes to status/body/headers."""
     try:
         if reason in REASONS and internal_cause in _INTERNAL_CAUSES:
             error._playback_503_reason = reason
             error._playback_503_internal_cause = internal_cause
+            capture_failure(error, db=db, source_error=source_error)
     except Exception:
         pass
     return error
 
 
-def storage_503(error, storage_error):
+def storage_503(error, storage_error, *, db=None):
     """Classify an existing storage rejection without exposing exception text."""
     try:
+        capture_failure(error, db=db, source_error=storage_error)
         if getattr(getattr(storage_error, "orig", None), "sqlstate", None) == "55P03":
             return tagged_503(error, "PLAYBACK_DB_LOCK_UNAVAILABLE", "SQLSTATE_55P03")
         cause = "SQLALCHEMY_POOL_TIMEOUT" if isinstance(storage_error, SQLAlchemyTimeoutError) else "SQLALCHEMY_ERROR"
@@ -98,6 +102,7 @@ def exception_observed(request, error):
     try:
         if error.status_code == 503:
             request.scope[_SCOPE_REASON] = _classify(error, request.scope.get(_SCOPE_HANDLER, False))
+            request.scope[_SCOPE_DATABASE] = failure_metadata(error)
     except Exception:
         pass
 
@@ -119,8 +124,7 @@ class Playback503DiagnosticsMiddleware:
             if message.get("type") == "http.response.start" and message.get("status") == 503 and not logged:
                 logged = True
                 try:
-                    trace = _current_trace.get()
-                    request_id = trace.request_id if trace is not None else _request_uuid(scope.get("headers", []))
+                    request_id = correlated_request_uuid(scope)
                     reason, cause = scope.get(_SCOPE_REASON, ("PLAYBACK_OTHER", "RESPONSE_HTTP_503"))
                     if (type(reason) is not str or reason not in REASONS
                             or type(cause) is not str or cause not in _INTERNAL_CAUSES):
@@ -131,6 +135,7 @@ class Playback503DiagnosticsMiddleware:
                         "retry_after_present": any(key.lower() == b"retry-after" for key, _ in message.get("headers", [])),
                         "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                         "internal_cause": cause,
+                        **scope.get(_SCOPE_DATABASE, failure_metadata()),
                     }, separators=(",", ":"), allow_nan=False))
                 except Exception:
                     pass

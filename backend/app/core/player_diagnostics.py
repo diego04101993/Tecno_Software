@@ -670,7 +670,8 @@ class PlayerDiagnosticsMiddleware:
             return
         accepted_ns = time.monotonic_ns()
         _ensure_sampler()
-        request_id = _request_uuid(scope.get("headers", []))
+        from app.core.request_pg_diagnostics import request_uuid
+        request_id = request_uuid(scope)
         trace = _Trace(request_id, scope["path"], scope.get("method", "OTHER"), accepted_ns)
         token = _current_trace.set(trace)
         status_code = 500

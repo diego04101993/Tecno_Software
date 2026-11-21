@@ -19,6 +19,7 @@ from app.core.player_diagnostics import (
 )
 from app.core.player_admission import player_activity, playback_worker_activity, heartbeat_worker_activity
 from app.core.playback_failure_diagnostics import handler_entered as playback_handler_entered
+from app.core.request_pg_diagnostics import diagnostic_stage, runtime_handler_entered
 from app.models.entities import (
     Campaign,
     Channel,
@@ -222,20 +223,24 @@ def get_runtime_config(
     player_device: PlayerDevice = Depends(get_current_player_device),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    channel = db.get(Channel, player_device.channel_id)
-    if not channel:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
-    if channel.client_id != player_device.client_id or channel.branch_id != player_device.branch_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    runtime_handler_entered(request)
+    with diagnostic_stage("runtime_db", db=db):
+        channel = db.get(Channel, player_device.channel_id)
+        if not channel:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+        if channel.client_id != player_device.client_id or channel.branch_id != player_device.branch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
 
-    intent = MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), (("last_seen_at", datetime.now(UTC)),))
-    with player_write_guard(db, channel=channel, player_device=player_device,
-                            operation="get_runtime_config", intents=(intent,)) as plan:
-        player_device.last_seen_at = next(p.values["last_seen_at"] for p in plan.proposed
-                                          if p.reference == intent.reference)
-        db.add(player_device)
-        db.commit()
-    return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
+        intent = MutationIntent("UPDATE", RowRef("PlayerDevice", player_device.id), (("last_seen_at", datetime.now(UTC)),))
+        with diagnostic_stage("runtime_tenant_guard", db=db):
+            with player_write_guard(db, channel=channel, player_device=player_device,
+                                    operation="get_runtime_config", intents=(intent,)) as plan:
+                player_device.last_seen_at = next(p.values["last_seen_at"] for p in plan.proposed
+                                                  if p.reference == intent.reference)
+                db.add(player_device)
+                db.commit()
+    with diagnostic_stage("runtime_builder", db=db):
+        return build_player_runtime_from_snapshot(channel, db, build_public_base_url(request))
 
 
 @router.post("/heartbeat", response_model=PlayerHeartbeatAck, dependencies=[Depends(_admit_player_activity)])

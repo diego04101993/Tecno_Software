@@ -23,6 +23,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.player_diagnostics import admission_grant_recorder, _current_trace, _request_uuid
 from app.core.playback_failure_diagnostics import exception_observed as observe_playback_503
+from app.core.request_pg_diagnostics import (
+    diag_event, failure_metadata, request_uuid as correlated_request_uuid, runtime_exception_observed,
+)
 
 
 EXPENSIVE_CAPACITY = 2
@@ -65,8 +68,7 @@ def _record_heartbeat_503(error, gate, request):
         reason = getattr(error, "_player_503_reason", None)
         if type(reason) is not str or reason not in _HEARTBEAT_503_PHASES:
             reason = "UNCLASSIFIED_HTTP_503"
-        trace = _current_trace.get()
-        request_id = trace.request_id if trace is not None else _request_uuid(request.scope.get("headers", []))
+        request_id = correlated_request_uuid(request.scope)
         state = gate.snapshot()
         logging.getLogger(__name__).warning(json.dumps({
             "event": "heartbeat_http_503",
@@ -76,6 +78,7 @@ def _record_heartbeat_503(error, gate, request):
             "retry_after_present": any(name.lower() == "retry-after" for name in (error.headers or {})),
             "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "phase": _HEARTBEAT_503_PHASES.get(reason, "unclassified"),
+            **failure_metadata(error),
             # Admission's original finally has already run. This is explicitly
             # the remaining gate state, not a claimed snapshot at rejection.
             "gate_state_after_cleanup": {
@@ -289,19 +292,32 @@ async def player_activity(request):
         # Latest grant, not a new client/handler timeout. Retain enough of the
         # original five seconds for auth, validation and the atomic commit.
         deadline_ns = started_ns + HEARTBEAT_REQUEST_BUDGET_NS - HEARTBEAT_HANDLER_RESERVE_NS
+    runtime_admission_done = False
     try:
+        if kind == "runtime":
+            diag_event("runtime_admission_start", stage="RUNTIME_ADMISSION")
         async with gate.admit(kind, observer, deadline_ns=deadline_ns):
+            if kind == "runtime":
+                diag_event("runtime_admission_end", stage="RUNTIME_ADMISSION")
+                runtime_admission_done = True
             yield
     except HTTPException as error:
         if kind == "heartbeat" and error.status_code == 503:
             _record_heartbeat_503(error, gate, request)
         if kind == "ingress":
             observe_playback_503(request, error)
+        if kind == "runtime":
+            runtime_exception_observed(request, error)
         raise
     except StarletteHTTPException as error:
         if kind == "ingress":
             observe_playback_503(request, error)
+        if kind == "runtime":
+            runtime_exception_observed(request, error)
         raise
+    finally:
+        if kind == "runtime" and not runtime_admission_done:
+            diag_event("runtime_admission_end", stage="RUNTIME_ADMISSION")
 
 
 def playback_worker_activity(app):

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 import time
+import sys
 from types import MappingProxyType
 
 from fastapi import HTTPException
@@ -16,6 +17,7 @@ from sqlalchemy.exc import DBAPIError
 
 from app.models.entities import Branch, Channel, ChannelConnectionStatus, Client, PlayerDevice, PlayerHeartbeatInbox
 from app.services.tenant_relations import conflict
+from app.core.request_pg_diagnostics import capture_failure, diag_event
 
 
 def _utc(value):
@@ -36,6 +38,17 @@ class _HeartbeatRootBusy(Exception):
         self.model, self.identity, self.shared = model, identity, shared
 
 
+def _heartbeat_diag(stage, *, db=None, connection=None, entity=None, target=None,
+                    deadline_ns=None, error=None):
+    """Diagnostic metadata only; never authorizes, queries or changes a budget."""
+    try:
+        remaining = None if deadline_ns is None else max(0, (deadline_ns - time.monotonic_ns()) / 1_000_000)
+        diag_event("heartbeat_guard_stage", stage=stage, db=db, connection=connection,
+                   entity=entity, target=target, remaining_budget_ms=remaining, error=error)
+    except BaseException:
+        pass
+
+
 def _locked_roots(db, identity, channel_identity):
     """Fresh root locks; a busy stage is explicit, never parsed from SQL text."""
     if db.get_bind().dialect.name != "postgresql":
@@ -49,11 +62,13 @@ def _locked_roots(db, identity, channel_identity):
                                (Client, channel_identity[1], True),
                                (Branch, channel_identity[2], True),
                                (PlayerDevice, identity[0], False)):
+        _heartbeat_diag("INITIAL_LOCK", db=db, entity=model.__name__, target=key)
         try:
             row = db.scalar(select(model).where(model.id == key)
                             .with_for_update(of=model, read=shared, nowait=True)
                             .execution_options(populate_existing=True))
         except DBAPIError as error:
+            _heartbeat_diag("INITIAL_LOCK", db=db, entity=model.__name__, target=key, error=error)
             if getattr(error.orig, "sqlstate", None) != "55P03":
                 raise
             raise _HeartbeatRootBusy(model, key, shared) from error
@@ -66,6 +81,7 @@ def _locked_roots(db, identity, channel_identity):
 def _lock_unavailable():
     error = HTTPException(503, "Player operation temporarily unavailable")
     error._player_503_reason = "TENANT_GUARD_LOCK_UNAVAILABLE"
+    capture_failure(error, source_error=sys.exc_info()[1])
     return error
 
 
@@ -90,6 +106,8 @@ def _postgres_roots(db, identity, channel_identity, deadline_ns):
     wait_deadline_ns = deadline_ns - HEARTBEAT_HANDLER_RESERVE_NS
     key = int.from_bytes(sha256(("tecno.tenant.write.v1:" + channel_identity[1]).encode()).digest()[:8],
                          "big", signed=True)
+    revalidating = False
+    revalidate_target = (None, None)
     while True:
         connection = db.connection()
         if connection.get_isolation_level() != "READ COMMITTED":
@@ -97,24 +115,50 @@ def _postgres_roots(db, identity, channel_identity, deadline_ns):
         _set_lock_budget(connection, wait_deadline_ns)
         # Separate statement: a writer may commit while this barrier waits.
         # The following root queries must use new READ COMMITTED snapshots.
+        _heartbeat_diag("INITIAL_LOCK", connection=connection, entity="tenant_barrier",
+                        target=channel_identity[1], deadline_ns=deadline_ns)
         connection.execute(text("SELECT pg_advisory_xact_lock_shared(:key)"), {"key": key})
+        if revalidating:
+            _heartbeat_diag("REVALIDATE_BEGIN", connection=connection, deadline_ns=deadline_ns,
+                            entity=revalidate_target[0], target=revalidate_target[1])
         try:
             roots = _locked_roots(db, identity, channel_identity)
         except _HeartbeatRootBusy as busy:
+            if revalidating:
+                _heartbeat_diag("REVALIDATE_END", db=db, entity=busy.model.__name__,
+                                target=busy.identity, deadline_ns=deadline_ns, error=busy)
+            _heartbeat_diag("RELEASE_FOR_WAIT", db=db, entity=busy.model.__name__,
+                            target=busy.identity, deadline_ns=deadline_ns, error=busy)
             db.rollback()
             if time.monotonic_ns() >= wait_deadline_ns:
                 raise _lock_unavailable() from None
+            wait_observed = False
             try:
                 connection = db.connection()
+                _heartbeat_diag("WAIT_BEGIN", connection=connection, entity=busy.model.__name__,
+                                target=busy.identity, deadline_ns=deadline_ns)
+                wait_observed = True
                 _set_lock_budget(connection, wait_deadline_ns)
                 # This transaction owns no tenant, parent or other row lock.
                 # A successful wait is only a wakeup, never an authorization.
                 db.scalar(select(busy.model.id).where(busy.model.id == busy.identity)
                           .with_for_update(of=busy.model, read=busy.shared))
+                _heartbeat_diag("WAIT_END", connection=connection, entity=busy.model.__name__,
+                                target=busy.identity, deadline_ns=deadline_ns)
+            except BaseException as error:
+                if wait_observed:
+                    _heartbeat_diag("WAIT_END", db=db, entity=busy.model.__name__,
+                                    target=busy.identity, deadline_ns=deadline_ns, error=error)
+                raise
             finally:
                 db.rollback()
+            revalidate_target = (busy.model.__name__, busy.identity)
+            revalidating = True
             continue
         _set_lock_budget(connection, wait_deadline_ns)
+        if revalidating:
+            _heartbeat_diag("REVALIDATE_END", connection=connection, deadline_ns=deadline_ns,
+                            entity=revalidate_target[0], target=revalidate_target[1])
         return roots
 
 

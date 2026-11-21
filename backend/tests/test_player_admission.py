@@ -648,7 +648,11 @@ class Heartbeat503ReasonTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(error.headers, {"X-QA": "preserved"})
                 self.assertEqual(len(captured.records), 1)
                 row = json.loads(captured.records[0].getMessage())
-                self.assertEqual(set(row), {"event", "request_id", "heartbeat_503_reason", "status_code", "retry_after_present", "timestamp", "phase", "gate_state_after_cleanup"})
+                self.assertEqual(set(row), {"event", "request_id", "heartbeat_503_reason", "status_code", "retry_after_present", "timestamp", "phase", "gate_state_after_cleanup",
+                                           "pg_backend_pid", "db_transaction_id", "stage", "sqlstate", "exception_class"})
+                self.assertIsNone(row["pg_backend_pid"])
+                self.assertIsNone(row["db_transaction_id"])
+                self.assertIsNone(row["sqlstate"])
                 self.assertEqual(row["event"], "heartbeat_http_503")
                 self.assertEqual(row["heartbeat_503_reason"], reason)
                 self.assertEqual(row["phase"], phase)

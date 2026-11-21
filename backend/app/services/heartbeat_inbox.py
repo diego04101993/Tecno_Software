@@ -34,6 +34,7 @@ from app.schemas.domain import PlayerHeartbeatAck, PlayerHeartbeatCreate
 from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_relations import conflict
 from app.services.heartbeat_acceptance import heartbeat_accept_guard, locked_player_heartbeat_receipt
+from app.core.request_pg_diagnostics import worker_scope
 
 
 MAX_PENDING_COUNT = 128
@@ -409,6 +410,7 @@ async def _finish_atomic_thread(engine, processor) -> bool:
     return result
 
 
+@worker_scope("heartbeat-worker")
 async def _consume(control: _Worker, engine, processor, activity) -> None:
     try:
         while not control.stop.is_set():

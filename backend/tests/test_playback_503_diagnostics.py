@@ -59,7 +59,8 @@ class Playback503MetadataTests(unittest.IsolatedAsyncioTestCase):
     def assert_metadata(self, record, *, request_id, reason, retry=False):
         event = json.loads(record.getMessage())
         self.assertEqual(set(event), {"event", "request_id", "playback_503_reason", "status_code",
-                                     "retry_after_present", "timestamp", "internal_cause"})
+                                     "retry_after_present", "timestamp", "internal_cause",
+                                     "pg_backend_pid", "db_transaction_id", "stage", "sqlstate", "exception_class"})
         self.assertEqual(event["event"], "playback_http_503")
         self.assertEqual(event["request_id"], request_id)
         self.assertEqual(event["playback_503_reason"], reason)

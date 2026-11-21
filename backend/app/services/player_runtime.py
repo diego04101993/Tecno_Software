@@ -984,7 +984,9 @@ def build_player_runtime_from_snapshot(channel: Channel, db: Session, base_url: 
             return build_player_runtime_config(snapshot_channel, snapshot_db, base_url, snapshot_coherent=True)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as error:
         logger.exception("Could not create coherent runtime snapshot for channel %s", channel_id)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail="Runtime snapshot unavailable")
+        from app.core.request_pg_diagnostics import capture_failure, runtime_reason, tag_failure
+        raise tag_failure(capture_failure(HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                                       detail="Runtime snapshot unavailable"), source_error=error),
+                          runtime_reason(error), stage="RUNTIME_BUILDER")

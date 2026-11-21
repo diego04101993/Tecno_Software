@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.models.entities import Channel, PlayerDevice, PlayerPlaybackInbox
 from app.core.playback_failure_diagnostics import storage_503, tagged_503
+from app.core.request_pg_diagnostics import worker_scope
 from app.schemas.domain import PlayerPlaybackEventAck, PlayerPlaybackEventCreate
 from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_mutations import (
@@ -149,18 +150,19 @@ def enqueue(db: Session, device: PlayerDevice, channel: Channel,
                 if int(count) >= MAX_PENDING_COUNT or int(total_bytes) + payload_bytes > MAX_PENDING_BYTES:
                     _increment(bind, "capacity_rejections")
                     raise tagged_503(HTTPException(status_code=503, detail="Playback receipt storage is temporarily unavailable"),
-                                     "PLAYBACK_INBOX_FULL", "COUNT_OR_BYTE_CAPACITY")
+                                     "PLAYBACK_INBOX_FULL", "COUNT_OR_BYTE_CAPACITY", db=db)
                 with player_write_guard(db, channel=channel, player_device=device,
                                         operation="create_player_playback_event", intents=intents):
                     db.add(PlayerPlaybackInbox(id=identity, **values))
                     db.commit()
             break
-        except PlayerPlaybackReceiptBusy:
+        except PlayerPlaybackReceiptBusy as error:
             db.rollback()
             if attempt == len(_PARENT_LOCK_BACKOFF) - 1:
                 _increment(bind, "parent_lock_rejections")
                 raise tagged_503(HTTPException(status_code=503, detail="Player operation temporarily unavailable"),
-                                 "PLAYBACK_DB_LOCK_UNAVAILABLE", "PARENT_SCOPE_LOCK_RETRY_EXHAUSTED") from None
+                                 "PLAYBACK_DB_LOCK_UNAVAILABLE", "PARENT_SCOPE_LOCK_RETRY_EXHAUSTED",
+                                 db=db, source_error=error) from None
             _increment(bind, "parent_lock_retries")
         except HTTPException:
             db.rollback()
@@ -169,7 +171,7 @@ def enqueue(db: Session, device: PlayerDevice, channel: Channel,
             db.rollback()
             _increment(bind, "enqueue_storage_errors")
             raise storage_503(HTTPException(status_code=503, detail="Playback receipt storage is temporarily unavailable"),
-                              error) from None
+                              error, db=db) from None
 
     # Build from captured scalar values: do not reopen an expired ORM row after
     # COMMIT or acquire a second connection only to construct this receipt ACK.
@@ -415,6 +417,7 @@ async def _finish_atomic_thread(engine, processor) -> bool:
     return result
 
 
+@worker_scope("playback-worker")
 async def _consume(control: _Worker, engine, processor, activity) -> None:
     try:
         while not control.stop.is_set():
