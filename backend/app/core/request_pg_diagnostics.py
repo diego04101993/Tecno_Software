@@ -1,9 +1,9 @@
-"""Always-on, bounded-metadata request/PostgreSQL correlation; no diagnostic SQL.
+"""Bounded request/PostgreSQL correlation with optional Channel lock capture.
 
 Only transaction boundaries, locking SQL and SQL errors are emitted. Successful
 non-locking statements are counted, with their safe shape retained only for a
-possible error. Worker scopes have independent technical IDs and log lifecycle
-and errors, never idle-poll transactions. Logging cannot alter an HTTP result.
+possible error. Worker scopes have independent technical IDs. The opt-in
+Channel events add no SQL or idle-poll events and cannot alter responses.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import threading
@@ -31,6 +32,10 @@ _install_lock = threading.Lock()
 _target_key = secrets.token_bytes(32)
 _SCOPE_ID = "_request_pg_correlation_id"
 _PATHS = {"heartbeat": "POST", "runtime-config": "GET", "playback-events": "POST"}
+_CHANNEL_CAPTURE = os.getenv("CHANNEL_LOCK_CAPTURE", "") == "1"
+_CHANNEL_WORKERS = frozenset({"heartbeat-worker", "playback-worker"})
+_CHANNEL_LOCK_MODES = frozenset({"FOR_UPDATE", "FOR_NO_KEY_UPDATE", "FOR_SHARE", "FOR_KEY_SHARE"})
+_CHANNEL_QUERY = re.compile(r"\bchannels\b[\s\S]*\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\b", re.I)
 _ENTITIES = frozenset({"Channel", "Client", "Branch", "PlayerDevice", "tenant_barrier",
                        "heartbeat_capacity", "heartbeat_inbox", "playback_inbox"})
 _STAGES = frozenset({"DEPENDENCY", "REQUEST", "RUNTIME_ADMISSION", "RUNTIME_DB", "RUNTIME_TENANT_GUARD", "RUNTIME_BUILDER",
@@ -68,6 +73,7 @@ class _Trace:
     target_hmac: str | None = None
     active: bool = True
     request_finished: bool = False
+    channel_only: bool = False
     sql_sequence: int = 0
     pids: set = field(default_factory=set)
     lock: object = field(default_factory=threading.RLock)
@@ -237,6 +243,57 @@ def _shape(statement, *, worker_receipt=False):
             "sql_tables": tables, "lock_mode": lock_mode, "lock_nowait": "NOWAIT" in upper,
             "lock_targets": sorted(target.lower() for target in targets if target.lower() in known_tables),
             "fingerprint_truncated": len(statement) > 65536 if type(statement) is str else False}
+
+
+@contextmanager
+def heartbeat_channel_lock_scope():
+    """Identify the worker's owned SQL thread, not its async loop or an HTTP caller."""
+    if not _CHANNEL_CAPTURE:
+        yield
+        return
+    trace = _Trace(endpoint="heartbeat-worker", method="WORKER", worker_id=str(uuid.uuid4()),
+                   stage="WORKER", channel_only=True)
+    token = _current.set(trace)
+    try:
+        yield
+    finally:
+        trace.active = False
+        _current.reset(token)
+
+
+def _channel_event(name, trace, state, **fields):
+    # Deliberately not _common: these records must not export receipt/history IDs.
+    _emit({"event": name, "timestamp": datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+           "request_id": trace.request_id, "worker_id": trace.worker_id, "endpoint": trace.endpoint,
+           "stage": trace.stage, "relation": "channels", "pg_backend_pid": state["pid"],
+           "db_transaction_id": state["id"], **fields})
+
+
+def _channel_attempt(trace, state, metadata):
+    mode = metadata["lock_mode"]
+    if (state["pid"] is None or (trace.endpoint not in _PATHS and trace.endpoint not in _CHANNEL_WORKERS)
+            or metadata["sql_operation"] != "SELECT" or metadata["sql_tables"] != ["channels"]
+            or mode not in _CHANNEL_LOCK_MODES):
+        return False
+    previous = state.get("channel_capture")
+    if previous is None:
+        previous = state["channel_capture"] = {"owner": trace, "attempted": set(), "acquired": set()}
+    if previous["owner"] is not trace:
+        return False
+    if mode not in previous["attempted"]:
+        previous["attempted"].add(mode)
+        _channel_event("channel_lock_attempt", trace, state, db_operation_id=metadata["db_operation_id"],
+                       lock_mode=mode, nowait=metadata["lock_nowait"])
+    return True
+
+
+def _channel_acquired(trace, state, metadata, rowcount):
+    capture = state.get("channel_capture")
+    mode = metadata["lock_mode"]
+    if capture is not None and capture["owner"] is trace and rowcount > 0 and mode not in capture["acquired"]:
+        capture["acquired"].add(mode)
+        _channel_event("channel_lock_acquired", trace, state, db_operation_id=metadata["db_operation_id"],
+                       lock_mode=mode, boundary="after_successful_sql")
 
 
 def _worker_lock_context():
@@ -619,10 +676,13 @@ def _install_hooks():
 
     def before_sql(connection, cursor, statement, parameters, context, many):
         try:
+            trace = _active()
+            if trace is None or (trace.channel_only and
+                    (type(statement) is not str or not _CHANNEL_QUERY.search(statement[:65536]))):
+                return
             state = _state(connection, create=True)
             if state is None:
                 return
-            trace = _active()
             with trace.lock:
                 trace.sql_sequence += 1
                 sequence = trace.sql_sequence
@@ -630,6 +690,8 @@ def _install_hooks():
             state["count"] += 1
             state["last"] = metadata
             context._request_pg_operation = metadata
+            if _CHANNEL_CAPTURE:
+                context._channel_lock_observed = _channel_attempt(trace, state, metadata)
             if metadata["lock_mode"] != "NONE" and not trace.worker_id:
                 _emit({"event": "request_pg_sql_start", **_common(trace), "pg_backend_pid": state["pid"],
                        "db_transaction_id": state["id"], **metadata})
@@ -641,6 +703,8 @@ def _install_hooks():
             state = _state(connection, create=False)
             metadata = getattr(context, "_request_pg_operation", None)
             trace = _active()
+            if state is not None and metadata is not None and getattr(context, "_channel_lock_observed", False):
+                _channel_acquired(trace, state, metadata, cursor.rowcount)
             if state is not None and metadata is not None and metadata["lock_mode"] != "NONE" and not trace.worker_id:
                 _emit({"event": "request_pg_sql_end", **_common(trace), "pg_backend_pid": state["pid"],
                        "db_transaction_id": state["id"], **metadata, "outcome": "ok"})
@@ -650,7 +714,7 @@ def _install_hooks():
     def failed(error_context):
         try:
             trace = _active()
-            if trace is None:
+            if trace is None or trace.channel_only:
                 return
             error = error_context.sqlalchemy_exception or error_context.original_exception
             metadata = _error_metadata(error, error_context.connection)
@@ -692,6 +756,11 @@ def _install_hooks():
                                    "pg_backend_pid": state["pid"], "db_transaction_id": state["id"],
                                    "operation": kind, "outcome": outcome, "sql_count": state["count"],
                                    "boundary": "after_dbapi_call"})
+                        channel_capture = state.get("channel_capture")
+                        if channel_capture is not None:
+                            _channel_event("channel_lock_transaction_end", channel_capture["owner"], state,
+                                           operation=kind, outcome=outcome, boundary="after_dbapi_call",
+                                           acquired_modes=sorted(channel_capture["acquired"]))
                         setattr(connection, "_request_pg_diagnostic_state", None)
                 except BaseException:
                     pass

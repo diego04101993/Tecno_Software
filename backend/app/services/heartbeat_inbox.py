@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 import contextvars
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,7 +35,7 @@ from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_relations import conflict
 from app.services.heartbeat_acceptance import heartbeat_accept_guard, locked_player_heartbeat_receipt
 from app.services.tenant_mutations import PlayerReceiptMediaDeferred
-from app.core.request_pg_diagnostics import receipt_media_deferred, worker_scope
+from app.core.request_pg_diagnostics import heartbeat_channel_lock_scope, receipt_media_deferred, worker_scope
 
 
 MAX_PENDING_COUNT = 128
@@ -298,7 +298,7 @@ def materialize_one(engine, processor: Callable) -> bool:
 def _materialize_one_locked(engine, processor) -> bool:
     receipt = None
     try:
-        with Session(engine, autoflush=False) as db:
+        with ExitStack() as observation, Session(engine, autoflush=False) as db:
             if engine.dialect.name == "postgresql" and not db.scalar(text(
                     "SELECT pg_try_advisory_xact_lock(:key)"), {"key": _WORKER_KEY}):
                 _increment(engine, "materializer_busy")
@@ -314,6 +314,9 @@ def _materialize_one_locked(engine, processor) -> bool:
                 .order_by(PlayerHeartbeatInbox.accepted_at, PlayerHeartbeatInbox.id).limit(1))
             if row is None:
                 return False
+            if engine.dialect.name == "postgresql":
+                # Keep the technical identity alive through Session close, even on rollback.
+                observation.enter_context(heartbeat_channel_lock_scope())
             receipt = _Receipt.capture(row)
             payload = PlayerHeartbeatCreate.model_validate(json.loads(receipt.canonical_payload))
             device = db.get(PlayerDevice, receipt.scope[0])

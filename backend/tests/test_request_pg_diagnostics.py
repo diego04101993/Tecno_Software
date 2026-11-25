@@ -9,7 +9,7 @@ import os
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from app.core import request_pg_diagnostics as diagnostic
+from app.core.channel_lock_observer import sample_channel_waits
 from app.models.entities import Channel
 from app.services.db_snapshots import readonly_snapshot_session
 from test_heartbeat_inbox import HeartbeatInboxPostgresTests
@@ -164,6 +165,70 @@ class RequestPGCoreTests(unittest.TestCase):
         self.assertEqual({row["request_id"] for row in self.records}, {None})
         self.assertEqual({row["event"] for row in self.records}, {"player_worker_start", "player_worker_end"})
 
+    def test_heartbeat_channel_capture_scope_is_opt_in_and_restores_request(self):
+        with trace("playback-events") as request:
+            with patch.object(diagnostic, "_CHANNEL_CAPTURE", False), diagnostic.heartbeat_channel_lock_scope():
+                self.assertIs(diagnostic._active(), request)
+            with patch.object(diagnostic, "_CHANNEL_CAPTURE", True), diagnostic.heartbeat_channel_lock_scope():
+                worker = diagnostic._active()
+                self.assertEqual(worker.endpoint, "heartbeat-worker")
+                self.assertTrue(worker.channel_only)
+                self.assertIsNone(worker.request_id)
+                self.assertTrue(diagnostic._valid_uuid(worker.worker_id))
+            self.assertIs(diagnostic._active(), request)
+        self.assertIsNone(diagnostic._active())
+        self.assertEqual(self.records, [])
+
+    def test_channel_capture_events_are_bounded_private_and_require_a_returned_row(self):
+        receipt = str(uuid4())
+        worker = diagnostic._Trace(endpoint="playback-worker", method="WORKER",
+                                   worker_id=str(uuid4()), receipt_id=receipt)
+        state = {"pid": 42, "id": str(uuid4())}
+        for statement in (
+            "SELECT id FROM clients FOR UPDATE",
+            "SELECT id FROM channels",
+            "SELECT channels.id FROM channels JOIN clients ON true FOR UPDATE",
+        ):
+            metadata = {**diagnostic._shape(statement), "db_operation_id": 1}
+            self.assertFalse(diagnostic._channel_attempt(worker, state, metadata))
+        self.assertEqual(self.records, [])
+        metadata = {**diagnostic._shape("SELECT id FROM channels WHERE id='synthetic-id' FOR SHARE"),
+                    "db_operation_id": 2}
+        self.assertTrue(diagnostic._channel_attempt(worker, state, metadata))
+        diagnostic._channel_acquired(worker, state, metadata, 0)
+        self.assertEqual([row["event"] for row in self.records], ["channel_lock_attempt"])
+        for _ in range(3):
+            self.assertTrue(diagnostic._channel_attempt(worker, state, metadata))
+            diagnostic._channel_acquired(worker, state, metadata, 1)
+        self.assertEqual([row["event"] for row in self.records],
+                         ["channel_lock_attempt", "channel_lock_acquired"])
+        self.assertEqual({row["pg_backend_pid"] for row in self.records}, {42})
+        self.assertEqual({row["db_transaction_id"] for row in self.records}, {state["id"]})
+        self.assertEqual({row["worker_id"] for row in self.records}, {worker.worker_id})
+        for item in (receipt, "synthetic-id", "receipt_id", "history_id", "sql_fingerprint"):
+            self.assertNotIn(item, json.dumps(self.records))
+
+    def test_channel_wait_observer_keeps_empty_or_invalid_inputs_off_database(self):
+        pg = Mock(dialect=SimpleNamespace(name="postgresql"))
+        self.assertEqual(sample_channel_waits(pg, []), [])
+        for invalid in ([True], [0], [-1], [2**31], ["42"], list(range(1, 18))):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                sample_channel_waits(pg, invalid)
+        pg.execute.assert_not_called()
+        sqlite = Mock(dialect=SimpleNamespace(name="sqlite"))
+        with self.assertRaises(ValueError):
+            sample_channel_waits(sqlite, [42])
+        sqlite.execute.assert_not_called()
+
+        pair = {"waiter_pid": 42, "blocker_pid": 43, "wait_event": "transactionid"}
+        pg.execute.return_value.mappings.return_value = [pair]
+        self.assertEqual(sample_channel_waits(pg, [42, 42]), [pair])
+        pg.execute.assert_called_once()
+        query, params = pg.execute.call_args.args
+        self.assertEqual(params, {"pids": [42]})
+        self.assertIn("pg_blocking_pids", str(query))
+        self.assertNotIn(".query", str(query))
+
     def test_observer_setup_failure_cannot_prevent_actual_commit_or_rollback(self):
         engine = create_engine("sqlite://")
         self.addCleanup(engine.dispose)
@@ -260,6 +325,74 @@ class RequestPGPostgresTests(GateFixture):
             self.assertEqual(diagnostic._database_metadata(connection=connection)["pg_backend_pid"], actual)
         self.assertEqual(statements, ["SELECT pg_backend_pid()"])
         self.assertEqual({row["request_id"] for row in self.records}, {current.request_id})
+
+    def test_postgres_channel_capture_opt_in_and_empty_row_does_not_acquire(self):
+        for enabled, identity in ((False, self.ids["A"]["channel"]), (True, str(uuid4()))):
+            with self.subTest(enabled=enabled), patch.object(diagnostic, "_CHANNEL_CAPTURE", enabled):
+                self.records.clear()
+                with trace("playback-events") as current, Session(self.engine) as db:
+                    found = db.scalar(select(Channel.id).where(Channel.id == identity).with_for_update(read=True))
+                    db.commit()
+                self.assertEqual(found, None if enabled else identity)
+                self.assertTrue(any(row["event"] == "request_pg_sql_end" for row in self.records))
+                capture = [row for row in self.records if row["event"].startswith("channel_lock_")]
+                if enabled:
+                    self.assertEqual([row["event"] for row in capture],
+                                     ["channel_lock_attempt", "channel_lock_transaction_end"])
+                    self.assertEqual(capture[-1]["acquired_modes"], [])
+                    self.assertTrue(all(row["request_id"] == current.request_id for row in capture))
+                else:
+                    self.assertEqual(capture, [])
+        self.assertEqual(self.engine.pool.checkedout(), 0)
+
+    def test_postgres_real_heartbeat_materializer_captures_commit_and_rollback(self):
+        from app.api.routes import player
+        from app.models.entities import PlayerDevice, PlayerHeartbeat, PlayerHeartbeatInbox
+        from app.schemas.domain import PlayerHeartbeatCreate
+        from app.services import heartbeat_inbox
+
+        ids = self.ids["A"]
+
+        def abandon_after_claim(payload, device, db, **kwargs):
+            claim = kwargs.pop("before_commit")
+
+            def abandon(plan):
+                claim(plan)
+                raise RuntimeError("QA-only processor rollback after valid claim")
+
+            return player._materialize_player_heartbeat(payload, device, db, before_commit=abandon, **kwargs)
+
+        for expected, processor in (("COMMIT", player._materialize_player_heartbeat),
+                                    ("ROLLBACK", abandon_after_claim)):
+            with self.subTest(expected=expected), patch.object(diagnostic, "_CHANNEL_CAPTURE", True):
+                with Session(self.engine, autoflush=False) as db:
+                    heartbeat_inbox.enqueue(db, db.get(PlayerDevice, ids["device"]), db.get(Channel, ids["channel"]),
+                                            PlayerHeartbeatCreate(status="online", current_content_id=ids["content"]))
+                self.records.clear()
+                with trace("playback-events") as request:
+                    self.assertTrue(heartbeat_inbox.materialize_one(self.engine, processor))
+                    self.assertIs(diagnostic._active(), request)
+                capture = [row for row in self.records if row["event"].startswith("channel_lock_")]
+                self.assertEqual([row["event"] for row in capture], [
+                    "channel_lock_attempt", "channel_lock_acquired", "channel_lock_transaction_end",
+                ])
+                self.assertEqual({row["endpoint"] for row in capture}, {"heartbeat-worker"})
+                self.assertEqual({row["request_id"] for row in capture}, {None})
+                self.assertEqual(len({row["worker_id"] for row in capture}), 1)
+                self.assertTrue(diagnostic._valid_uuid(capture[0]["worker_id"]))
+                self.assertEqual(len({row["pg_backend_pid"] for row in capture}), 1)
+                self.assertGreater(capture[0]["pg_backend_pid"], 0)
+                self.assertEqual(len({row["db_transaction_id"] for row in capture}), 1)
+                self.assertEqual([row["timestamp"] for row in capture], sorted(row["timestamp"] for row in capture))
+                self.assertEqual(capture[1]["lock_mode"], "FOR_UPDATE")
+                self.assertEqual((capture[2]["operation"], capture[2]["outcome"], capture[2]["acquired_modes"]),
+                                 (expected, "ok", ["FOR_UPDATE"]))
+                for private_value in (ids["channel"], ids["device"], ids["client"], "receipt_id", "history_id"):
+                    self.assertNotIn(private_value, json.dumps(capture))
+        with Session(self.engine) as db:
+            self.assertEqual(len(list(db.scalars(select(PlayerHeartbeat.id)))), 1)
+            self.assertEqual(len(list(db.scalars(select(PlayerHeartbeatInbox.id)))), 1)
+        self.assertEqual(self.engine.pool.checkedout(), 0)
 
     def test_real_lock_error_keeps_exact_pid_transaction_and_state_after_rollback(self):
         with Session(self.engine) as holder:
