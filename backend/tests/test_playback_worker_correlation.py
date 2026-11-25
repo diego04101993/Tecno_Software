@@ -220,7 +220,9 @@ class PlaybackWorkerCorrelationPostgresTests(_WorkerFixture):
                                  (actual_pids[0], "55P03", relation, mode))
                 self.assertEqual(error["error_stage"], "PLAYBACK_MATERIALIZE")
                 self.assertEqual(error["lock_context"], "AUTHORITY_ROW")
-                self.assertTrue(error["lock_nowait"])
+                # Only the first Channel lock can wait. Held through the full
+                # budget it still counts as a real failure with the same PID.
+                self.assertEqual(error["lock_nowait"], relation != "channels")
                 self.assertEqual((error["receipt_id"], error["history_id"], error["attempt_number"]),
                                  (ack.event_id, ack.event_id, 1))
                 self.ready_again(ack.event_id)
@@ -245,8 +247,8 @@ class PlaybackWorkerCorrelationPostgresTests(_WorkerFixture):
 
                 def bounded_qa_timeout(connection, cursor, statement, parameters, execution, many):
                     trace = diagnostic._active()
-                    # QA-only acceleration of a deliberate ten-second lock:
-                    # no source timeout, retry count, deadline or policy changes.
+                    # QA-only acceleration of the blocking tenant barrier.
+                    # The canonical media TRY probe never waits for this limit.
                     if (trace is not None and trace.receipt_id == ack.event_id
                             and statement == "SET LOCAL lock_timeout = '10s'"):
                         return "SET LOCAL lock_timeout = '100ms'", parameters
@@ -260,14 +262,26 @@ class PlaybackWorkerCorrelationPostgresTests(_WorkerFixture):
                 finally:
                     event.remove(Engine, "before_cursor_execute", bounded_qa_timeout)
                 row = self.receipt(ack.event_id)
+                is_media = context == "MEDIA_PATH"
                 self.assertEqual((row.status, row.attempts, row.last_error_code),
-                                 ("PENDING", 1, "TARGET_TEMPORARILY_LOCKED"))
+                                 ("PENDING", 0, None) if is_media else ("PENDING", 1, "TARGET_TEMPORARILY_LOCKED"))
                 errors = [row for row in self.receipt_records(ack.event_id)
-                          if row.get("error_reason") == "TARGET_TEMPORARILY_LOCKED" and row.get("sqlstate")]
+                          if (row.get("event") == "playback_worker_media_deferred" if is_media else
+                              row.get("error_reason") == "TARGET_TEMPORARILY_LOCKED")
+                          and (row.get("sqlstate") or row.get("media_try_lock_granted") is False)]
                 self.assertEqual(len(errors), 1)
                 self.assertEqual((errors[0]["lock_context"], errors[0]["relation"], errors[0]["lock_mode"]),
                                  (context, None, "ADVISORY_SHARED"))
-                self.assertEqual(errors[0]["sqlstate"], "55P03")
+                if context == "MEDIA_PATH":
+                    self.assertNotIn("error_reason", errors[0])
+                    self.assertEqual(errors[0]["deferral_reason"], "MEDIA_COORDINATION_BUSY")
+                    self.assertEqual(errors[0]["defer_seconds"], 1)
+                    self.assertGreaterEqual(errors[0]["pending_age_seconds"], 0)
+                    self.assertIsNone(errors[0]["sqlstate"])
+                    self.assertIs(errors[0]["media_try_lock_granted"], False)
+                    self.assertFalse(errors[0]["lock_nowait"])
+                else:
+                    self.assertEqual(errors[0]["sqlstate"], "55P03")
                 self.assertGreater(errors[0]["pg_backend_pid"], 0)
                 self.ready_again(ack.event_id)
                 self.assertTrue(self.process())

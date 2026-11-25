@@ -526,6 +526,35 @@ def playback_worker_event(stage, *, db=None, error=None, reason=None, receipt_st
         pass
 
 
+def receipt_media_deferred(kind, receipt_id, *, error=None, pending_age_seconds, defer_seconds):
+    """A pre-write scheduling deferral, not a processing error or an HTTP result."""
+    try:
+        if kind not in {"heartbeat", "playback"} or not _valid_uuid(receipt_id):
+            return
+        trace = _active()
+        if kind == "playback":
+            if trace is None or trace.receipt_id != receipt_id:
+                return
+            value = {"event": "playback_worker_media_deferred", **_common(trace)}
+        else:
+            # The sealed PB observer recognizes generic receipt_id even on a HB
+            # event. Use a distinct technical field rather than misclassifying it.
+            value = {"event": "heartbeat_worker_media_deferred", "request_id": None,
+                     "worker_id": str(uuid.uuid4()), "scope": "worker", "endpoint": "heartbeat-worker",
+                     "method": "WORKER", "stage": "WORKER", "heartbeat_receipt_id": receipt_id,
+                     "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+        value.update(failure_metadata(error) if error is not None else {})
+        if kind == "heartbeat":
+            value["stage"] = "WORKER"
+        tables = value.get("sql_tables", [])
+        value["relation"] = tables[0] if len(tables) == 1 else None
+        value.update(receipt_status="PENDING", deferral_reason="MEDIA_COORDINATION_BUSY",
+                     pending_age_seconds=max(0.0, float(pending_age_seconds)), defer_seconds=float(defer_seconds))
+        _emit(value)
+    except BaseException:
+        pass
+
+
 class RequestPGCorrelationMiddleware:
     def __init__(self, app, *, api_prefix="/api"):
         self.app = app

@@ -24,17 +24,17 @@ from weakref import WeakKeyDictionary
 import anyio
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models.entities import Channel, PlayerDevice, PlayerPlaybackInbox
 from app.core.playback_failure_diagnostics import storage_503, tagged_503
-from app.core.request_pg_diagnostics import playback_receipt_scope, playback_worker_event, worker_scope
+from app.core.request_pg_diagnostics import playback_receipt_scope, playback_worker_event, receipt_media_deferred, worker_scope
 from app.schemas.domain import PlayerPlaybackEventAck, PlayerPlaybackEventCreate
 from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_mutations import (
-    MutationIntent, PlayerPlaybackReceiptBusy, PlayerPlaybackReceiptUnavailable,
+    MutationIntent, PlayerPlaybackReceiptBusy, PlayerPlaybackReceiptUnavailable, PlayerReceiptMediaDeferred,
     locked_player_playback_receipt, player_write_guard,
 )
 from app.services.tenant_ownership import RowRef
@@ -152,7 +152,8 @@ def enqueue(db: Session, device: PlayerDevice, channel: Channel,
                     raise tagged_503(HTTPException(status_code=503, detail="Playback receipt storage is temporarily unavailable"),
                                      "PLAYBACK_INBOX_FULL", "COUNT_OR_BYTE_CAPACITY", db=db)
                 with player_write_guard(db, channel=channel, player_device=device,
-                                        operation="create_player_playback_event", intents=intents):
+                                        operation="create_player_playback_event", intents=intents,
+                                        first_playback_acceptance=attempt == 0):
                     db.add(PlayerPlaybackInbox(id=identity, **values))
                     db.commit()
             break
@@ -264,6 +265,32 @@ def _retain_failure(engine, receipt: _Receipt, code: str, terminal: bool) -> boo
         return False
 
 
+def _defer_media(engine, receipt: _Receipt, error: PlayerReceiptMediaDeferred) -> bool:
+    # Parent/media locks were released before opening this receipt-only Session.
+    # Preserve the original acceptance, scope, payload and real failure budget.
+    try:
+        with Session(engine, autoflush=False) as db:
+            row = db.scalar(select(PlayerPlaybackInbox).where(PlayerPlaybackInbox.id == receipt.identity)
+                            .with_for_update(skip_locked=True).execution_options(populate_existing=True))
+            if row is None or row.status != "PENDING":
+                return False
+            changed = not receipt.matches(row)
+            if not changed:
+                row.available_at = datetime.now(UTC) + timedelta(seconds=_RETRY_SECONDS[0])
+                db.commit()
+                _increment(engine, "media_deferrals")
+                receipt_media_deferred("playback", receipt.identity, error=error,
+                    pending_age_seconds=max(0.0, (datetime.now(UTC) - receipt.accepted_at).total_seconds()),
+                    defer_seconds=_RETRY_SECONDS[0])
+                return True
+        _increment(engine, "processing_failures")
+        return _retain_failure(engine, receipt, "IMMUTABLE_RECEIPT_CHANGED", True)
+    except SQLAlchemyError as exc:
+        _increment(engine, "deferral_storage_errors")
+        playback_worker_event("PLAYBACK_RETAIN_FAILURE", error=exc, reason="DATABASE_TEMPORARILY_UNAVAILABLE")
+        return False
+
+
 def materialize_one(engine, processor: Callable) -> bool:
     """Process at most one receipt; each call owns and closes its own Session.
 
@@ -341,6 +368,10 @@ def _materialize_one_locked(engine, processor) -> bool:
     except (_NoLongerAvailable, PlayerPlaybackReceiptUnavailable):
         _increment(engine, "receipt_claim_misses")
         return False
+    except PlayerReceiptMediaDeferred as exc:
+        if receipt is None:
+            raise
+        return _defer_media(engine, receipt, exc)
     except Exception as exc:
         # The Session context closed/rolled back before private retry marking.
         _increment(engine, "processing_failures")
@@ -356,14 +387,17 @@ def _materialize_one_locked(engine, processor) -> bool:
 
 def snapshot(db: Session) -> dict[str, int | float | None]:
     """Small private table aggregate; no raw IDs/payloads or historical scan."""
-    count, payload_bytes, oldest = db.execute(select(func.count(), func.coalesce(func.sum(
-        PlayerPlaybackInbox.payload_bytes), 0), func.min(PlayerPlaybackInbox.accepted_at))
+    count, payload_bytes, oldest, oldest_pending = db.execute(select(func.count(), func.coalesce(func.sum(
+        PlayerPlaybackInbox.payload_bytes), 0), func.min(PlayerPlaybackInbox.accepted_at),
+        func.min(case((PlayerPlaybackInbox.status == "PENDING", PlayerPlaybackInbox.accepted_at))))
         .select_from(PlayerPlaybackInbox)).one()
     failed = db.scalar(select(func.count()).select_from(PlayerPlaybackInbox).where(
         PlayerPlaybackInbox.status == "FAILED"))
     return {"pending_count": int(count), "pending_payload_bytes": int(payload_bytes),
             "failed_count": int(failed),
             "oldest_age_seconds": max(0.0, (datetime.now(UTC) - _utc(oldest)).total_seconds()) if oldest else None,
+             "oldest_pending_age_seconds": max(0.0, (datetime.now(UTC) - _utc(oldest_pending)).total_seconds()) if oldest_pending else None,
+             "media_deferrals": 0, "deferral_storage_errors": 0,
             **counters(db.get_bind())}
 
 

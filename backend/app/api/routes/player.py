@@ -326,7 +326,8 @@ def _materialize_player_heartbeat(payload, player_device, db, *, event_id, recei
         MutationIntent("CREATE", ref, tuple(values.items())),
     )
     with player_write_guard(db, channel=channel, player_device=player_device,
-                            operation="create_player_heartbeat", intents=intents) as plan:
+                            operation="create_player_heartbeat", intents=intents,
+                            receipt_processing=True) as plan:
         if db.get_bind().dialect.name == "postgresql":
             retain_heartbeat_write_keys(db, plan, channel, player_device)
         before_commit(plan)

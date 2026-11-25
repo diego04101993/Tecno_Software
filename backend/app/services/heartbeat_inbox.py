@@ -24,7 +24,7 @@ from weakref import WeakKeyDictionary
 import anyio
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import and_, exists, func, inspect, or_, select, text
+from sqlalchemy import and_, case, exists, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased
@@ -34,7 +34,8 @@ from app.schemas.domain import PlayerHeartbeatAck, PlayerHeartbeatCreate
 from app.services.tenancy import require_active_channel_tenant
 from app.services.tenant_relations import conflict
 from app.services.heartbeat_acceptance import heartbeat_accept_guard, locked_player_heartbeat_receipt
-from app.core.request_pg_diagnostics import worker_scope
+from app.services.tenant_mutations import PlayerReceiptMediaDeferred
+from app.core.request_pg_diagnostics import receipt_media_deferred, worker_scope
 
 
 MAX_PENDING_COUNT = 128
@@ -254,6 +255,32 @@ def _retain_failure(engine, receipt: _Receipt, code: str, terminal: bool) -> boo
         return False
 
 
+def _defer_media(engine, receipt: _Receipt, error: PlayerReceiptMediaDeferred) -> bool:
+    # The processing Session and its coordinator have already rolled back and
+    # closed. A deferral owns only this short receipt transaction, never a parent
+    # lock, and cannot resurrect a claimed, failed or changed receipt.
+    try:
+        with Session(engine, autoflush=False) as db:
+            row = db.scalar(select(PlayerHeartbeatInbox).where(PlayerHeartbeatInbox.id == receipt.identity)
+                            .with_for_update(skip_locked=True).execution_options(populate_existing=True))
+            if row is None or row.status != "PENDING":
+                return False
+            changed = not receipt.matches(row)
+            if not changed:
+                row.available_at = datetime.now(UTC) + timedelta(seconds=_RETRY_SECONDS[0])
+                db.commit()
+                _increment(engine, "media_deferrals")
+                receipt_media_deferred("heartbeat", receipt.identity, error=error,
+                    pending_age_seconds=max(0.0, (datetime.now(UTC) - receipt.accepted_at).total_seconds()),
+                    defer_seconds=_RETRY_SECONDS[0])
+                return True
+        _increment(engine, "processing_failures")
+        return _retain_failure(engine, receipt, "IMMUTABLE_RECEIPT_CHANGED", True)
+    except SQLAlchemyError:
+        _increment(engine, "deferral_storage_errors")
+        return False
+
+
 def materialize_one(engine, processor: Callable) -> bool:
     """Own one short Session; never borrow a request's connection or transaction."""
     engine = _engine(engine)
@@ -325,6 +352,10 @@ def _materialize_one_locked(engine, processor) -> bool:
     except _NoLongerAvailable:
         _increment(engine, "receipt_claim_misses")
         return False
+    except PlayerReceiptMediaDeferred as exc:
+        if receipt is None:
+            raise  # The typed signal is meaningful only after receipt selection.
+        return _defer_media(engine, receipt, exc)
     except Exception as exc:
         _increment(engine, "processing_failures")
         if receipt is None:
@@ -336,8 +367,9 @@ def _materialize_one_locked(engine, processor) -> bool:
 
 def snapshot(db: Session) -> dict[str, int | float | None]:
     """Small private table aggregate; no raw IDs/payloads or historical scan."""
-    count, payload_bytes, oldest = db.execute(select(func.count(), func.coalesce(func.sum(
-        PlayerHeartbeatInbox.payload_bytes), 0), func.min(PlayerHeartbeatInbox.accepted_at))
+    count, payload_bytes, oldest, oldest_pending = db.execute(select(func.count(), func.coalesce(func.sum(
+        PlayerHeartbeatInbox.payload_bytes), 0), func.min(PlayerHeartbeatInbox.accepted_at),
+        func.min(case((PlayerHeartbeatInbox.status == "PENDING", PlayerHeartbeatInbox.accepted_at))))
         .select_from(PlayerHeartbeatInbox)).one()
     failed = db.scalar(select(func.count()).select_from(PlayerHeartbeatInbox).where(
         PlayerHeartbeatInbox.status == "FAILED"))
@@ -345,6 +377,8 @@ def snapshot(db: Session) -> dict[str, int | float | None]:
             "pending_only_count": int(count) - int(failed), "pending_payload_bytes": int(payload_bytes),
             "failed_count": int(failed),
             "oldest_age_seconds": max(0.0, (datetime.now(UTC) - _utc(oldest)).total_seconds()) if oldest else None,
+             "oldest_pending_age_seconds": max(0.0, (datetime.now(UTC) - _utc(oldest_pending)).total_seconds()) if oldest_pending else None,
+             "media_deferrals": 0, "deferral_storage_errors": 0,
             **counters(db.get_bind())}
 
 

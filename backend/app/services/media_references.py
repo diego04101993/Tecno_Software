@@ -37,6 +37,10 @@ _GENERATED_REFS = "vw1_generated_reference_batch"
 _OWNERSHIP_VALIDATION_PHASE = "media_ownership_validation_phase"
 
 
+class MediaCoordinationBusy(RuntimeError):
+    """A nonblocking shared coordination probe was not granted; no SQL error."""
+
+
 class _OwnershipValidationPhase:
     """Read-only proof lifetime, never a Session/request/transaction-wide cache.
 
@@ -1644,7 +1648,8 @@ def approved_media_cleanup_paths(db: Session) -> frozenset[Path]:
     return frozenset(db.info[_STATE]["cleanup_paths"])
 
 
-def lock_media_paths(db: Session, paths: list[Path], *, shared: bool = False) -> None:
+def lock_media_paths(db: Session, paths: list[Path], *, shared: bool = False,
+                     nonblocking: bool = False) -> None:
     """Coordinate the complete path batch; writers remain exclusive by default.
 
     The reviewed Player telemetry path only reads ownership/media facts. Its
@@ -1653,7 +1658,8 @@ def lock_media_paths(db: Session, paths: list[Path], *, shared: bool = False) ->
     writer cannot silently reuse or upgrade a read-only coordination batch.
     """
     state = db.info.get(_STATE)
-    if state is None or type(shared) is not bool:
+    if (state is None or type(shared) is not bool or type(nonblocking) is not bool
+            or (nonblocking and not shared)):
         raise MediaPathError("MEDIA_LOCK_REQUIRED")
     root = get_settings().MEDIA_ROOT
     canonical = {validate_media_file(root, path, must_exist=False) for path in paths}
@@ -1680,11 +1686,29 @@ def lock_media_paths(db: Session, paths: list[Path], *, shared: bool = False) ->
         state["connection"] = connection
         connection.execute(text("SET LOCAL lock_timeout = '10s'"))
         for key in sorted({media_lock_key(path) for path in canonical}):
-            statement = ("SELECT pg_advisory_xact_lock_shared(:key)" if shared
-                         else "SELECT pg_advisory_xact_lock(:key)")
-            connection.execute(text(statement), {"key": key})
+            if nonblocking:
+                if not connection.scalar(text("SELECT pg_try_advisory_xact_lock_shared(:key)"), {"key": key}):
+                    # False is a logical busy result, not SQLSTATE55P03. The
+                    # owning media context releases earlier keys atomically.
+                    error = MediaCoordinationBusy()
+                    try:
+                        from app.core.request_pg_diagnostics import capture_failure, failure_metadata
+                        capture_failure(error, connection=connection)
+                        metadata = failure_metadata(error)
+                        metadata.update(sqlstate=None, sql_operation="SELECT", sql_tables=[],
+                                        lock_mode="ADVISORY_SHARED", lock_nowait=False,
+                                        lock_context="MEDIA_PATH", media_try_lock_granted=False)
+                        error._request_pg_failure = metadata
+                    except Exception:
+                        pass  # An observer cannot change this failed lock probe.
+                    raise error
+            else:
+                statement = ("SELECT pg_advisory_xact_lock_shared(:key)" if shared
+                             else "SELECT pg_advisory_xact_lock(:key)")
+                connection.execute(text(statement), {"key": key})
     elif canonical and dialect == "sqlite":
-        _SQLITE_LOCK.acquire()
+        if not _SQLITE_LOCK.acquire(blocking=not nonblocking):
+            raise MediaCoordinationBusy()
         state["sqlite"] = True
     elif canonical:
         raise MediaPathError("MEDIA_LOCK_DATABASE_UNSUPPORTED")

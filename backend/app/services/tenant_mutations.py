@@ -15,6 +15,9 @@ from app.services.tenant_relations import (
 from app.services.tenant_ownership import RowRef, TenantGraph, freeze, ContextIntegrityState, OperationContext
 
 
+_PLAYER_FIRST_CHANNEL_LOCK_TIMEOUT = "1s"
+
+
 def _clean(session):
     if session.new or session.dirty or session.deleted:
         raise conflict()
@@ -856,6 +859,8 @@ class _DeleteGraph(_PhaseGraphFacts, TenantGraph):
             if locked:
                 nowait = (getattr(self, "_nonblocking_parent_locks", False)
                           or ref in getattr(self, "_runtime_wait_roots", ()))
+                if ref == getattr(self, "_waiting_first_channel", None):
+                    nowait = False
                 if self._row_lock_mode(ref) == "share":
                     statement = statement.with_for_update(read=True, nowait=nowait)
                 else:
@@ -1118,7 +1123,7 @@ def _monotonic_player_activity(graph, intents):
 
 @contextmanager
 def player_write_guard(db, *, channel, player_device, operation, intents, receipt_processing=False,
-                       runtime_wait_deadline_ns=None):
+                       runtime_wait_deadline_ns=None, first_playback_acceptance=False):
     """Relationship proof for the already authenticated Player/code entrypoints.
 
     Never constructs a User or accepts actor/tenant identity from HTTP payloads.
@@ -1127,6 +1132,7 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
     from sqlalchemy import inspect, text
     from sqlalchemy.exc import DBAPIError
     from app.models.entities import Channel, PlayerDevice
+    from app.services.media_references import MediaCoordinationBusy
 
     _clean(db)
     if type(channel) is not Channel:
@@ -1156,7 +1162,13 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
         # This private operation accepts one event OR one durable receipt, never
         # a mixed batch or an incidental structural/device update.
         raise conflict()
-    if type(receipt_processing) is not bool or (receipt_processing and operation != "create_player_playback_event"):
+    if type(receipt_processing) is not bool or (receipt_processing and (
+            not telemetry or operation not in {"create_player_heartbeat", "create_player_playback_event"})):
+        raise conflict()
+    creates_receipt = telemetry and operation == "create_player_playback_event" and any(
+        intent.action == "CREATE" and intent.reference.model == "PlayerPlaybackInbox" for intent in intents)
+    if type(first_playback_acceptance) is not bool or (first_playback_acceptance and (
+            not creates_receipt or receipt_processing)):
         raise conflict()
     exclusive = {RowRef("PlayerDevice", player_device.id)} if telemetry else set()
     if telemetry and operation == "create_player_heartbeat":
@@ -1173,13 +1185,14 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
             RowRef("PlayerDevice", player_device.id)))
     context = _PlayerWriteScope(channel.client_id, channel.branch_id)
     graph.player_scope = context
+    if telemetry and operation == "create_player_heartbeat" and receipt_processing:
+        # A canonical consumer may defer its durable receipt, never wait on a
+        # second authority root while retaining Channel's exclusive anchor.
+        graph._nonblocking_parent_locks = True
     if telemetry and operation == "create_player_playback_event":
-        creates_receipt = any(i.action == "CREATE" and i.reference.model == "PlayerPlaybackInbox" for i in intents)
         graph._receipt_scope = (player_device.id, channel.id, context.client_id, context.branch_id) if creates_receipt else None
         # BLUE has no tenant barrier and may lock Device->Channel while GREEN
-        # locks Channel->Device. Never wait while holding the other half of that
-        # cycle. Receipt ingress retries only this narrow pre-COMMIT conflict;
-        # the consumer uses its existing bounded retry policy.
+        # locks Channel->Device. Keep all roots after the first Channel NOWAIT.
         graph._nonblocking_parent_locks = creates_receipt or receipt_processing
     spec = next(o for o in OPERATIONS if o.function == operation)
     prepared = _prepared_row_versions(db, intents)
@@ -1202,18 +1215,31 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
             conn.execute(text("SET LOCAL lock_timeout = '10s'"))
         else:
             _runtime_lock_budget(db, runtime_wait_deadline_ns)
+    yielded = False
     try:
         gate_type = _PlayerTelemetryGate if telemetry else MutationGate
         with gate_type(graph, context) as gate:
             graph.snapshots.clear()
             graph.locking = True
+            channel_ref = RowRef("Channel", channel.id)
+            if ((receipt_processing or first_playback_acceptance)
+                    and db.get_bind().dialect.name == "postgresql"):
+                # Only the first row may wait. No Device or media lock has
+                # been taken. Record the actual locked snapshot in the same
+                # transaction that runs both proofs. Configure its timeout
+                # before entering the proof phase, which forbids textual SQL.
+                conn.execute(text(f"SET LOCAL lock_timeout = '{_PLAYER_FIRST_CHANNEL_LOCK_TIMEOUT}'"))
+                graph._waiting_first_channel = channel_ref
+                graph.snapshot(channel_ref)
+                graph._waiting_first_channel = None
+                conn.execute(text("SET LOCAL lock_timeout = '10s'"))
             with ExitStack() as first_phase:
                 if heartbeat_bulk:
                     from app.services.heartbeat_queries import heartbeat_query_scope
                     first_phase.enter_context(heartbeat_query_scope(db))
                     first_phase.enter_context(_graph_validation_phase(graph, gate))
                 # Keep Channel's exclusive anchor first, before any device lock.
-                current = graph.snapshot(RowRef("Channel", channel.id))
+                current = graph.snapshot(channel_ref)
                 if current is None or tuple(current[key] for key in ("client_id", "branch_id", "channel_code")) != channel_values:
                     raise conflict()
                 if heartbeat_bulk:
@@ -1259,7 +1285,8 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                     from app.services.media_references import media_reference_operation, lock_media_paths
                     media_locks.enter_context(media_reference_operation(db))
                     if telemetry:
-                        lock_media_paths(db, list(paths), shared=True)
+                        lock_media_paths(db, list(paths), shared=True,
+                                         nonblocking=receipt_processing)
                     else:
                         lock_media_paths(db, list(paths))
                 prior_references = tuple(graph.snapshots) if heartbeat_bulk else ()
@@ -1280,13 +1307,32 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
                     raise conflict()
                 confirmed.assert_usable(gate, context)
                 db.expire_all()
+                yielded = True
                 yield confirmed
+    except MediaCoordinationBusy as exc:
+        # The media context already closed its owned coordinator and released
+        # every partial lock batch. The data transaction must be released too
+        # before the consumer reschedules its still-durable receipt.
+        db.rollback()
+        if not receipt_processing:
+            raise
+        if not yielded:
+            # Only the known pre-write media probe is scheduling contention.
+            # A failure after yielding the plan remains a processing failure.
+            raise PlayerReceiptMediaDeferred() from exc
+        if spec.function == "create_player_playback_event":
+            raise PlayerPlaybackReceiptBusy() from exc
+        from fastapi import HTTPException
+        error = HTTPException(status_code=503, detail="Player operation temporarily unavailable")
+        error._player_503_reason = "TENANT_GUARD_LOCK_UNAVAILABLE"
+        raise error from exc
     except DBAPIError as exc:
         if getattr(exc.orig, "sqlstate", None) not in {"40001", "40P01", "55P03"}:
             raise
         db.rollback()
         if telemetry and getattr(exc.orig, "sqlstate", None) == "55P03":
-            if getattr(graph, "_nonblocking_parent_locks", False):
+            if (spec.function == "create_player_playback_event"
+                    and getattr(graph, "_nonblocking_parent_locks", False)):
                 raise PlayerPlaybackReceiptBusy() from exc
             from fastapi import HTTPException
             error = HTTPException(status_code=503, detail="Player operation temporarily unavailable")
@@ -1298,6 +1344,10 @@ def player_write_guard(db, *, channel, player_device, operation, intents, receip
 
 class PlayerPlaybackReceiptUnavailable(RuntimeError):
     """Another transaction consumed/locked the receipt; never a validation failure."""
+
+
+class PlayerReceiptMediaDeferred(RuntimeError):
+    """A canonical receipt's media probe was busy before any final writes."""
 
 
 class PlayerPlaybackReceiptBusy(RuntimeError):
